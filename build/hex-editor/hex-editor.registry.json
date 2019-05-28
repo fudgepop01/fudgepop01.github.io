@@ -1,0 +1,19 @@
+{
+  "namespace": "HexEditor",
+  "fsNamespace": "hex-editor",
+  "loader": "../hex-editor.js",
+  "core": "hex-editor.tqzfgd2t.js",
+  "corePolyfilled": "hex-editor.hpibxnhu.js",
+  "components": {
+    "hex-editor": {
+      "bundleIds": {
+        "$": "em9ux4sm"
+      }
+    },
+    "my-tooltip": {
+      "bundleIds": {
+        "$": "7otzjfuv"
+      }
+    }
+  }
+}
