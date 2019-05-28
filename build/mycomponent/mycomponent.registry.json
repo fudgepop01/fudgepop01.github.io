@@ -1,0 +1,19 @@
+{
+  "namespace": "mycomponent",
+  "fsNamespace": "mycomponent",
+  "loader": "../mycomponent.js",
+  "corePolyfilled": "es5-build-disabled.js",
+  "core": "mycomponent.core.js",
+  "components": {
+    "hex-editor": {
+      "bundleIds": {
+        "$": "hex-editor"
+      }
+    },
+    "my-tooltip": {
+      "bundleIds": {
+        "$": "my-tooltip"
+      }
+    }
+  }
+}
