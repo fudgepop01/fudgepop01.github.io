@@ -2,12 +2,12 @@
   "namespace": "HexEditor",
   "fsNamespace": "hex-editor",
   "loader": "../hex-editor.js",
-  "core": "hex-editor.acmibmh9.js",
-  "corePolyfilled": "hex-editor.sktpqyto.js",
+  "core": "hex-editor.am13xt0w.js",
+  "corePolyfilled": "hex-editor.qvqpk5lq.js",
   "components": {
     "hex-editor": {
       "bundleIds": {
-        "$": "l3b2g0m5"
+        "$": "6dkfuwqr"
       }
     },
     "my-tooltip": {
