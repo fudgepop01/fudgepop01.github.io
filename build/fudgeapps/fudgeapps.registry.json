@@ -1,0 +1,19 @@
+{
+  "namespace": "fudgeapps",
+  "fsNamespace": "fudgeapps",
+  "loader": "../fudgeapps.js",
+  "corePolyfilled": "es5-build-disabled.js",
+  "core": "fudgeapps.core.js",
+  "components": {
+    "fudge-hex-editor": {
+      "bundleIds": {
+        "$": "fudge-hex-editor"
+      }
+    },
+    "fudge-hex-tooltip": {
+      "bundleIds": {
+        "$": "fudge-hex-tooltip"
+      }
+    }
+  }
+}
