@@ -4,6 +4,7 @@ var app = (function () {
     'use strict';
 
     function noop() { }
+    const identity = x => x;
     function add_location(element, file, line, column, char) {
         element.__svelte_meta = {
             loc: { file, line, column, char }
@@ -26,6 +27,41 @@ var app = (function () {
     }
     function null_to_empty(value) {
         return value == null ? '' : value;
+    }
+
+    const is_client = typeof window !== 'undefined';
+    let now = is_client
+        ? () => window.performance.now()
+        : () => Date.now();
+    let raf = is_client ? cb => requestAnimationFrame(cb) : noop;
+
+    const tasks = new Set();
+    let running = false;
+    function run_tasks() {
+        tasks.forEach(task => {
+            if (!task[0](now())) {
+                tasks.delete(task);
+                task[1]();
+            }
+        });
+        running = tasks.size > 0;
+        if (running)
+            raf(run_tasks);
+    }
+    function loop(fn) {
+        let task;
+        if (!running) {
+            running = true;
+            raf(run_tasks);
+        }
+        return {
+            promise: new Promise(fulfil => {
+                tasks.add(task = [fn, fulfil]);
+            }),
+            abort() {
+                tasks.delete(task);
+            }
+        };
     }
 
     function append(target, node) {
@@ -111,9 +147,88 @@ var app = (function () {
         return e;
     }
 
+    let stylesheet;
+    let active = 0;
+    let current_rules = {};
+    // https://github.com/darkskyapp/string-hash/blob/master/index.js
+    function hash(str) {
+        let hash = 5381;
+        let i = str.length;
+        while (i--)
+            hash = ((hash << 5) - hash) ^ str.charCodeAt(i);
+        return hash >>> 0;
+    }
+    function create_rule(node, a, b, duration, delay, ease, fn, uid = 0) {
+        const step = 16.666 / duration;
+        let keyframes = '{\n';
+        for (let p = 0; p <= 1; p += step) {
+            const t = a + (b - a) * ease(p);
+            keyframes += p * 100 + `%{${fn(t, 1 - t)}}\n`;
+        }
+        const rule = keyframes + `100% {${fn(b, 1 - b)}}\n}`;
+        const name = `__svelte_${hash(rule)}_${uid}`;
+        if (!current_rules[name]) {
+            if (!stylesheet) {
+                const style = element('style');
+                document.head.appendChild(style);
+                stylesheet = style.sheet;
+            }
+            current_rules[name] = true;
+            stylesheet.insertRule(`@keyframes ${name} ${rule}`, stylesheet.cssRules.length);
+        }
+        const animation = node.style.animation || '';
+        node.style.animation = `${animation ? `${animation}, ` : ``}${name} ${duration}ms linear ${delay}ms 1 both`;
+        active += 1;
+        return name;
+    }
+    function delete_rule(node, name) {
+        node.style.animation = (node.style.animation || '')
+            .split(', ')
+            .filter(name
+            ? anim => anim.indexOf(name) < 0 // remove specific animation
+            : anim => anim.indexOf('__svelte') === -1 // remove all Svelte animations
+        )
+            .join(', ');
+        if (name && !--active)
+            clear_rules();
+    }
+    function clear_rules() {
+        raf(() => {
+            if (active)
+                return;
+            let i = stylesheet.cssRules.length;
+            while (i--)
+                stylesheet.deleteRule(i);
+            current_rules = {};
+        });
+    }
+
     let current_component;
     function set_current_component(component) {
         current_component = component;
+    }
+    function createEventDispatcher() {
+        const component = current_component;
+        return (type, detail) => {
+            const callbacks = component.$$.callbacks[type];
+            if (callbacks) {
+                // TODO are there situations where events could be dispatched
+                // in a server (non-DOM) environment?
+                const event = custom_event(type, detail);
+                callbacks.slice().forEach(fn => {
+                    fn.call(component, event);
+                });
+            }
+        };
+    }
+    // TODO figure out if we still want to support
+    // shorthand events, or if we want to implement
+    // a real bubbling mechanism
+    function bubble(component, event) {
+        const callbacks = component.$$.callbacks[event.type];
+        if (callbacks) {
+            callbacks.slice().forEach(fn => fn(event));
+        }
     }
 
     const dirty_components = [];
@@ -173,6 +288,20 @@ var app = (function () {
             $$.after_update.forEach(add_render_callback);
         }
     }
+
+    let promise;
+    function wait() {
+        if (!promise) {
+            promise = Promise.resolve();
+            promise.then(() => {
+                promise = null;
+            });
+        }
+        return promise;
+    }
+    function dispatch(node, direction, kind) {
+        node.dispatchEvent(custom_event(`${direction ? 'intro' : 'outro'}${kind}`));
+    }
     const outroing = new Set();
     let outros;
     function group_outros() {
@@ -210,6 +339,127 @@ var app = (function () {
             block.o(local);
         }
     }
+    const null_transition = { duration: 0 };
+    function create_in_transition(node, fn, params) {
+        let config = fn(node, params);
+        let running = false;
+        let animation_name;
+        let task;
+        let uid = 0;
+        function cleanup() {
+            if (animation_name)
+                delete_rule(node, animation_name);
+        }
+        function go() {
+            const { delay = 0, duration = 300, easing = identity, tick = noop, css } = config || null_transition;
+            if (css)
+                animation_name = create_rule(node, 0, 1, duration, delay, easing, css, uid++);
+            tick(0, 1);
+            const start_time = now() + delay;
+            const end_time = start_time + duration;
+            if (task)
+                task.abort();
+            running = true;
+            add_render_callback(() => dispatch(node, true, 'start'));
+            task = loop(now => {
+                if (running) {
+                    if (now >= end_time) {
+                        tick(1, 0);
+                        dispatch(node, true, 'end');
+                        cleanup();
+                        return running = false;
+                    }
+                    if (now >= start_time) {
+                        const t = easing((now - start_time) / duration);
+                        tick(t, 1 - t);
+                    }
+                }
+                return running;
+            });
+        }
+        let started = false;
+        return {
+            start() {
+                if (started)
+                    return;
+                delete_rule(node);
+                if (is_function(config)) {
+                    config = config();
+                    wait().then(go);
+                }
+                else {
+                    go();
+                }
+            },
+            invalidate() {
+                started = false;
+            },
+            end() {
+                if (running) {
+                    cleanup();
+                    running = false;
+                }
+            }
+        };
+    }
+    function create_out_transition(node, fn, params) {
+        let config = fn(node, params);
+        let running = true;
+        let animation_name;
+        const group = outros;
+        group.r += 1;
+        function go() {
+            const { delay = 0, duration = 300, easing = identity, tick = noop, css } = config || null_transition;
+            if (css)
+                animation_name = create_rule(node, 1, 0, duration, delay, easing, css);
+            const start_time = now() + delay;
+            const end_time = start_time + duration;
+            add_render_callback(() => dispatch(node, false, 'start'));
+            loop(now => {
+                if (running) {
+                    if (now >= end_time) {
+                        tick(0, 1);
+                        dispatch(node, false, 'end');
+                        if (!--group.r) {
+                            // this will result in `end()` being called,
+                            // so we don't need to clean up here
+                            run_all(group.c);
+                        }
+                        return false;
+                    }
+                    if (now >= start_time) {
+                        const t = easing((now - start_time) / duration);
+                        tick(1 - t, t);
+                    }
+                }
+                return running;
+            });
+        }
+        if (is_function(config)) {
+            wait().then(() => {
+                // @ts-ignore
+                config = config();
+                go();
+            });
+        }
+        else {
+            go();
+        }
+        return {
+            end(reset) {
+                if (reset && config.tick) {
+                    config.tick(1, 0);
+                }
+                if (running) {
+                    if (animation_name)
+                        delete_rule(node, animation_name);
+                    running = false;
+                }
+            }
+        };
+    }
+
+    const globals = (typeof window !== 'undefined' ? window : global);
 
     function bind(component, name, callback) {
         if (component.$$.props.indexOf(name) === -1)
@@ -392,6 +642,512 @@ var app = (function () {
     function createCommonjsModule(fn, module) {
     	return module = { exports: {} }, fn(module, module.exports), module.exports;
     }
+
+    function getCjsExportFromNamespace (n) {
+    	return n && n['default'] || n;
+    }
+
+    var lzString = createCommonjsModule(function (module) {
+    // Copyright (c) 2013 Pieroxy <pieroxy@pieroxy.net>
+    // This work is free. You can redistribute it and/or modify it
+    // under the terms of the WTFPL, Version 2
+    // For more information see LICENSE.txt or http://www.wtfpl.net/
+    //
+    // For more information, the home page:
+    // http://pieroxy.net/blog/pages/lz-string/testing.html
+    //
+    // LZ-based compression algorithm, version 1.4.4
+    var LZString = (function() {
+
+    // private property
+    var f = String.fromCharCode;
+    var keyStrBase64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+    var keyStrUriSafe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-$";
+    var baseReverseDic = {};
+
+    function getBaseValue(alphabet, character) {
+      if (!baseReverseDic[alphabet]) {
+        baseReverseDic[alphabet] = {};
+        for (var i=0 ; i<alphabet.length ; i++) {
+          baseReverseDic[alphabet][alphabet.charAt(i)] = i;
+        }
+      }
+      return baseReverseDic[alphabet][character];
+    }
+
+    var LZString = {
+      compressToBase64 : function (input) {
+        if (input == null) return "";
+        var res = LZString._compress(input, 6, function(a){return keyStrBase64.charAt(a);});
+        switch (res.length % 4) { // To produce valid Base64
+        default: // When could this happen ?
+        case 0 : return res;
+        case 1 : return res+"===";
+        case 2 : return res+"==";
+        case 3 : return res+"=";
+        }
+      },
+
+      decompressFromBase64 : function (input) {
+        if (input == null) return "";
+        if (input == "") return null;
+        return LZString._decompress(input.length, 32, function(index) { return getBaseValue(keyStrBase64, input.charAt(index)); });
+      },
+
+      compressToUTF16 : function (input) {
+        if (input == null) return "";
+        return LZString._compress(input, 15, function(a){return f(a+32);}) + " ";
+      },
+
+      decompressFromUTF16: function (compressed) {
+        if (compressed == null) return "";
+        if (compressed == "") return null;
+        return LZString._decompress(compressed.length, 16384, function(index) { return compressed.charCodeAt(index) - 32; });
+      },
+
+      //compress into uint8array (UCS-2 big endian format)
+      compressToUint8Array: function (uncompressed) {
+        var compressed = LZString.compress(uncompressed);
+        var buf=new Uint8Array(compressed.length*2); // 2 bytes per character
+
+        for (var i=0, TotalLen=compressed.length; i<TotalLen; i++) {
+          var current_value = compressed.charCodeAt(i);
+          buf[i*2] = current_value >>> 8;
+          buf[i*2+1] = current_value % 256;
+        }
+        return buf;
+      },
+
+      //decompress from uint8array (UCS-2 big endian format)
+      decompressFromUint8Array:function (compressed) {
+        if (compressed===null || compressed===undefined){
+            return LZString.decompress(compressed);
+        } else {
+            var buf=new Array(compressed.length/2); // 2 bytes per character
+            for (var i=0, TotalLen=buf.length; i<TotalLen; i++) {
+              buf[i]=compressed[i*2]*256+compressed[i*2+1];
+            }
+
+            var result = [];
+            buf.forEach(function (c) {
+              result.push(f(c));
+            });
+            return LZString.decompress(result.join(''));
+
+        }
+
+      },
+
+
+      //compress into a string that is already URI encoded
+      compressToEncodedURIComponent: function (input) {
+        if (input == null) return "";
+        return LZString._compress(input, 6, function(a){return keyStrUriSafe.charAt(a);});
+      },
+
+      //decompress from an output of compressToEncodedURIComponent
+      decompressFromEncodedURIComponent:function (input) {
+        if (input == null) return "";
+        if (input == "") return null;
+        input = input.replace(/ /g, "+");
+        return LZString._decompress(input.length, 32, function(index) { return getBaseValue(keyStrUriSafe, input.charAt(index)); });
+      },
+
+      compress: function (uncompressed) {
+        return LZString._compress(uncompressed, 16, function(a){return f(a);});
+      },
+      _compress: function (uncompressed, bitsPerChar, getCharFromInt) {
+        if (uncompressed == null) return "";
+        var i, value,
+            context_dictionary= {},
+            context_dictionaryToCreate= {},
+            context_c="",
+            context_wc="",
+            context_w="",
+            context_enlargeIn= 2, // Compensate for the first entry which should not count
+            context_dictSize= 3,
+            context_numBits= 2,
+            context_data=[],
+            context_data_val=0,
+            context_data_position=0,
+            ii;
+
+        for (ii = 0; ii < uncompressed.length; ii += 1) {
+          context_c = uncompressed.charAt(ii);
+          if (!Object.prototype.hasOwnProperty.call(context_dictionary,context_c)) {
+            context_dictionary[context_c] = context_dictSize++;
+            context_dictionaryToCreate[context_c] = true;
+          }
+
+          context_wc = context_w + context_c;
+          if (Object.prototype.hasOwnProperty.call(context_dictionary,context_wc)) {
+            context_w = context_wc;
+          } else {
+            if (Object.prototype.hasOwnProperty.call(context_dictionaryToCreate,context_w)) {
+              if (context_w.charCodeAt(0)<256) {
+                for (i=0 ; i<context_numBits ; i++) {
+                  context_data_val = (context_data_val << 1);
+                  if (context_data_position == bitsPerChar-1) {
+                    context_data_position = 0;
+                    context_data.push(getCharFromInt(context_data_val));
+                    context_data_val = 0;
+                  } else {
+                    context_data_position++;
+                  }
+                }
+                value = context_w.charCodeAt(0);
+                for (i=0 ; i<8 ; i++) {
+                  context_data_val = (context_data_val << 1) | (value&1);
+                  if (context_data_position == bitsPerChar-1) {
+                    context_data_position = 0;
+                    context_data.push(getCharFromInt(context_data_val));
+                    context_data_val = 0;
+                  } else {
+                    context_data_position++;
+                  }
+                  value = value >> 1;
+                }
+              } else {
+                value = 1;
+                for (i=0 ; i<context_numBits ; i++) {
+                  context_data_val = (context_data_val << 1) | value;
+                  if (context_data_position ==bitsPerChar-1) {
+                    context_data_position = 0;
+                    context_data.push(getCharFromInt(context_data_val));
+                    context_data_val = 0;
+                  } else {
+                    context_data_position++;
+                  }
+                  value = 0;
+                }
+                value = context_w.charCodeAt(0);
+                for (i=0 ; i<16 ; i++) {
+                  context_data_val = (context_data_val << 1) | (value&1);
+                  if (context_data_position == bitsPerChar-1) {
+                    context_data_position = 0;
+                    context_data.push(getCharFromInt(context_data_val));
+                    context_data_val = 0;
+                  } else {
+                    context_data_position++;
+                  }
+                  value = value >> 1;
+                }
+              }
+              context_enlargeIn--;
+              if (context_enlargeIn == 0) {
+                context_enlargeIn = Math.pow(2, context_numBits);
+                context_numBits++;
+              }
+              delete context_dictionaryToCreate[context_w];
+            } else {
+              value = context_dictionary[context_w];
+              for (i=0 ; i<context_numBits ; i++) {
+                context_data_val = (context_data_val << 1) | (value&1);
+                if (context_data_position == bitsPerChar-1) {
+                  context_data_position = 0;
+                  context_data.push(getCharFromInt(context_data_val));
+                  context_data_val = 0;
+                } else {
+                  context_data_position++;
+                }
+                value = value >> 1;
+              }
+
+
+            }
+            context_enlargeIn--;
+            if (context_enlargeIn == 0) {
+              context_enlargeIn = Math.pow(2, context_numBits);
+              context_numBits++;
+            }
+            // Add wc to the dictionary.
+            context_dictionary[context_wc] = context_dictSize++;
+            context_w = String(context_c);
+          }
+        }
+
+        // Output the code for w.
+        if (context_w !== "") {
+          if (Object.prototype.hasOwnProperty.call(context_dictionaryToCreate,context_w)) {
+            if (context_w.charCodeAt(0)<256) {
+              for (i=0 ; i<context_numBits ; i++) {
+                context_data_val = (context_data_val << 1);
+                if (context_data_position == bitsPerChar-1) {
+                  context_data_position = 0;
+                  context_data.push(getCharFromInt(context_data_val));
+                  context_data_val = 0;
+                } else {
+                  context_data_position++;
+                }
+              }
+              value = context_w.charCodeAt(0);
+              for (i=0 ; i<8 ; i++) {
+                context_data_val = (context_data_val << 1) | (value&1);
+                if (context_data_position == bitsPerChar-1) {
+                  context_data_position = 0;
+                  context_data.push(getCharFromInt(context_data_val));
+                  context_data_val = 0;
+                } else {
+                  context_data_position++;
+                }
+                value = value >> 1;
+              }
+            } else {
+              value = 1;
+              for (i=0 ; i<context_numBits ; i++) {
+                context_data_val = (context_data_val << 1) | value;
+                if (context_data_position == bitsPerChar-1) {
+                  context_data_position = 0;
+                  context_data.push(getCharFromInt(context_data_val));
+                  context_data_val = 0;
+                } else {
+                  context_data_position++;
+                }
+                value = 0;
+              }
+              value = context_w.charCodeAt(0);
+              for (i=0 ; i<16 ; i++) {
+                context_data_val = (context_data_val << 1) | (value&1);
+                if (context_data_position == bitsPerChar-1) {
+                  context_data_position = 0;
+                  context_data.push(getCharFromInt(context_data_val));
+                  context_data_val = 0;
+                } else {
+                  context_data_position++;
+                }
+                value = value >> 1;
+              }
+            }
+            context_enlargeIn--;
+            if (context_enlargeIn == 0) {
+              context_enlargeIn = Math.pow(2, context_numBits);
+              context_numBits++;
+            }
+            delete context_dictionaryToCreate[context_w];
+          } else {
+            value = context_dictionary[context_w];
+            for (i=0 ; i<context_numBits ; i++) {
+              context_data_val = (context_data_val << 1) | (value&1);
+              if (context_data_position == bitsPerChar-1) {
+                context_data_position = 0;
+                context_data.push(getCharFromInt(context_data_val));
+                context_data_val = 0;
+              } else {
+                context_data_position++;
+              }
+              value = value >> 1;
+            }
+
+
+          }
+          context_enlargeIn--;
+          if (context_enlargeIn == 0) {
+            context_enlargeIn = Math.pow(2, context_numBits);
+            context_numBits++;
+          }
+        }
+
+        // Mark the end of the stream
+        value = 2;
+        for (i=0 ; i<context_numBits ; i++) {
+          context_data_val = (context_data_val << 1) | (value&1);
+          if (context_data_position == bitsPerChar-1) {
+            context_data_position = 0;
+            context_data.push(getCharFromInt(context_data_val));
+            context_data_val = 0;
+          } else {
+            context_data_position++;
+          }
+          value = value >> 1;
+        }
+
+        // Flush the last char
+        while (true) {
+          context_data_val = (context_data_val << 1);
+          if (context_data_position == bitsPerChar-1) {
+            context_data.push(getCharFromInt(context_data_val));
+            break;
+          }
+          else context_data_position++;
+        }
+        return context_data.join('');
+      },
+
+      decompress: function (compressed) {
+        if (compressed == null) return "";
+        if (compressed == "") return null;
+        return LZString._decompress(compressed.length, 32768, function(index) { return compressed.charCodeAt(index); });
+      },
+
+      _decompress: function (length, resetValue, getNextValue) {
+        var dictionary = [],
+            next,
+            enlargeIn = 4,
+            dictSize = 4,
+            numBits = 3,
+            entry = "",
+            result = [],
+            i,
+            w,
+            bits, resb, maxpower, power,
+            c,
+            data = {val:getNextValue(0), position:resetValue, index:1};
+
+        for (i = 0; i < 3; i += 1) {
+          dictionary[i] = i;
+        }
+
+        bits = 0;
+        maxpower = Math.pow(2,2);
+        power=1;
+        while (power!=maxpower) {
+          resb = data.val & data.position;
+          data.position >>= 1;
+          if (data.position == 0) {
+            data.position = resetValue;
+            data.val = getNextValue(data.index++);
+          }
+          bits |= (resb>0 ? 1 : 0) * power;
+          power <<= 1;
+        }
+
+        switch (next = bits) {
+          case 0:
+              bits = 0;
+              maxpower = Math.pow(2,8);
+              power=1;
+              while (power!=maxpower) {
+                resb = data.val & data.position;
+                data.position >>= 1;
+                if (data.position == 0) {
+                  data.position = resetValue;
+                  data.val = getNextValue(data.index++);
+                }
+                bits |= (resb>0 ? 1 : 0) * power;
+                power <<= 1;
+              }
+            c = f(bits);
+            break;
+          case 1:
+              bits = 0;
+              maxpower = Math.pow(2,16);
+              power=1;
+              while (power!=maxpower) {
+                resb = data.val & data.position;
+                data.position >>= 1;
+                if (data.position == 0) {
+                  data.position = resetValue;
+                  data.val = getNextValue(data.index++);
+                }
+                bits |= (resb>0 ? 1 : 0) * power;
+                power <<= 1;
+              }
+            c = f(bits);
+            break;
+          case 2:
+            return "";
+        }
+        dictionary[3] = c;
+        w = c;
+        result.push(c);
+        while (true) {
+          if (data.index > length) {
+            return "";
+          }
+
+          bits = 0;
+          maxpower = Math.pow(2,numBits);
+          power=1;
+          while (power!=maxpower) {
+            resb = data.val & data.position;
+            data.position >>= 1;
+            if (data.position == 0) {
+              data.position = resetValue;
+              data.val = getNextValue(data.index++);
+            }
+            bits |= (resb>0 ? 1 : 0) * power;
+            power <<= 1;
+          }
+
+          switch (c = bits) {
+            case 0:
+              bits = 0;
+              maxpower = Math.pow(2,8);
+              power=1;
+              while (power!=maxpower) {
+                resb = data.val & data.position;
+                data.position >>= 1;
+                if (data.position == 0) {
+                  data.position = resetValue;
+                  data.val = getNextValue(data.index++);
+                }
+                bits |= (resb>0 ? 1 : 0) * power;
+                power <<= 1;
+              }
+
+              dictionary[dictSize++] = f(bits);
+              c = dictSize-1;
+              enlargeIn--;
+              break;
+            case 1:
+              bits = 0;
+              maxpower = Math.pow(2,16);
+              power=1;
+              while (power!=maxpower) {
+                resb = data.val & data.position;
+                data.position >>= 1;
+                if (data.position == 0) {
+                  data.position = resetValue;
+                  data.val = getNextValue(data.index++);
+                }
+                bits |= (resb>0 ? 1 : 0) * power;
+                power <<= 1;
+              }
+              dictionary[dictSize++] = f(bits);
+              c = dictSize-1;
+              enlargeIn--;
+              break;
+            case 2:
+              return result.join('');
+          }
+
+          if (enlargeIn == 0) {
+            enlargeIn = Math.pow(2, numBits);
+            numBits++;
+          }
+
+          if (dictionary[c]) {
+            entry = dictionary[c];
+          } else {
+            if (c === dictSize) {
+              entry = w + w.charAt(0);
+            } else {
+              return null;
+            }
+          }
+          result.push(entry);
+
+          // Add w+entry[0] to the dictionary.
+          dictionary[dictSize++] = w + entry.charAt(0);
+          enlargeIn--;
+
+          w = entry;
+
+          if (enlargeIn == 0) {
+            enlargeIn = Math.pow(2, numBits);
+            numBits++;
+          }
+
+        }
+      }
+    };
+      return LZString;
+    })();
+
+    if(  module != null ) {
+      module.exports = LZString;
+    }
+    });
 
     var store2 = createCommonjsModule(function (module) {
     (function(window, define) {
@@ -655,6 +1411,16432 @@ var app = (function () {
 
     })(commonjsGlobal, commonjsGlobal && commonjsGlobal.define);
     });
+
+    var StreamSaver = createCommonjsModule(function (module) {
+    ((name, definition) => {
+       module.exports = definition()
+        ;
+    })('streamSaver', () => {
+
+      let mitmTransporter = null;
+      let supportsTransferable = false;
+      const test = fn => { try { fn(); } catch (e) {} };
+      const ponyfill = window.WebStreamsPolyfill || {};
+      const isSecureContext = window.isSecureContext;
+      let useBlobFallback = /constructor/i.test(window.HTMLElement) || !!window.safari;
+      const downloadStrategy = isSecureContext || 'MozAppearance' in document.documentElement.style
+        ? 'iframe'
+        : 'navigate';
+
+      const streamSaver = {
+        createWriteStream,
+        WritableStream: window.WritableStream || ponyfill.WritableStream,
+        supported: true,
+        version: { full: '2.0.0', major: 2, minor: 0, dot: 0 },
+        mitm: 'https://jimmywarting.github.io/StreamSaver.js/mitm.html?version=2.0.0'
+      };
+
+      /**
+       * create a hidden iframe and append it to the DOM (body)
+       *
+       * @param  {string} src page to load
+       * @return {HTMLIFrameElement} page to load
+       */
+      function makeIframe (src) {
+        if (!src) throw new Error('meh')
+        const iframe = document.createElement('iframe');
+        iframe.hidden = true;
+        iframe.src = src;
+        iframe.loaded = false;
+        iframe.name = 'iframe';
+        iframe.isIframe = true;
+        iframe.postMessage = (...args) => iframe.contentWindow.postMessage(...args);
+        iframe.addEventListener('load', () => {
+          iframe.loaded = true;
+        }, { once: true });
+        document.body.appendChild(iframe);
+        return iframe
+      }
+
+      /**
+       * create a popup that simulates the basic things
+       * of what a iframe can do
+       *
+       * @param  {string} src page to load
+       * @return {object}     iframe like object
+       */
+      function makePopup (src) {
+        const options = 'width=200,height=100';
+        const delegate = document.createDocumentFragment();
+        const popup = {
+          frame: window.open(src, 'popup', options),
+          loaded: false,
+          isIframe: false,
+          isPopup: true,
+          remove () { popup.frame.close(); },
+          addEventListener (...args) { delegate.addEventListener(...args); },
+          dispatchEvent (...args) { delegate.dispatchEvent(...args); },
+          removeEventListener (...args) { delegate.removeEventListener(...args); },
+          postMessage (...args) { popup.frame.postMessage(...args); }
+        };
+
+        const onReady = evt => {
+          if (evt.source === popup.frame) {
+            popup.loaded = true;
+            window.removeEventListener('message', onReady);
+            popup.dispatchEvent(new Event('load'));
+          }
+        };
+
+        window.addEventListener('message', onReady);
+
+        return popup
+      }
+
+      try {
+        // We can't look for service worker since it may still work on http
+        new Response(new ReadableStream());
+        if (isSecureContext && !('serviceWorker' in navigator)) {
+          useBlobFallback = true;
+        }
+      } catch (err) {
+        useBlobFallback = true;
+      }
+
+      test(() => {
+        // Transfariable stream was first enabled in chrome v73 behind a flag
+        const { readable } = new TransformStream();
+        const mc = new MessageChannel();
+        mc.port1.postMessage(readable, [readable]);
+        mc.port1.close();
+        mc.port2.close();
+        supportsTransferable = true;
+        // Freeze TransformStream object (can only work with native)
+        Object.defineProperty(streamSaver, 'TransformStream', {
+          configurable: false,
+          writable: false,
+          value: TransformStream
+        });
+      });
+
+      function loadTransporter () {
+        if (!mitmTransporter) {
+          mitmTransporter = isSecureContext
+            ? makeIframe(streamSaver.mitm)
+            : makePopup(streamSaver.mitm);
+        }
+      }
+
+      /**
+       * @param  {string} filename filename that should be used
+       * @param  {object} options  [description]
+       * @param  {number} size     depricated
+       * @return {WritableStream}
+       */
+      function createWriteStream (filename, options, size) {
+        let opts = {
+          size: null,
+          pathname: null,
+          writableStrategy: undefined,
+          readableStrategy: undefined
+        };
+
+        // normalize arguments
+        if (Number.isFinite(options)) {
+          [ size, options ] = [ options, size ];
+          console.warn('[StreamSaver] Depricated pass an object as 2nd argument when creating a write stream');
+          opts.size = size;
+          opts.writableStrategy = options;
+        } else if (options && options.highWaterMark) {
+          console.warn('[StreamSaver] Depricated pass an object as 2nd argument when creating a write stream');
+          opts.size = size;
+          opts.writableStrategy = options;
+        } else {
+          opts = options || {};
+        }
+        if (!useBlobFallback) {
+          loadTransporter();
+
+          var bytesWritten = 0; // by StreamSaver.js (not the service worker)
+          var downloadUrl = null;
+          var channel = new MessageChannel();
+
+          // Make filename RFC5987 compatible
+          filename = encodeURIComponent(filename.replace(/\//g, ':'))
+            .replace(/['()]/g, escape)
+            .replace(/\*/g, '%2A');
+
+          const response = {
+            transferringReadable: supportsTransferable,
+            pathname: opts.pathname || Math.random().toString().slice(-6) + '/' + filename,
+            headers: {
+              'Content-Type': 'application/octet-stream; charset=utf-8',
+              'Content-Disposition': "attachment; filename*=UTF-8''" + filename
+            }
+          };
+
+          if (opts.size) {
+            response.headers['Content-Length'] = opts.size;
+          }
+
+          const args = [ response, '*', [ channel.port2 ] ];
+
+          if (supportsTransferable) {
+            const transformer = downloadStrategy === 'iframe' ? undefined : {
+              // This transformer & flush method is only used by insecure context.
+              transform (chunk, controller) {
+                bytesWritten += chunk.length;
+                controller.enqueue(chunk);
+
+                if (downloadUrl) {
+                  location.href = downloadUrl;
+                  downloadUrl = null;
+                }
+              },
+              flush () {
+                if (downloadUrl) {
+                  location.href = downloadUrl;
+                }
+              }
+            };
+            var ts = new streamSaver.TransformStream(
+              transformer,
+              opts.writableStrategy,
+              opts.readableStrategy
+            );
+            const readableStream = ts.readable;
+
+            channel.port1.postMessage({ readableStream }, [ readableStream ]);
+          }
+
+          channel.port1.onmessage = evt => {
+            // Service worker sent us a link that we should open.
+            if (evt.data.download) {
+              // Special treatment for popup...
+              if (downloadStrategy === 'navigate') {
+                mitmTransporter.remove();
+                mitmTransporter = null;
+                if (bytesWritten) {
+                  location.href = evt.data.download;
+                } else {
+                  downloadUrl = evt.data.download;
+                }
+              } else {
+                if (mitmTransporter.isPopup) {
+                  mitmTransporter.remove();
+                  // Special case for firefox, they can keep sw alive with fetch
+                  if (downloadStrategy === 'iframe') {
+                    makeIframe(streamSaver.mitm);
+                  }
+                }
+
+                // We never remove this iframes b/c it can interrupt saving
+                makeIframe(evt.data.download);
+              }
+            }
+          };
+
+          if (mitmTransporter.loaded) {
+            mitmTransporter.postMessage(...args);
+          } else {
+            mitmTransporter.addEventListener('load', () => {
+              mitmTransporter.postMessage(...args);
+            }, { once: true });
+          }
+        }
+
+        let chunks = [];
+
+        return (!useBlobFallback && ts && ts.writable) || new streamSaver.WritableStream({
+          write (chunk) {
+            if (useBlobFallback) {
+              // Safari... The new IE6
+              // https://github.com/jimmywarting/StreamSaver.js/issues/69
+              //
+              // even doe it has everything it fails to download anything
+              // that comes from the service worker..!
+              chunks.push(chunk);
+              return
+            }
+
+            // is called when a new chunk of data is ready to be written
+            // to the underlying sink. It can return a promise to signal
+            // success or failure of the write operation. The stream
+            // implementation guarantees that this method will be called
+            // only after previous writes have succeeded, and never after
+            // close or abort is called.
+
+            // TODO: Kind of important that service worker respond back when
+            // it has been written. Otherwise we can't handle backpressure
+            // EDIT: Transfarable streams solvs this...
+            channel.port1.postMessage(chunk);
+            bytesWritten += chunk.length;
+
+            if (downloadUrl) {
+              location.href = downloadUrl;
+              downloadUrl = null;
+            }
+          },
+          close () {
+            if (useBlobFallback) {
+              const blob = new Blob(chunks, { type: 'application/octet-stream; charset=utf-8' });
+              const link = document.createElement('a');
+              link.href = URL.createObjectURL(blob);
+              link.download = filename;
+              link.click();
+            } else {
+              channel.port1.postMessage('end');
+            }
+          },
+          abort () {
+            chunks = [];
+            channel.port1.postMessage('abort');
+            channel.port1.onmessage = null;
+            channel.port1.close();
+            channel.port2.close();
+            channel = null;
+          }
+        }, opts.writableStrategy)
+      }
+
+      return streamSaver
+    });
+    });
+
+    /* src\components\paramsBuilder.svelte generated by Svelte v3.12.1 */
+
+    const file = "src\\components\\paramsBuilder.svelte";
+
+    function get_each_context_2(ctx, list, i) {
+    	const child_ctx = Object.create(ctx);
+    	child_ctx.choice = list[i];
+    	return child_ctx;
+    }
+
+    function get_each_context_1(ctx, list, i) {
+    	const child_ctx = Object.create(ctx);
+    	child_ctx.choice = list[i];
+    	return child_ctx;
+    }
+
+    function get_each_context(ctx, list, i) {
+    	const child_ctx = Object.create(ctx);
+    	child_ctx.key = list[i][0];
+    	child_ctx.val = list[i][1];
+    	child_ctx.index = i;
+    	return child_ctx;
+    }
+
+    // (61:4) {#if (!isDisabled(key, props))}
+    function create_if_block(ctx) {
+    	var div0, t0_value = ctx.key + "", t0, t1, div1, show_if, t2, index = ctx.index, div1_class_value, div1_data_tooltip_value, dispose;
+
+    	function select_block_type(changed, ctx) {
+    		if ((show_if == null) || changed.props) show_if = !!(Array.isArray(ctx.val.type));
+    		if (show_if) return create_if_block_1;
+    		if (ctx.val.type === 'number') return create_if_block_2;
+    		if (ctx.val.type === 'string') return create_if_block_3;
+    		if (ctx.val.type === 'auto') return create_if_block_4;
+    		return create_else_block;
+    	}
+
+    	var current_block_type = select_block_type(null, ctx);
+    	var if_block = current_block_type(ctx);
+
+    	const assign_div1 = () => ctx.div1_binding(div1, index);
+    	const unassign_div1 = () => ctx.div1_binding(null, index);
+
+    	function mouseover_handler(...args) {
+    		return ctx.mouseover_handler(ctx, ...args);
+    	}
+
+    	const block = {
+    		c: function create() {
+    			div0 = element("div");
+    			t0 = text(t0_value);
+    			t1 = space();
+    			div1 = element("div");
+    			if_block.c();
+    			t2 = space();
+    			attr_dev(div0, "class", "input-title svelte-1ko1yj5");
+    			add_location(div0, file, 61, 8, 1444);
+    			attr_dev(div1, "class", div1_class_value = "" + null_to_empty(((ctx.index !== Object.keys(ctx.props).length - 1) ? 'tooltip-left' : 'tooltip-up-left')) + " svelte-1ko1yj5");
+    			attr_dev(div1, "data-tooltip", div1_data_tooltip_value = ctx.val.description);
+    			add_location(div1, file, 62, 8, 1490);
+    			dispose = listen_dev(div1, "mouseover", mouseover_handler);
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, div0, anchor);
+    			append_dev(div0, t0);
+    			insert_dev(target, t1, anchor);
+    			insert_dev(target, div1, anchor);
+    			if_block.m(div1, null);
+    			append_dev(div1, t2);
+    			assign_div1();
+    		},
+
+    		p: function update(changed, new_ctx) {
+    			ctx = new_ctx;
+    			if ((changed.props) && t0_value !== (t0_value = ctx.key + "")) {
+    				set_data_dev(t0, t0_value);
+    			}
+
+    			if (current_block_type === (current_block_type = select_block_type(changed, ctx)) && if_block) {
+    				if_block.p(changed, ctx);
+    			} else {
+    				if_block.d(1);
+    				if_block = current_block_type(ctx);
+    				if (if_block) {
+    					if_block.c();
+    					if_block.m(div1, t2);
+    				}
+    			}
+
+    			if (index !== ctx.index) {
+    				unassign_div1();
+    				index = ctx.index;
+    				assign_div1();
+    			}
+
+    			if ((changed.props) && div1_class_value !== (div1_class_value = "" + null_to_empty(((ctx.index !== Object.keys(ctx.props).length - 1) ? 'tooltip-left' : 'tooltip-up-left')) + " svelte-1ko1yj5")) {
+    				attr_dev(div1, "class", div1_class_value);
+    			}
+
+    			if ((changed.props) && div1_data_tooltip_value !== (div1_data_tooltip_value = ctx.val.description)) {
+    				attr_dev(div1, "data-tooltip", div1_data_tooltip_value);
+    			}
+    		},
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(div0);
+    				detach_dev(t1);
+    				detach_dev(div1);
+    			}
+
+    			if_block.d();
+    			unassign_div1();
+    			dispose();
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block.name, type: "if", source: "(61:4) {#if (!isDisabled(key, props))}", ctx });
+    	return block;
+    }
+
+    // (90:8) {:else}
+    function create_else_block(ctx) {
+    	var select, t, input, dispose;
+
+    	let each_value_2 = JSON.parse(ctx.val.options);
+
+    	let each_blocks = [];
+
+    	for (let i = 0; i < each_value_2.length; i += 1) {
+    		each_blocks[i] = create_each_block_2(get_each_context_2(ctx, each_value_2, i));
+    	}
+
+    	function select_change_handler_1() {
+    		ctx.select_change_handler_1.call(select, ctx);
+    	}
+
+    	function input_input_handler_3() {
+    		ctx.input_input_handler_3.call(input, ctx);
+    	}
+
+    	const block = {
+    		c: function create() {
+    			select = element("select");
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].c();
+    			}
+
+    			t = space();
+    			input = element("input");
+    			if (ctx.props[ctx.key].value === void 0) add_render_callback(select_change_handler_1);
+    			attr_dev(select, "class", "svelte-1ko1yj5");
+    			add_location(select, file, 90, 12, 3070);
+    			attr_dev(input, "type", "text");
+    			attr_dev(input, "class", "svelte-1ko1yj5");
+    			add_location(input, file, 95, 12, 3369);
+
+    			dispose = [
+    				listen_dev(select, "change", select_change_handler_1),
+    				listen_dev(select, "change", ctx.change_handler_3),
+    				listen_dev(input, "input", input_input_handler_3),
+    				listen_dev(input, "change", ctx.change_handler_4)
+    			];
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, select, anchor);
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].m(select, null);
+    			}
+
+    			select_option(select, ctx.props[ctx.key].value);
+
+    			insert_dev(target, t, anchor);
+    			insert_dev(target, input, anchor);
+
+    			set_input_value(input, ctx.props[ctx.key].value);
+    		},
+
+    		p: function update(changed, new_ctx) {
+    			ctx = new_ctx;
+    			if (changed.props) {
+    				each_value_2 = JSON.parse(ctx.val.options);
+
+    				let i;
+    				for (i = 0; i < each_value_2.length; i += 1) {
+    					const child_ctx = get_each_context_2(ctx, each_value_2, i);
+
+    					if (each_blocks[i]) {
+    						each_blocks[i].p(changed, child_ctx);
+    					} else {
+    						each_blocks[i] = create_each_block_2(child_ctx);
+    						each_blocks[i].c();
+    						each_blocks[i].m(select, null);
+    					}
+    				}
+
+    				for (; i < each_blocks.length; i += 1) {
+    					each_blocks[i].d(1);
+    				}
+    				each_blocks.length = each_value_2.length;
+    			}
+
+    			if (changed.props) select_option(select, ctx.props[ctx.key].value);
+    			if (changed.props && (input.value !== ctx.props[ctx.key].value)) set_input_value(input, ctx.props[ctx.key].value);
+    		},
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(select);
+    			}
+
+    			destroy_each(each_blocks, detaching);
+
+    			if (detaching) {
+    				detach_dev(t);
+    				detach_dev(input);
+    			}
+
+    			run_all(dispose);
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_else_block.name, type: "else", source: "(90:8) {:else}", ctx });
+    	return block;
+    }
+
+    // (88:38) 
+    function create_if_block_4(ctx) {
+    	var input, dispose;
+
+    	function input_input_handler_2() {
+    		ctx.input_input_handler_2.call(input, ctx);
+    	}
+
+    	const block = {
+    		c: function create() {
+    			input = element("input");
+    			attr_dev(input, "type", "text");
+    			input.disabled = true;
+    			attr_dev(input, "class", "svelte-1ko1yj5");
+    			add_location(input, file, 88, 12, 2978);
+    			dispose = listen_dev(input, "input", input_input_handler_2);
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, input, anchor);
+
+    			set_input_value(input, ctx.props[ctx.key].value);
+    		},
+
+    		p: function update(changed, new_ctx) {
+    			ctx = new_ctx;
+    			if (changed.props && (input.value !== ctx.props[ctx.key].value)) set_input_value(input, ctx.props[ctx.key].value);
+    		},
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(input);
+    			}
+
+    			dispose();
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_4.name, type: "if", source: "(88:38) ", ctx });
+    	return block;
+    }
+
+    // (86:40) 
+    function create_if_block_3(ctx) {
+    	var input, dispose;
+
+    	function input_input_handler_1() {
+    		ctx.input_input_handler_1.call(input, ctx);
+    	}
+
+    	const block = {
+    		c: function create() {
+    			input = element("input");
+    			attr_dev(input, "type", "text");
+    			attr_dev(input, "class", "svelte-1ko1yj5");
+    			add_location(input, file, 86, 12, 2831);
+
+    			dispose = [
+    				listen_dev(input, "input", input_input_handler_1),
+    				listen_dev(input, "change", ctx.change_handler_2)
+    			];
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, input, anchor);
+
+    			set_input_value(input, ctx.props[ctx.key].value);
+    		},
+
+    		p: function update(changed, new_ctx) {
+    			ctx = new_ctx;
+    			if (changed.props && (input.value !== ctx.props[ctx.key].value)) set_input_value(input, ctx.props[ctx.key].value);
+    		},
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(input);
+    			}
+
+    			run_all(dispose);
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_3.name, type: "if", source: "(86:40) ", ctx });
+    	return block;
+    }
+
+    // (84:40) 
+    function create_if_block_2(ctx) {
+    	var input, input_updating = false, dispose;
+
+    	function input_input_handler() {
+    		input_updating = true;
+    		ctx.input_input_handler.call(input, ctx);
+    	}
+
+    	const block = {
+    		c: function create() {
+    			input = element("input");
+    			attr_dev(input, "type", "number");
+    			attr_dev(input, "class", "svelte-1ko1yj5");
+    			add_location(input, file, 84, 12, 2679);
+
+    			dispose = [
+    				listen_dev(input, "input", input_input_handler),
+    				listen_dev(input, "change", ctx.change_handler_1)
+    			];
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, input, anchor);
+
+    			set_input_value(input, ctx.props[ctx.key].value);
+    		},
+
+    		p: function update(changed, new_ctx) {
+    			ctx = new_ctx;
+    			if (!input_updating && changed.props) set_input_value(input, ctx.props[ctx.key].value);
+    			input_updating = false;
+    		},
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(input);
+    			}
+
+    			run_all(dispose);
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_2.name, type: "if", source: "(84:40) ", ctx });
+    	return block;
+    }
+
+    // (78:8) {#if Array.isArray(val.type)}
+    function create_if_block_1(ctx) {
+    	var select, dispose;
+
+    	let each_value_1 = ctx.val.type;
+
+    	let each_blocks = [];
+
+    	for (let i = 0; i < each_value_1.length; i += 1) {
+    		each_blocks[i] = create_each_block_1(get_each_context_1(ctx, each_value_1, i));
+    	}
+
+    	function select_change_handler() {
+    		ctx.select_change_handler.call(select, ctx);
+    	}
+
+    	const block = {
+    		c: function create() {
+    			select = element("select");
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].c();
+    			}
+    			if (ctx.props[ctx.key].value === void 0) add_render_callback(select_change_handler);
+    			attr_dev(select, "class", "svelte-1ko1yj5");
+    			add_location(select, file, 78, 12, 2353);
+
+    			dispose = [
+    				listen_dev(select, "change", select_change_handler),
+    				listen_dev(select, "change", ctx.change_handler)
+    			];
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, select, anchor);
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].m(select, null);
+    			}
+
+    			select_option(select, ctx.props[ctx.key].value);
+    		},
+
+    		p: function update(changed, new_ctx) {
+    			ctx = new_ctx;
+    			if (changed.props) {
+    				each_value_1 = ctx.val.type;
+
+    				let i;
+    				for (i = 0; i < each_value_1.length; i += 1) {
+    					const child_ctx = get_each_context_1(ctx, each_value_1, i);
+
+    					if (each_blocks[i]) {
+    						each_blocks[i].p(changed, child_ctx);
+    					} else {
+    						each_blocks[i] = create_each_block_1(child_ctx);
+    						each_blocks[i].c();
+    						each_blocks[i].m(select, null);
+    					}
+    				}
+
+    				for (; i < each_blocks.length; i += 1) {
+    					each_blocks[i].d(1);
+    				}
+    				each_blocks.length = each_value_1.length;
+    			}
+
+    			if (changed.props) select_option(select, ctx.props[ctx.key].value);
+    		},
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(select);
+    			}
+
+    			destroy_each(each_blocks, detaching);
+
+    			run_all(dispose);
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_1.name, type: "if", source: "(78:8) {#if Array.isArray(val.type)}", ctx });
+    	return block;
+    }
+
+    // (92:16) {#each JSON.parse(val.options) as choice}
+    function create_each_block_2(ctx) {
+    	var option, t_value = ctx.choice + "", t, option_value_value, option_selected_value;
+
+    	const block = {
+    		c: function create() {
+    			option = element("option");
+    			t = text(t_value);
+    			option.__value = option_value_value = ctx.choice;
+    			option.value = option.__value;
+    			option.selected = option_selected_value = ctx.choice === ctx.val.value;
+    			add_location(option, file, 92, 20, 3231);
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, option, anchor);
+    			append_dev(option, t);
+    		},
+
+    		p: function update(changed, ctx) {
+    			if ((changed.props) && t_value !== (t_value = ctx.choice + "")) {
+    				set_data_dev(t, t_value);
+    			}
+
+    			if ((changed.props) && option_value_value !== (option_value_value = ctx.choice)) {
+    				prop_dev(option, "__value", option_value_value);
+    			}
+
+    			option.value = option.__value;
+
+    			if ((changed.props) && option_selected_value !== (option_selected_value = ctx.choice === ctx.val.value)) {
+    				prop_dev(option, "selected", option_selected_value);
+    			}
+    		},
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(option);
+    			}
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_2.name, type: "each", source: "(92:16) {#each JSON.parse(val.options) as choice}", ctx });
+    	return block;
+    }
+
+    // (80:16) {#each val.type as choice}
+    function create_each_block_1(ctx) {
+    	var option, t_value = ctx.choice + "", t, option_value_value, option_selected_value;
+
+    	const block = {
+    		c: function create() {
+    			option = element("option");
+    			t = text(t_value);
+    			option.__value = option_value_value = ctx.choice;
+    			option.value = option.__value;
+    			option.selected = option_selected_value = ctx.choice === ctx.val.value;
+    			add_location(option, file, 80, 20, 2499);
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, option, anchor);
+    			append_dev(option, t);
+    		},
+
+    		p: function update(changed, ctx) {
+    			if ((changed.props) && t_value !== (t_value = ctx.choice + "")) {
+    				set_data_dev(t, t_value);
+    			}
+
+    			if ((changed.props) && option_value_value !== (option_value_value = ctx.choice)) {
+    				prop_dev(option, "__value", option_value_value);
+    			}
+
+    			option.value = option.__value;
+
+    			if ((changed.props) && option_selected_value !== (option_selected_value = ctx.choice === ctx.val.value)) {
+    				prop_dev(option, "selected", option_selected_value);
+    			}
+    		},
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(option);
+    			}
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_1.name, type: "each", source: "(80:16) {#each val.type as choice}", ctx });
+    	return block;
+    }
+
+    // (60:0) {#each Object.entries(props) as [key, val], index}
+    function create_each_block(ctx) {
+    	var show_if = (!ctx.isDisabled(ctx.key, ctx.props)), if_block_anchor;
+
+    	var if_block = (show_if) && create_if_block(ctx);
+
+    	const block = {
+    		c: function create() {
+    			if (if_block) if_block.c();
+    			if_block_anchor = empty();
+    		},
+
+    		m: function mount(target, anchor) {
+    			if (if_block) if_block.m(target, anchor);
+    			insert_dev(target, if_block_anchor, anchor);
+    		},
+
+    		p: function update(changed, ctx) {
+    			if (changed.isDisabled || changed.props) show_if = (!ctx.isDisabled(ctx.key, ctx.props));
+
+    			if (show_if) {
+    				if (if_block) {
+    					if_block.p(changed, ctx);
+    				} else {
+    					if_block = create_if_block(ctx);
+    					if_block.c();
+    					if_block.m(if_block_anchor.parentNode, if_block_anchor);
+    				}
+    			} else if (if_block) {
+    				if_block.d(1);
+    				if_block = null;
+    			}
+    		},
+
+    		d: function destroy(detaching) {
+    			if (if_block) if_block.d(detaching);
+
+    			if (detaching) {
+    				detach_dev(if_block_anchor);
+    			}
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block.name, type: "each", source: "(60:0) {#each Object.entries(props) as [key, val], index}", ctx });
+    	return block;
+    }
+
+    function create_fragment(ctx) {
+    	var each_1_anchor;
+
+    	let each_value = Object.entries(ctx.props);
+
+    	let each_blocks = [];
+
+    	for (let i = 0; i < each_value.length; i += 1) {
+    		each_blocks[i] = create_each_block(get_each_context(ctx, each_value, i));
+    	}
+
+    	const block = {
+    		c: function create() {
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].c();
+    			}
+
+    			each_1_anchor = empty();
+    		},
+
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+
+    		m: function mount(target, anchor) {
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].m(target, anchor);
+    			}
+
+    			insert_dev(target, each_1_anchor, anchor);
+    		},
+
+    		p: function update(changed, ctx) {
+    			if (changed.isDisabled || changed.props || changed.items) {
+    				each_value = Object.entries(ctx.props);
+
+    				let i;
+    				for (i = 0; i < each_value.length; i += 1) {
+    					const child_ctx = get_each_context(ctx, each_value, i);
+
+    					if (each_blocks[i]) {
+    						each_blocks[i].p(changed, child_ctx);
+    					} else {
+    						each_blocks[i] = create_each_block(child_ctx);
+    						each_blocks[i].c();
+    						each_blocks[i].m(each_1_anchor.parentNode, each_1_anchor);
+    					}
+    				}
+
+    				for (; i < each_blocks.length; i += 1) {
+    					each_blocks[i].d(1);
+    				}
+    				each_blocks.length = each_value.length;
+    			}
+    		},
+
+    		i: noop,
+    		o: noop,
+
+    		d: function destroy(detaching) {
+    			destroy_each(each_blocks, detaching);
+
+    			if (detaching) {
+    				detach_dev(each_1_anchor);
+    			}
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment.name, type: "component", source: "", ctx });
+    	return block;
+    }
+
+    function instance($$self, $$props, $$invalidate) {
+    	let { props = {}, isDisabled = false } = $$props;
+        let items = [];
+
+        const dispatch = createEventDispatcher();
+
+    	const writable_props = ['props', 'isDisabled'];
+    	Object.keys($$props).forEach(key => {
+    		if (!writable_props.includes(key) && !key.startsWith('$$')) console.warn(`<ParamsBuilder> was created with unknown prop '${key}'`);
+    	});
+
+    	function select_change_handler({ key }) {
+    		props[key].value = select_value(this);
+    		$$invalidate('props', props);
+    	}
+
+    	const change_handler = () => dispatch('dataChanged');
+
+    	function input_input_handler({ key }) {
+    		props[key].value = to_number(this.value);
+    		$$invalidate('props', props);
+    	}
+
+    	const change_handler_1 = () => dispatch('dataChanged');
+
+    	function input_input_handler_1({ key }) {
+    		props[key].value = this.value;
+    		$$invalidate('props', props);
+    	}
+
+    	const change_handler_2 = () => dispatch('dataChanged');
+
+    	function input_input_handler_2({ key }) {
+    		props[key].value = this.value;
+    		$$invalidate('props', props);
+    	}
+
+    	function select_change_handler_1({ key }) {
+    		props[key].value = select_value(this);
+    		$$invalidate('props', props);
+    	}
+
+    	const change_handler_3 = () => dispatch('dataChanged');
+
+    	function input_input_handler_3({ key }) {
+    		props[key].value = this.value;
+    		$$invalidate('props', props);
+    	}
+
+    	const change_handler_4 = () => dispatch('dataChanged');
+
+    	function div1_binding($$value, index) {
+    		if (items[index] === $$value) return;
+    		binding_callbacks[$$value ? 'unshift' : 'push'](() => {
+    			items[index] = $$value;
+    			$$invalidate('items', items);
+    		});
+    	}
+
+    	const mouseover_handler = ({ index }, evt) => {
+    	                let self = items[index];
+    	                let bounds = self.getBoundingClientRect();
+    	                let styles = window.getComputedStyle(self, ':after');
+    	                self.style.setProperty('--position-right', `${bounds.left - 5}px`);
+    	                self.style.setProperty('--position-top', `${
+	                    (bounds.top + parseInt(styles.getPropertyValue('height')) > window.innerHeight) ? 
+	                    window.innerHeight - parseInt(styles.getPropertyValue('height')) - 10 : bounds.top 
+	                }px`);
+    	            };
+
+    	$$self.$set = $$props => {
+    		if ('props' in $$props) $$invalidate('props', props = $$props.props);
+    		if ('isDisabled' in $$props) $$invalidate('isDisabled', isDisabled = $$props.isDisabled);
+    	};
+
+    	$$self.$capture_state = () => {
+    		return { props, isDisabled, items };
+    	};
+
+    	$$self.$inject_state = $$props => {
+    		if ('props' in $$props) $$invalidate('props', props = $$props.props);
+    		if ('isDisabled' in $$props) $$invalidate('isDisabled', isDisabled = $$props.isDisabled);
+    		if ('items' in $$props) $$invalidate('items', items = $$props.items);
+    	};
+
+    	return {
+    		props,
+    		isDisabled,
+    		items,
+    		dispatch,
+    		select_change_handler,
+    		change_handler,
+    		input_input_handler,
+    		change_handler_1,
+    		input_input_handler_1,
+    		change_handler_2,
+    		input_input_handler_2,
+    		select_change_handler_1,
+    		change_handler_3,
+    		input_input_handler_3,
+    		change_handler_4,
+    		div1_binding,
+    		mouseover_handler
+    	};
+    }
+
+    class ParamsBuilder extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance, create_fragment, safe_not_equal, ["props", "isDisabled"]);
+    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "ParamsBuilder", options, id: create_fragment.name });
+    	}
+
+    	get props() {
+    		throw new Error("<ParamsBuilder>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set props(value) {
+    		throw new Error("<ParamsBuilder>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get isDisabled() {
+    		throw new Error("<ParamsBuilder>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set isDisabled(value) {
+    		throw new Error("<ParamsBuilder>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+    }
+
+    /* src\components\timeline.svelte generated by Svelte v3.12.1 */
+
+    const file$1 = "src\\components\\timeline.svelte";
+
+    function get_each_context$1(ctx, list, i) {
+    	const child_ctx = Object.create(ctx);
+    	child_ctx.win = list[i];
+    	child_ctx.i = i;
+    	return child_ctx;
+    }
+
+    // (164:2) {#each windows as win, i}
+    function create_each_block$1(ctx) {
+    	var div, p, t_value = ctx.win.meta.name + "", t, dispose;
+
+    	function click_handler_1() {
+    		return ctx.click_handler_1(ctx);
+    	}
+
+    	const block = {
+    		c: function create() {
+    			div = element("div");
+    			p = element("p");
+    			t = text(t_value);
+    			set_style(p, "justify-self", "center");
+    			set_style(p, "align-self", "center");
+    			set_style(p, "margin", "0");
+    			set_style(p, "position", "absolute");
+    			add_location(p, file$1, 176, 4, 4878);
+    			attr_dev(div, "class", "window");
+    			set_style(div, "height", "100%");
+    			set_style(div, "flex-grow", ctx.win.data.AG_WINDOW_LENGTH.value);
+    			set_style(div, "background-color", ctx.win.meta.color);
+    			set_style(div, "border-right", ((ctx.i !== ctx.windows.length - 1) ? '1px solid black' : 'none'));
+    			set_style(div, "display", "grid");
+    			set_style(div, "position", "relative");
+    			set_style(div, "box-shadow", (ctx.anim.windowIndex == ctx.i ? 'inset 0 0 5px black' : 'none'));
+    			add_location(div, file$1, 164, 3, 4394);
+    			dispose = listen_dev(div, "click", click_handler_1);
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, div, anchor);
+    			append_dev(div, p);
+    			append_dev(p, t);
+    		},
+
+    		p: function update(changed, new_ctx) {
+    			ctx = new_ctx;
+    			if ((changed.windows) && t_value !== (t_value = ctx.win.meta.name + "")) {
+    				set_data_dev(t, t_value);
+    			}
+
+    			if (changed.windows) {
+    				set_style(div, "flex-grow", ctx.win.data.AG_WINDOW_LENGTH.value);
+    				set_style(div, "background-color", ctx.win.meta.color);
+    				set_style(div, "border-right", ((ctx.i !== ctx.windows.length - 1) ? '1px solid black' : 'none'));
+    			}
+
+    			if (changed.anim) {
+    				set_style(div, "box-shadow", (ctx.anim.windowIndex == ctx.i ? 'inset 0 0 5px black' : 'none'));
+    			}
+    		},
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(div);
+    			}
+
+    			dispose();
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block$1.name, type: "each", source: "(164:2) {#each windows as win, i}", ctx });
+    	return block;
+    }
+
+    // (197:39) 
+    function create_if_block_3$1(ctx) {
+    	var input, dispose;
+
+    	const block = {
+    		c: function create() {
+    			input = element("input");
+    			attr_dev(input, "type", "text");
+    			add_location(input, file$1, 197, 5, 5541);
+    			dispose = listen_dev(input, "input", ctx.input_input_handler_2);
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, input, anchor);
+
+    			set_input_value(input, ctx.hitboxes[ctx.hitboxes.selected].meta.name);
+    		},
+
+    		p: function update(changed, ctx) {
+    			if (changed.hitboxes && (input.value !== ctx.hitboxes[ctx.hitboxes.selected].meta.name)) set_input_value(input, ctx.hitboxes[ctx.hitboxes.selected].meta.name);
+    		},
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(input);
+    			}
+
+    			dispose();
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_3$1.name, type: "if", source: "(197:39) ", ctx });
+    	return block;
+    }
+
+    // (195:4) {#if editingMode === 'window'}
+    function create_if_block_2$1(ctx) {
+    	var input, dispose;
+
+    	const block = {
+    		c: function create() {
+    			input = element("input");
+    			attr_dev(input, "type", "text");
+    			add_location(input, file$1, 195, 5, 5425);
+    			dispose = listen_dev(input, "input", ctx.input_input_handler_1);
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, input, anchor);
+
+    			set_input_value(input, ctx.windows[ctx.anim.windowIndex].meta.name);
+    		},
+
+    		p: function update(changed, ctx) {
+    			if ((changed.windows || changed.anim) && (input.value !== ctx.windows[ctx.anim.windowIndex].meta.name)) set_input_value(input, ctx.windows[ctx.anim.windowIndex].meta.name);
+    		},
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(input);
+    			}
+
+    			dispose();
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_2$1.name, type: "if", source: "(195:4) {#if editingMode === 'window'}", ctx });
+    	return block;
+    }
+
+    // (205:39) 
+    function create_if_block_1$1(ctx) {
+    	var input, dispose;
+
+    	const block = {
+    		c: function create() {
+    			input = element("input");
+    			attr_dev(input, "type", "text");
+    			add_location(input, file$1, 205, 5, 5850);
+    			dispose = listen_dev(input, "input", ctx.input_input_handler_4);
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, input, anchor);
+
+    			set_input_value(input, ctx.hitboxes[ctx.hitboxes.selected].meta.color);
+    		},
+
+    		p: function update(changed, ctx) {
+    			if (changed.hitboxes && (input.value !== ctx.hitboxes[ctx.hitboxes.selected].meta.color)) set_input_value(input, ctx.hitboxes[ctx.hitboxes.selected].meta.color);
+    		},
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(input);
+    			}
+
+    			dispose();
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_1$1.name, type: "if", source: "(205:39) ", ctx });
+    	return block;
+    }
+
+    // (203:4) {#if editingMode === 'window'}
+    function create_if_block$1(ctx) {
+    	var input, dispose;
+
+    	const block = {
+    		c: function create() {
+    			input = element("input");
+    			attr_dev(input, "type", "text");
+    			add_location(input, file$1, 203, 5, 5733);
+    			dispose = listen_dev(input, "input", ctx.input_input_handler_3);
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, input, anchor);
+
+    			set_input_value(input, ctx.windows[ctx.anim.windowIndex].meta.color);
+    		},
+
+    		p: function update(changed, ctx) {
+    			if ((changed.windows || changed.anim) && (input.value !== ctx.windows[ctx.anim.windowIndex].meta.color)) set_input_value(input, ctx.windows[ctx.anim.windowIndex].meta.color);
+    		},
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(input);
+    			}
+
+    			dispose();
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block$1.name, type: "if", source: "(203:4) {#if editingMode === 'window'}", ctx });
+    	return block;
+    }
+
+    function create_fragment$1(ctx) {
+    	var div4, div1, input, input_updating = false, input_max_value, t0, p, t1, label0, t2_value = ctx.anim.animFrame + 1 + "", t2, label0_class_value, t3, t4_value = ctx.anim.duration + "", t4, t5, t6, div0, t7, t8_value = ctx.anim.windowIndex + 1 + "", t8, t9, t10_value = ctx.windows.length + "", t10, t11, button0, i0, t13, button1, i1, button1_disabled_value, t15, div2, button2, i2, t17, button3, i3, button3_disabled_value, t19, button4, i4, t20_value = ctx.anim.playing ? 'pause' : 'play_arrow' + "", t20, t21, button5, i5, button5_disabled_value, t23, div3, t24, select, option0, option1, option2, t28, div6, t29, div5, t30, div8, div7, label1, t31, t32, label2, t33, dispose;
+
+    	function input_input_handler() {
+    		input_updating = true;
+    		ctx.input_input_handler.call(input);
+    	}
+
+    	let each_value = ctx.windows;
+
+    	let each_blocks = [];
+
+    	for (let i = 0; i < each_value.length; i += 1) {
+    		each_blocks[i] = create_each_block$1(get_each_context$1(ctx, each_value, i));
+    	}
+
+    	function select_block_type(changed, ctx) {
+    		if (ctx.editingMode === 'window') return create_if_block_2$1;
+    		if (ctx.editingMode === 'hitbox') return create_if_block_3$1;
+    	}
+
+    	var current_block_type = select_block_type(null, ctx);
+    	var if_block0 = current_block_type && current_block_type(ctx);
+
+    	function select_block_type_1(changed, ctx) {
+    		if (ctx.editingMode === 'window') return create_if_block$1;
+    		if (ctx.editingMode === 'hitbox') return create_if_block_1$1;
+    	}
+
+    	var current_block_type_1 = select_block_type_1(null, ctx);
+    	var if_block1 = current_block_type_1 && current_block_type_1(ctx);
+
+    	const block = {
+    		c: function create() {
+    			div4 = element("div");
+    			div1 = element("div");
+    			input = element("input");
+    			t0 = space();
+    			p = element("p");
+    			t1 = text("frame: ");
+    			label0 = element("label");
+    			t2 = text(t2_value);
+    			t3 = text(" / ");
+    			t4 = text(t4_value);
+    			t5 = text(";");
+    			t6 = space();
+    			div0 = element("div");
+    			t7 = text("window: ");
+    			t8 = text(t8_value);
+    			t9 = text(" / ");
+    			t10 = text(t10_value);
+    			t11 = space();
+    			button0 = element("button");
+    			i0 = element("i");
+    			i0.textContent = "add";
+    			t13 = space();
+    			button1 = element("button");
+    			i1 = element("i");
+    			i1.textContent = "delete";
+    			t15 = space();
+    			div2 = element("div");
+    			button2 = element("button");
+    			i2 = element("i");
+    			i2.textContent = "loop";
+    			t17 = space();
+    			button3 = element("button");
+    			i3 = element("i");
+    			i3.textContent = "skip_previous";
+    			t19 = space();
+    			button4 = element("button");
+    			i4 = element("i");
+    			t20 = text(t20_value);
+    			t21 = space();
+    			button5 = element("button");
+    			i5 = element("i");
+    			i5.textContent = "skip_next";
+    			t23 = space();
+    			div3 = element("div");
+    			t24 = text("playback speed:\r\n\t\t\t");
+    			select = element("select");
+    			option0 = element("option");
+    			option0.textContent = "1/4x";
+    			option1 = element("option");
+    			option1.textContent = "1/2x";
+    			option2 = element("option");
+    			option2.textContent = "1x";
+    			t28 = space();
+    			div6 = element("div");
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].c();
+    			}
+
+    			t29 = space();
+    			div5 = element("div");
+    			t30 = space();
+    			div8 = element("div");
+    			div7 = element("div");
+    			label1 = element("label");
+    			t31 = text("name:\r\n\t\t\t\t");
+    			if (if_block0) if_block0.c();
+    			t32 = space();
+    			label2 = element("label");
+    			t33 = text("color:\r\n\t\t\t\t");
+    			if (if_block1) if_block1.c();
+    			attr_dev(input, "type", "number");
+    			attr_dev(input, "id", "current-frame");
+    			attr_dev(input, "min", "0");
+    			attr_dev(input, "max", input_max_value = ctx.anim.duration - 1);
+    			attr_dev(input, "class", "svelte-1v3rt8w");
+    			add_location(input, file$1, 122, 3, 2544);
+    			set_style(label0, "width", "" + (ctx.anim.duration.toString().length * 10 + 10) + "px");
+    			attr_dev(label0, "id", "current-frame-label");
+    			attr_dev(label0, "class", label0_class_value = "" + null_to_empty(((ctx.isCurrentFrameFocused) ? 'active' : '')) + " svelte-1v3rt8w");
+    			attr_dev(label0, "for", "current-frame");
+    			add_location(label0, file$1, 130, 11, 2871);
+    			set_style(p, "width", "150px");
+    			set_style(p, "margin", "0");
+    			set_style(p, "display", "inline-block");
+    			add_location(p, file$1, 129, 3, 2800);
+    			attr_dev(i0, "class", "material-icons svelte-1v3rt8w");
+    			add_location(i0, file$1, 143, 44, 3341);
+    			add_location(button0, file$1, 143, 4, 3301);
+    			attr_dev(i1, "class", "material-icons svelte-1v3rt8w");
+    			add_location(i1, file$1, 144, 77, 3462);
+    			button1.disabled = button1_disabled_value = ctx.windows.length <= 1;
+    			attr_dev(button1, "class", "svelte-1v3rt8w");
+    			add_location(button1, file$1, 144, 4, 3389);
+    			set_style(div0, "width", "400px");
+    			set_style(div0, "margin", "0");
+    			set_style(div0, "display", "inline-block");
+    			add_location(div0, file$1, 141, 3, 3180);
+    			attr_dev(div1, "class", "option-group svelte-1v3rt8w");
+    			set_style(div1, "justify-self", "left");
+    			add_location(div1, file$1, 121, 2, 2486);
+    			attr_dev(i2, "class", "material-icons svelte-1v3rt8w");
+    			add_location(i2, file$1, 148, 53, 3643);
+    			add_location(button2, file$1, 148, 3, 3593);
+    			attr_dev(i3, "class", "material-icons svelte-1v3rt8w");
+    			add_location(i3, file$1, 149, 65, 3753);
+    			button3.disabled = button3_disabled_value = ctx.anim.animFrame === 0;
+    			attr_dev(button3, "class", "svelte-1v3rt8w");
+    			add_location(button3, file$1, 149, 3, 3691);
+    			attr_dev(i4, "class", "material-icons svelte-1v3rt8w");
+    			add_location(i4, file$1, 150, 35, 3842);
+    			add_location(button4, file$1, 150, 3, 3810);
+    			attr_dev(i5, "class", "material-icons svelte-1v3rt8w");
+    			add_location(i5, file$1, 151, 82, 4004);
+    			button5.disabled = button5_disabled_value = ctx.anim.animFrame === ctx.anim.duration - 1;
+    			attr_dev(button5, "class", "svelte-1v3rt8w");
+    			add_location(button5, file$1, 151, 3, 3925);
+    			attr_dev(div2, "class", "option-group svelte-1v3rt8w");
+    			set_style(div2, "justify-self", "center");
+    			add_location(div2, file$1, 147, 2, 3532);
+    			option0.__value = "0.25";
+    			option0.value = option0.__value;
+    			add_location(option0, file$1, 156, 4, 4188);
+    			option1.__value = "0.5";
+    			option1.value = option1.__value;
+    			add_location(option1, file$1, 157, 4, 4228);
+    			option2.__value = "1";
+    			option2.value = option2.__value;
+    			option2.selected = true;
+    			add_location(option2, file$1, 158, 4, 4267);
+    			if (ctx.anim.playSpeed === void 0) add_render_callback(() => ctx.select_change_handler.call(select));
+    			add_location(select, file$1, 155, 3, 4146);
+    			attr_dev(div3, "class", "option-group svelte-1v3rt8w");
+    			set_style(div3, "justify-self", "right");
+    			add_location(div3, file$1, 153, 2, 4066);
+    			attr_dev(div4, "id", "timeline-controls");
+    			attr_dev(div4, "class", "svelte-1v3rt8w");
+    			add_location(div4, file$1, 120, 0, 2454);
+    			attr_dev(div5, "id", "playhead");
+    			set_style(div5, "height", "100%");
+    			set_style(div5, "width", "2px");
+    			set_style(div5, "background-color", "#8888");
+    			set_style(div5, "box-shadow", "0 0 0 1px #000");
+    			set_style(div5, "position", "absolute");
+    			set_style(div5, "margin-left", "" + ((ctx.anim.duration != 0) ? ctx.anim.animFrame * 100 / ctx.anim.duration : 0) + "%");
+    			add_location(div5, file$1, 179, 2, 5007);
+    			attr_dev(div6, "id", "timeline");
+    			attr_dev(div6, "class", "svelte-1v3rt8w");
+    			add_location(div6, file$1, 162, 1, 4341);
+    			set_style(label1, "display", "inline-block");
+    			add_location(label1, file$1, 192, 3, 5333);
+    			set_style(label2, "display", "inline-block");
+    			add_location(label2, file$1, 200, 3, 5640);
+    			attr_dev(div7, "class", "option-group svelte-1v3rt8w");
+    			add_location(div7, file$1, 191, 2, 5302);
+    			attr_dev(div8, "id", "window-metadata");
+    			attr_dev(div8, "class", "svelte-1v3rt8w");
+    			add_location(div8, file$1, 190, 1, 5272);
+
+    			dispose = [
+    				listen_dev(input, "input", input_input_handler),
+    				listen_dev(input, "focus", ctx.focus_handler),
+    				listen_dev(input, "blur", ctx.blur_handler),
+    				listen_dev(button0, "click", ctx.handleWindowAddition),
+    				listen_dev(button1, "click", ctx.handleWindowDeletion),
+    				listen_dev(button2, "click", ctx.click_handler),
+    				listen_dev(button3, "click", ctx.skipBack),
+    				listen_dev(button4, "click", ctx.startPlaying),
+    				listen_dev(button5, "click", ctx.skipAhead),
+    				listen_dev(select, "change", ctx.select_change_handler)
+    			];
+    		},
+
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, div4, anchor);
+    			append_dev(div4, div1);
+    			append_dev(div1, input);
+
+    			set_input_value(input, ctx.anim.animFrame);
+
+    			append_dev(div1, t0);
+    			append_dev(div1, p);
+    			append_dev(p, t1);
+    			append_dev(p, label0);
+    			append_dev(label0, t2);
+    			ctx.label0_binding(label0);
+    			append_dev(p, t3);
+    			append_dev(p, t4);
+    			append_dev(p, t5);
+    			append_dev(div1, t6);
+    			append_dev(div1, div0);
+    			append_dev(div0, t7);
+    			append_dev(div0, t8);
+    			append_dev(div0, t9);
+    			append_dev(div0, t10);
+    			append_dev(div0, t11);
+    			append_dev(div0, button0);
+    			append_dev(button0, i0);
+    			append_dev(div0, t13);
+    			append_dev(div0, button1);
+    			append_dev(button1, i1);
+    			append_dev(div4, t15);
+    			append_dev(div4, div2);
+    			append_dev(div2, button2);
+    			append_dev(button2, i2);
+    			append_dev(div2, t17);
+    			append_dev(div2, button3);
+    			append_dev(button3, i3);
+    			append_dev(div2, t19);
+    			append_dev(div2, button4);
+    			append_dev(button4, i4);
+    			append_dev(i4, t20);
+    			append_dev(div2, t21);
+    			append_dev(div2, button5);
+    			append_dev(button5, i5);
+    			append_dev(div4, t23);
+    			append_dev(div4, div3);
+    			append_dev(div3, t24);
+    			append_dev(div3, select);
+    			append_dev(select, option0);
+    			append_dev(select, option1);
+    			append_dev(select, option2);
+
+    			select_option(select, ctx.anim.playSpeed);
+
+    			insert_dev(target, t28, anchor);
+    			insert_dev(target, div6, anchor);
+
+    			for (let i = 0; i < each_blocks.length; i += 1) {
+    				each_blocks[i].m(div6, null);
+    			}
+
+    			append_dev(div6, t29);
+    			append_dev(div6, div5);
+    			insert_dev(target, t30, anchor);
+    			insert_dev(target, div8, anchor);
+    			append_dev(div8, div7);
+    			append_dev(div7, label1);
+    			append_dev(label1, t31);
+    			if (if_block0) if_block0.m(label1, null);
+    			append_dev(div7, t32);
+    			append_dev(div7, label2);
+    			append_dev(label2, t33);
+    			if (if_block1) if_block1.m(label2, null);
+    		},
+
+    		p: function update(changed, ctx) {
+    			if (!input_updating && changed.anim) set_input_value(input, ctx.anim.animFrame);
+    			input_updating = false;
+
+    			if ((changed.anim) && input_max_value !== (input_max_value = ctx.anim.duration - 1)) {
+    				attr_dev(input, "max", input_max_value);
+    			}
+
+    			if ((changed.anim) && t2_value !== (t2_value = ctx.anim.animFrame + 1 + "")) {
+    				set_data_dev(t2, t2_value);
+    			}
+
+    			if (changed.anim) {
+    				set_style(label0, "width", "" + (ctx.anim.duration.toString().length * 10 + 10) + "px");
+    			}
+
+    			if ((changed.isCurrentFrameFocused) && label0_class_value !== (label0_class_value = "" + null_to_empty(((ctx.isCurrentFrameFocused) ? 'active' : '')) + " svelte-1v3rt8w")) {
+    				attr_dev(label0, "class", label0_class_value);
+    			}
+
+    			if ((changed.anim) && t4_value !== (t4_value = ctx.anim.duration + "")) {
+    				set_data_dev(t4, t4_value);
+    			}
+
+    			if ((changed.anim) && t8_value !== (t8_value = ctx.anim.windowIndex + 1 + "")) {
+    				set_data_dev(t8, t8_value);
+    			}
+
+    			if ((changed.windows) && t10_value !== (t10_value = ctx.windows.length + "")) {
+    				set_data_dev(t10, t10_value);
+    			}
+
+    			if ((changed.windows) && button1_disabled_value !== (button1_disabled_value = ctx.windows.length <= 1)) {
+    				prop_dev(button1, "disabled", button1_disabled_value);
+    			}
+
+    			if ((changed.anim) && button3_disabled_value !== (button3_disabled_value = ctx.anim.animFrame === 0)) {
+    				prop_dev(button3, "disabled", button3_disabled_value);
+    			}
+
+    			if ((changed.anim) && t20_value !== (t20_value = ctx.anim.playing ? 'pause' : 'play_arrow' + "")) {
+    				set_data_dev(t20, t20_value);
+    			}
+
+    			if ((changed.anim) && button5_disabled_value !== (button5_disabled_value = ctx.anim.animFrame === ctx.anim.duration - 1)) {
+    				prop_dev(button5, "disabled", button5_disabled_value);
+    			}
+
+    			if (changed.anim) select_option(select, ctx.anim.playSpeed);
+
+    			if (changed.windows || changed.anim) {
+    				each_value = ctx.windows;
+
+    				let i;
+    				for (i = 0; i < each_value.length; i += 1) {
+    					const child_ctx = get_each_context$1(ctx, each_value, i);
+
+    					if (each_blocks[i]) {
+    						each_blocks[i].p(changed, child_ctx);
+    					} else {
+    						each_blocks[i] = create_each_block$1(child_ctx);
+    						each_blocks[i].c();
+    						each_blocks[i].m(div6, t29);
+    					}
+    				}
+
+    				for (; i < each_blocks.length; i += 1) {
+    					each_blocks[i].d(1);
+    				}
+    				each_blocks.length = each_value.length;
+    			}
+
+    			if (changed.anim) {
+    				set_style(div5, "margin-left", "" + ((ctx.anim.duration != 0) ? ctx.anim.animFrame * 100 / ctx.anim.duration : 0) + "%");
+    			}
+
+    			if (current_block_type === (current_block_type = select_block_type(changed, ctx)) && if_block0) {
+    				if_block0.p(changed, ctx);
+    			} else {
+    				if (if_block0) if_block0.d(1);
+    				if_block0 = current_block_type && current_block_type(ctx);
+    				if (if_block0) {
+    					if_block0.c();
+    					if_block0.m(label1, null);
+    				}
+    			}
+
+    			if (current_block_type_1 === (current_block_type_1 = select_block_type_1(changed, ctx)) && if_block1) {
+    				if_block1.p(changed, ctx);
+    			} else {
+    				if (if_block1) if_block1.d(1);
+    				if_block1 = current_block_type_1 && current_block_type_1(ctx);
+    				if (if_block1) {
+    					if_block1.c();
+    					if_block1.m(label2, null);
+    				}
+    			}
+    		},
+
+    		i: noop,
+    		o: noop,
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(div4);
+    			}
+
+    			ctx.label0_binding(null);
+
+    			if (detaching) {
+    				detach_dev(t28);
+    				detach_dev(div6);
+    			}
+
+    			destroy_each(each_blocks, detaching);
+
+    			if (detaching) {
+    				detach_dev(t30);
+    				detach_dev(div8);
+    			}
+
+    			if (if_block0) if_block0.d();
+    			if (if_block1) if_block1.d();
+    			run_all(dispose);
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment$1.name, type: "component", source: "", ctx });
+    	return block;
+    }
+
+    function instance$1($$self, $$props, $$invalidate) {
+    	let { anim, windows, hitboxes, skipAhead, skipBack, editingMode, winProps, updateStates } = $$props;
+
+        let currentFrameLabel;
+    	let isCurrentFrameFocused = false;
+    	let fpsMonitor = 0;
+
+        const startPlaying = () => {
+    		$$invalidate('anim', anim.playing = !anim.playing, anim);
+    		if (anim.playing) play();
+    	};
+    	const play = () => {
+    		if (anim.playing) {
+    			requestAnimationFrame(play);
+    			$$invalidate('updateStates', updateStates.frames = true, updateStates);
+    			fpsMonitor++;
+    			if (fpsMonitor >= (1 / anim.playSpeed)) {
+    				fpsMonitor = 0;
+    				if (anim.animFrame + 1 === anim.duration) { 
+    					$$invalidate('anim', anim.animFrame = 0, anim);
+    					if (!anim.loop) { $$invalidate('anim', anim.playing = false, anim); }
+    				}
+    				else { $$invalidate('anim', anim.animFrame += 1, anim);}
+    			}
+    		}
+    	};
+
+    	const handleWindowAddition = () => {
+    		windows.splice(anim.windowIndex, 0, {meta: {}, data: JSON.parse(JSON.stringify({...winProps}))} );
+    		$$invalidate('anim', anim);
+    		$$invalidate('updateStates', updateStates.length = true, updateStates);
+    		$$invalidate('updateStates', updateStates.frames = true, updateStates);
+    	};
+    	const handleWindowDeletion = () => {
+    		windows.splice(anim.windowIndex, 1);
+    		$$invalidate('anim', anim.animFrame = anim.windowPositions[anim.windowIndex - 1] || 0, anim);
+    		$$invalidate('updateStates', updateStates.length = true, updateStates);
+    		$$invalidate('updateStates', updateStates.frames = true, updateStates);
+    	};
+
+    	const writable_props = ['anim', 'windows', 'hitboxes', 'skipAhead', 'skipBack', 'editingMode', 'winProps', 'updateStates'];
+    	Object.keys($$props).forEach(key => {
+    		if (!writable_props.includes(key) && !key.startsWith('$$')) console.warn(`<Timeline> was created with unknown prop '${key}'`);
+    	});
+
+    	function input_input_handler() {
+    		anim.animFrame = to_number(this.value);
+    		$$invalidate('anim', anim);
+    	}
+
+    	const focus_handler = (evt) => {$$invalidate('isCurrentFrameFocused', isCurrentFrameFocused = true); evt.target.select();};
+
+    	const blur_handler = () => $$invalidate('isCurrentFrameFocused', isCurrentFrameFocused = false);
+
+    	function label0_binding($$value) {
+    		binding_callbacks[$$value ? 'unshift' : 'push'](() => {
+    			$$invalidate('currentFrameLabel', currentFrameLabel = $$value);
+    		});
+    	}
+
+    	const click_handler = () => {$$invalidate('anim', anim.loop = !anim.loop, anim);};
+
+    	function select_change_handler() {
+    		anim.playSpeed = select_value(this);
+    		$$invalidate('anim', anim);
+    	}
+
+    	const click_handler_1 = ({ i }) => {$$invalidate('anim', anim.animFrame = anim.windowPositions[i], anim); $$invalidate('updateStates', updateStates.frames = true, updateStates); $$invalidate('editingMode', editingMode = "window");};
+
+    	function input_input_handler_1() {
+    		windows[anim.windowIndex].meta.name = this.value;
+    		$$invalidate('windows', windows);
+    		$$invalidate('anim', anim);
+    	}
+
+    	function input_input_handler_2() {
+    		hitboxes[hitboxes.selected].meta.name = this.value;
+    		$$invalidate('hitboxes', hitboxes);
+    	}
+
+    	function input_input_handler_3() {
+    		windows[anim.windowIndex].meta.color = this.value;
+    		$$invalidate('windows', windows);
+    		$$invalidate('anim', anim);
+    	}
+
+    	function input_input_handler_4() {
+    		hitboxes[hitboxes.selected].meta.color = this.value;
+    		$$invalidate('hitboxes', hitboxes);
+    	}
+
+    	$$self.$set = $$props => {
+    		if ('anim' in $$props) $$invalidate('anim', anim = $$props.anim);
+    		if ('windows' in $$props) $$invalidate('windows', windows = $$props.windows);
+    		if ('hitboxes' in $$props) $$invalidate('hitboxes', hitboxes = $$props.hitboxes);
+    		if ('skipAhead' in $$props) $$invalidate('skipAhead', skipAhead = $$props.skipAhead);
+    		if ('skipBack' in $$props) $$invalidate('skipBack', skipBack = $$props.skipBack);
+    		if ('editingMode' in $$props) $$invalidate('editingMode', editingMode = $$props.editingMode);
+    		if ('winProps' in $$props) $$invalidate('winProps', winProps = $$props.winProps);
+    		if ('updateStates' in $$props) $$invalidate('updateStates', updateStates = $$props.updateStates);
+    	};
+
+    	$$self.$capture_state = () => {
+    		return { anim, windows, hitboxes, skipAhead, skipBack, editingMode, winProps, updateStates, currentFrameLabel, isCurrentFrameFocused, fpsMonitor };
+    	};
+
+    	$$self.$inject_state = $$props => {
+    		if ('anim' in $$props) $$invalidate('anim', anim = $$props.anim);
+    		if ('windows' in $$props) $$invalidate('windows', windows = $$props.windows);
+    		if ('hitboxes' in $$props) $$invalidate('hitboxes', hitboxes = $$props.hitboxes);
+    		if ('skipAhead' in $$props) $$invalidate('skipAhead', skipAhead = $$props.skipAhead);
+    		if ('skipBack' in $$props) $$invalidate('skipBack', skipBack = $$props.skipBack);
+    		if ('editingMode' in $$props) $$invalidate('editingMode', editingMode = $$props.editingMode);
+    		if ('winProps' in $$props) $$invalidate('winProps', winProps = $$props.winProps);
+    		if ('updateStates' in $$props) $$invalidate('updateStates', updateStates = $$props.updateStates);
+    		if ('currentFrameLabel' in $$props) $$invalidate('currentFrameLabel', currentFrameLabel = $$props.currentFrameLabel);
+    		if ('isCurrentFrameFocused' in $$props) $$invalidate('isCurrentFrameFocused', isCurrentFrameFocused = $$props.isCurrentFrameFocused);
+    		if ('fpsMonitor' in $$props) fpsMonitor = $$props.fpsMonitor;
+    	};
+
+    	return {
+    		anim,
+    		windows,
+    		hitboxes,
+    		skipAhead,
+    		skipBack,
+    		editingMode,
+    		winProps,
+    		updateStates,
+    		currentFrameLabel,
+    		isCurrentFrameFocused,
+    		startPlaying,
+    		handleWindowAddition,
+    		handleWindowDeletion,
+    		input_input_handler,
+    		focus_handler,
+    		blur_handler,
+    		label0_binding,
+    		click_handler,
+    		select_change_handler,
+    		click_handler_1,
+    		input_input_handler_1,
+    		input_input_handler_2,
+    		input_input_handler_3,
+    		input_input_handler_4
+    	};
+    }
+
+    class Timeline extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$1, create_fragment$1, safe_not_equal, ["anim", "windows", "hitboxes", "skipAhead", "skipBack", "editingMode", "winProps", "updateStates"]);
+    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "Timeline", options, id: create_fragment$1.name });
+
+    		const { ctx } = this.$$;
+    		const props = options.props || {};
+    		if (ctx.anim === undefined && !('anim' in props)) {
+    			console.warn("<Timeline> was created without expected prop 'anim'");
+    		}
+    		if (ctx.windows === undefined && !('windows' in props)) {
+    			console.warn("<Timeline> was created without expected prop 'windows'");
+    		}
+    		if (ctx.hitboxes === undefined && !('hitboxes' in props)) {
+    			console.warn("<Timeline> was created without expected prop 'hitboxes'");
+    		}
+    		if (ctx.skipAhead === undefined && !('skipAhead' in props)) {
+    			console.warn("<Timeline> was created without expected prop 'skipAhead'");
+    		}
+    		if (ctx.skipBack === undefined && !('skipBack' in props)) {
+    			console.warn("<Timeline> was created without expected prop 'skipBack'");
+    		}
+    		if (ctx.editingMode === undefined && !('editingMode' in props)) {
+    			console.warn("<Timeline> was created without expected prop 'editingMode'");
+    		}
+    		if (ctx.winProps === undefined && !('winProps' in props)) {
+    			console.warn("<Timeline> was created without expected prop 'winProps'");
+    		}
+    		if (ctx.updateStates === undefined && !('updateStates' in props)) {
+    			console.warn("<Timeline> was created without expected prop 'updateStates'");
+    		}
+    	}
+
+    	get anim() {
+    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set anim(value) {
+    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get windows() {
+    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set windows(value) {
+    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get hitboxes() {
+    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set hitboxes(value) {
+    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get skipAhead() {
+    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set skipAhead(value) {
+    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get skipBack() {
+    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set skipBack(value) {
+    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get editingMode() {
+    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set editingMode(value) {
+    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get winProps() {
+    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set winProps(value) {
+    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get updateStates() {
+    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set updateStates(value) {
+    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+    }
+
+    /* src\components\LocalStorageFS.svelte generated by Svelte v3.12.1 */
+
+    function create_fragment$2(ctx) {
+    	const block = {
+    		c: noop,
+
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+
+    		m: noop,
+    		p: noop,
+    		i: noop,
+    		o: noop,
+    		d: noop
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment$2.name, type: "component", source: "", ctx });
+    	return block;
+    }
+
+    class LocalStorageFS extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, null, create_fragment$2, safe_not_equal, []);
+    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "LocalStorageFS", options, id: create_fragment$2.name });
+    	}
+    }
+
+    var Aacute = "Á";
+    var aacute = "á";
+    var Abreve = "Ă";
+    var abreve = "ă";
+    var ac = "∾";
+    var acd = "∿";
+    var acE = "∾̳";
+    var Acirc = "Â";
+    var acirc = "â";
+    var acute = "´";
+    var Acy = "А";
+    var acy = "а";
+    var AElig = "Æ";
+    var aelig = "æ";
+    var af = "⁡";
+    var Afr = "𝔄";
+    var afr = "𝔞";
+    var Agrave = "À";
+    var agrave = "à";
+    var alefsym = "ℵ";
+    var aleph = "ℵ";
+    var Alpha = "Α";
+    var alpha = "α";
+    var Amacr = "Ā";
+    var amacr = "ā";
+    var amalg = "⨿";
+    var amp = "&";
+    var AMP = "&";
+    var andand = "⩕";
+    var And = "⩓";
+    var and = "∧";
+    var andd = "⩜";
+    var andslope = "⩘";
+    var andv = "⩚";
+    var ang = "∠";
+    var ange = "⦤";
+    var angle = "∠";
+    var angmsdaa = "⦨";
+    var angmsdab = "⦩";
+    var angmsdac = "⦪";
+    var angmsdad = "⦫";
+    var angmsdae = "⦬";
+    var angmsdaf = "⦭";
+    var angmsdag = "⦮";
+    var angmsdah = "⦯";
+    var angmsd = "∡";
+    var angrt = "∟";
+    var angrtvb = "⊾";
+    var angrtvbd = "⦝";
+    var angsph = "∢";
+    var angst = "Å";
+    var angzarr = "⍼";
+    var Aogon = "Ą";
+    var aogon = "ą";
+    var Aopf = "𝔸";
+    var aopf = "𝕒";
+    var apacir = "⩯";
+    var ap = "≈";
+    var apE = "⩰";
+    var ape = "≊";
+    var apid = "≋";
+    var apos = "'";
+    var ApplyFunction = "⁡";
+    var approx = "≈";
+    var approxeq = "≊";
+    var Aring = "Å";
+    var aring = "å";
+    var Ascr = "𝒜";
+    var ascr = "𝒶";
+    var Assign = "≔";
+    var ast = "*";
+    var asymp = "≈";
+    var asympeq = "≍";
+    var Atilde = "Ã";
+    var atilde = "ã";
+    var Auml = "Ä";
+    var auml = "ä";
+    var awconint = "∳";
+    var awint = "⨑";
+    var backcong = "≌";
+    var backepsilon = "϶";
+    var backprime = "‵";
+    var backsim = "∽";
+    var backsimeq = "⋍";
+    var Backslash = "∖";
+    var Barv = "⫧";
+    var barvee = "⊽";
+    var barwed = "⌅";
+    var Barwed = "⌆";
+    var barwedge = "⌅";
+    var bbrk = "⎵";
+    var bbrktbrk = "⎶";
+    var bcong = "≌";
+    var Bcy = "Б";
+    var bcy = "б";
+    var bdquo = "„";
+    var becaus = "∵";
+    var because = "∵";
+    var Because = "∵";
+    var bemptyv = "⦰";
+    var bepsi = "϶";
+    var bernou = "ℬ";
+    var Bernoullis = "ℬ";
+    var Beta = "Β";
+    var beta = "β";
+    var beth = "ℶ";
+    var between = "≬";
+    var Bfr = "𝔅";
+    var bfr = "𝔟";
+    var bigcap = "⋂";
+    var bigcirc = "◯";
+    var bigcup = "⋃";
+    var bigodot = "⨀";
+    var bigoplus = "⨁";
+    var bigotimes = "⨂";
+    var bigsqcup = "⨆";
+    var bigstar = "★";
+    var bigtriangledown = "▽";
+    var bigtriangleup = "△";
+    var biguplus = "⨄";
+    var bigvee = "⋁";
+    var bigwedge = "⋀";
+    var bkarow = "⤍";
+    var blacklozenge = "⧫";
+    var blacksquare = "▪";
+    var blacktriangle = "▴";
+    var blacktriangledown = "▾";
+    var blacktriangleleft = "◂";
+    var blacktriangleright = "▸";
+    var blank = "␣";
+    var blk12 = "▒";
+    var blk14 = "░";
+    var blk34 = "▓";
+    var block = "█";
+    var bne = "=⃥";
+    var bnequiv = "≡⃥";
+    var bNot = "⫭";
+    var bnot = "⌐";
+    var Bopf = "𝔹";
+    var bopf = "𝕓";
+    var bot = "⊥";
+    var bottom = "⊥";
+    var bowtie = "⋈";
+    var boxbox = "⧉";
+    var boxdl = "┐";
+    var boxdL = "╕";
+    var boxDl = "╖";
+    var boxDL = "╗";
+    var boxdr = "┌";
+    var boxdR = "╒";
+    var boxDr = "╓";
+    var boxDR = "╔";
+    var boxh = "─";
+    var boxH = "═";
+    var boxhd = "┬";
+    var boxHd = "╤";
+    var boxhD = "╥";
+    var boxHD = "╦";
+    var boxhu = "┴";
+    var boxHu = "╧";
+    var boxhU = "╨";
+    var boxHU = "╩";
+    var boxminus = "⊟";
+    var boxplus = "⊞";
+    var boxtimes = "⊠";
+    var boxul = "┘";
+    var boxuL = "╛";
+    var boxUl = "╜";
+    var boxUL = "╝";
+    var boxur = "└";
+    var boxuR = "╘";
+    var boxUr = "╙";
+    var boxUR = "╚";
+    var boxv = "│";
+    var boxV = "║";
+    var boxvh = "┼";
+    var boxvH = "╪";
+    var boxVh = "╫";
+    var boxVH = "╬";
+    var boxvl = "┤";
+    var boxvL = "╡";
+    var boxVl = "╢";
+    var boxVL = "╣";
+    var boxvr = "├";
+    var boxvR = "╞";
+    var boxVr = "╟";
+    var boxVR = "╠";
+    var bprime = "‵";
+    var breve = "˘";
+    var Breve = "˘";
+    var brvbar = "¦";
+    var bscr = "𝒷";
+    var Bscr = "ℬ";
+    var bsemi = "⁏";
+    var bsim = "∽";
+    var bsime = "⋍";
+    var bsolb = "⧅";
+    var bsol = "\\";
+    var bsolhsub = "⟈";
+    var bull = "•";
+    var bullet = "•";
+    var bump = "≎";
+    var bumpE = "⪮";
+    var bumpe = "≏";
+    var Bumpeq = "≎";
+    var bumpeq = "≏";
+    var Cacute = "Ć";
+    var cacute = "ć";
+    var capand = "⩄";
+    var capbrcup = "⩉";
+    var capcap = "⩋";
+    var cap = "∩";
+    var Cap = "⋒";
+    var capcup = "⩇";
+    var capdot = "⩀";
+    var CapitalDifferentialD = "ⅅ";
+    var caps = "∩︀";
+    var caret = "⁁";
+    var caron = "ˇ";
+    var Cayleys = "ℭ";
+    var ccaps = "⩍";
+    var Ccaron = "Č";
+    var ccaron = "č";
+    var Ccedil = "Ç";
+    var ccedil = "ç";
+    var Ccirc = "Ĉ";
+    var ccirc = "ĉ";
+    var Cconint = "∰";
+    var ccups = "⩌";
+    var ccupssm = "⩐";
+    var Cdot = "Ċ";
+    var cdot = "ċ";
+    var cedil = "¸";
+    var Cedilla = "¸";
+    var cemptyv = "⦲";
+    var cent = "¢";
+    var centerdot = "·";
+    var CenterDot = "·";
+    var cfr = "𝔠";
+    var Cfr = "ℭ";
+    var CHcy = "Ч";
+    var chcy = "ч";
+    var check = "✓";
+    var checkmark = "✓";
+    var Chi = "Χ";
+    var chi = "χ";
+    var circ = "ˆ";
+    var circeq = "≗";
+    var circlearrowleft = "↺";
+    var circlearrowright = "↻";
+    var circledast = "⊛";
+    var circledcirc = "⊚";
+    var circleddash = "⊝";
+    var CircleDot = "⊙";
+    var circledR = "®";
+    var circledS = "Ⓢ";
+    var CircleMinus = "⊖";
+    var CirclePlus = "⊕";
+    var CircleTimes = "⊗";
+    var cir = "○";
+    var cirE = "⧃";
+    var cire = "≗";
+    var cirfnint = "⨐";
+    var cirmid = "⫯";
+    var cirscir = "⧂";
+    var ClockwiseContourIntegral = "∲";
+    var CloseCurlyDoubleQuote = "”";
+    var CloseCurlyQuote = "’";
+    var clubs = "♣";
+    var clubsuit = "♣";
+    var colon = ":";
+    var Colon = "∷";
+    var Colone = "⩴";
+    var colone = "≔";
+    var coloneq = "≔";
+    var comma = ",";
+    var commat = "@";
+    var comp = "∁";
+    var compfn = "∘";
+    var complement = "∁";
+    var complexes = "ℂ";
+    var cong = "≅";
+    var congdot = "⩭";
+    var Congruent = "≡";
+    var conint = "∮";
+    var Conint = "∯";
+    var ContourIntegral = "∮";
+    var copf = "𝕔";
+    var Copf = "ℂ";
+    var coprod = "∐";
+    var Coproduct = "∐";
+    var copy = "©";
+    var COPY = "©";
+    var copysr = "℗";
+    var CounterClockwiseContourIntegral = "∳";
+    var crarr = "↵";
+    var cross = "✗";
+    var Cross = "⨯";
+    var Cscr = "𝒞";
+    var cscr = "𝒸";
+    var csub = "⫏";
+    var csube = "⫑";
+    var csup = "⫐";
+    var csupe = "⫒";
+    var ctdot = "⋯";
+    var cudarrl = "⤸";
+    var cudarrr = "⤵";
+    var cuepr = "⋞";
+    var cuesc = "⋟";
+    var cularr = "↶";
+    var cularrp = "⤽";
+    var cupbrcap = "⩈";
+    var cupcap = "⩆";
+    var CupCap = "≍";
+    var cup = "∪";
+    var Cup = "⋓";
+    var cupcup = "⩊";
+    var cupdot = "⊍";
+    var cupor = "⩅";
+    var cups = "∪︀";
+    var curarr = "↷";
+    var curarrm = "⤼";
+    var curlyeqprec = "⋞";
+    var curlyeqsucc = "⋟";
+    var curlyvee = "⋎";
+    var curlywedge = "⋏";
+    var curren = "¤";
+    var curvearrowleft = "↶";
+    var curvearrowright = "↷";
+    var cuvee = "⋎";
+    var cuwed = "⋏";
+    var cwconint = "∲";
+    var cwint = "∱";
+    var cylcty = "⌭";
+    var dagger = "†";
+    var Dagger = "‡";
+    var daleth = "ℸ";
+    var darr = "↓";
+    var Darr = "↡";
+    var dArr = "⇓";
+    var dash = "‐";
+    var Dashv = "⫤";
+    var dashv = "⊣";
+    var dbkarow = "⤏";
+    var dblac = "˝";
+    var Dcaron = "Ď";
+    var dcaron = "ď";
+    var Dcy = "Д";
+    var dcy = "д";
+    var ddagger = "‡";
+    var ddarr = "⇊";
+    var DD = "ⅅ";
+    var dd = "ⅆ";
+    var DDotrahd = "⤑";
+    var ddotseq = "⩷";
+    var deg = "°";
+    var Del = "∇";
+    var Delta = "Δ";
+    var delta = "δ";
+    var demptyv = "⦱";
+    var dfisht = "⥿";
+    var Dfr = "𝔇";
+    var dfr = "𝔡";
+    var dHar = "⥥";
+    var dharl = "⇃";
+    var dharr = "⇂";
+    var DiacriticalAcute = "´";
+    var DiacriticalDot = "˙";
+    var DiacriticalDoubleAcute = "˝";
+    var DiacriticalGrave = "`";
+    var DiacriticalTilde = "˜";
+    var diam = "⋄";
+    var diamond = "⋄";
+    var Diamond = "⋄";
+    var diamondsuit = "♦";
+    var diams = "♦";
+    var die = "¨";
+    var DifferentialD = "ⅆ";
+    var digamma = "ϝ";
+    var disin = "⋲";
+    var div = "÷";
+    var divide = "÷";
+    var divideontimes = "⋇";
+    var divonx = "⋇";
+    var DJcy = "Ђ";
+    var djcy = "ђ";
+    var dlcorn = "⌞";
+    var dlcrop = "⌍";
+    var dollar = "$";
+    var Dopf = "𝔻";
+    var dopf = "𝕕";
+    var Dot = "¨";
+    var dot = "˙";
+    var DotDot = "⃜";
+    var doteq = "≐";
+    var doteqdot = "≑";
+    var DotEqual = "≐";
+    var dotminus = "∸";
+    var dotplus = "∔";
+    var dotsquare = "⊡";
+    var doublebarwedge = "⌆";
+    var DoubleContourIntegral = "∯";
+    var DoubleDot = "¨";
+    var DoubleDownArrow = "⇓";
+    var DoubleLeftArrow = "⇐";
+    var DoubleLeftRightArrow = "⇔";
+    var DoubleLeftTee = "⫤";
+    var DoubleLongLeftArrow = "⟸";
+    var DoubleLongLeftRightArrow = "⟺";
+    var DoubleLongRightArrow = "⟹";
+    var DoubleRightArrow = "⇒";
+    var DoubleRightTee = "⊨";
+    var DoubleUpArrow = "⇑";
+    var DoubleUpDownArrow = "⇕";
+    var DoubleVerticalBar = "∥";
+    var DownArrowBar = "⤓";
+    var downarrow = "↓";
+    var DownArrow = "↓";
+    var Downarrow = "⇓";
+    var DownArrowUpArrow = "⇵";
+    var DownBreve = "̑";
+    var downdownarrows = "⇊";
+    var downharpoonleft = "⇃";
+    var downharpoonright = "⇂";
+    var DownLeftRightVector = "⥐";
+    var DownLeftTeeVector = "⥞";
+    var DownLeftVectorBar = "⥖";
+    var DownLeftVector = "↽";
+    var DownRightTeeVector = "⥟";
+    var DownRightVectorBar = "⥗";
+    var DownRightVector = "⇁";
+    var DownTeeArrow = "↧";
+    var DownTee = "⊤";
+    var drbkarow = "⤐";
+    var drcorn = "⌟";
+    var drcrop = "⌌";
+    var Dscr = "𝒟";
+    var dscr = "𝒹";
+    var DScy = "Ѕ";
+    var dscy = "ѕ";
+    var dsol = "⧶";
+    var Dstrok = "Đ";
+    var dstrok = "đ";
+    var dtdot = "⋱";
+    var dtri = "▿";
+    var dtrif = "▾";
+    var duarr = "⇵";
+    var duhar = "⥯";
+    var dwangle = "⦦";
+    var DZcy = "Џ";
+    var dzcy = "џ";
+    var dzigrarr = "⟿";
+    var Eacute = "É";
+    var eacute = "é";
+    var easter = "⩮";
+    var Ecaron = "Ě";
+    var ecaron = "ě";
+    var Ecirc = "Ê";
+    var ecirc = "ê";
+    var ecir = "≖";
+    var ecolon = "≕";
+    var Ecy = "Э";
+    var ecy = "э";
+    var eDDot = "⩷";
+    var Edot = "Ė";
+    var edot = "ė";
+    var eDot = "≑";
+    var ee = "ⅇ";
+    var efDot = "≒";
+    var Efr = "𝔈";
+    var efr = "𝔢";
+    var eg = "⪚";
+    var Egrave = "È";
+    var egrave = "è";
+    var egs = "⪖";
+    var egsdot = "⪘";
+    var el = "⪙";
+    var Element = "∈";
+    var elinters = "⏧";
+    var ell = "ℓ";
+    var els = "⪕";
+    var elsdot = "⪗";
+    var Emacr = "Ē";
+    var emacr = "ē";
+    var empty$1 = "∅";
+    var emptyset = "∅";
+    var EmptySmallSquare = "◻";
+    var emptyv = "∅";
+    var EmptyVerySmallSquare = "▫";
+    var emsp13 = " ";
+    var emsp14 = " ";
+    var emsp = " ";
+    var ENG = "Ŋ";
+    var eng = "ŋ";
+    var ensp = " ";
+    var Eogon = "Ę";
+    var eogon = "ę";
+    var Eopf = "𝔼";
+    var eopf = "𝕖";
+    var epar = "⋕";
+    var eparsl = "⧣";
+    var eplus = "⩱";
+    var epsi = "ε";
+    var Epsilon = "Ε";
+    var epsilon = "ε";
+    var epsiv = "ϵ";
+    var eqcirc = "≖";
+    var eqcolon = "≕";
+    var eqsim = "≂";
+    var eqslantgtr = "⪖";
+    var eqslantless = "⪕";
+    var Equal = "⩵";
+    var equals = "=";
+    var EqualTilde = "≂";
+    var equest = "≟";
+    var Equilibrium = "⇌";
+    var equiv = "≡";
+    var equivDD = "⩸";
+    var eqvparsl = "⧥";
+    var erarr = "⥱";
+    var erDot = "≓";
+    var escr = "ℯ";
+    var Escr = "ℰ";
+    var esdot = "≐";
+    var Esim = "⩳";
+    var esim = "≂";
+    var Eta = "Η";
+    var eta = "η";
+    var ETH = "Ð";
+    var eth = "ð";
+    var Euml = "Ë";
+    var euml = "ë";
+    var euro = "€";
+    var excl = "!";
+    var exist = "∃";
+    var Exists = "∃";
+    var expectation = "ℰ";
+    var exponentiale = "ⅇ";
+    var ExponentialE = "ⅇ";
+    var fallingdotseq = "≒";
+    var Fcy = "Ф";
+    var fcy = "ф";
+    var female = "♀";
+    var ffilig = "ﬃ";
+    var fflig = "ﬀ";
+    var ffllig = "ﬄ";
+    var Ffr = "𝔉";
+    var ffr = "𝔣";
+    var filig = "ﬁ";
+    var FilledSmallSquare = "◼";
+    var FilledVerySmallSquare = "▪";
+    var fjlig = "fj";
+    var flat = "♭";
+    var fllig = "ﬂ";
+    var fltns = "▱";
+    var fnof = "ƒ";
+    var Fopf = "𝔽";
+    var fopf = "𝕗";
+    var forall = "∀";
+    var ForAll = "∀";
+    var fork = "⋔";
+    var forkv = "⫙";
+    var Fouriertrf = "ℱ";
+    var fpartint = "⨍";
+    var frac12 = "½";
+    var frac13 = "⅓";
+    var frac14 = "¼";
+    var frac15 = "⅕";
+    var frac16 = "⅙";
+    var frac18 = "⅛";
+    var frac23 = "⅔";
+    var frac25 = "⅖";
+    var frac34 = "¾";
+    var frac35 = "⅗";
+    var frac38 = "⅜";
+    var frac45 = "⅘";
+    var frac56 = "⅚";
+    var frac58 = "⅝";
+    var frac78 = "⅞";
+    var frasl = "⁄";
+    var frown = "⌢";
+    var fscr = "𝒻";
+    var Fscr = "ℱ";
+    var gacute = "ǵ";
+    var Gamma = "Γ";
+    var gamma = "γ";
+    var Gammad = "Ϝ";
+    var gammad = "ϝ";
+    var gap = "⪆";
+    var Gbreve = "Ğ";
+    var gbreve = "ğ";
+    var Gcedil = "Ģ";
+    var Gcirc = "Ĝ";
+    var gcirc = "ĝ";
+    var Gcy = "Г";
+    var gcy = "г";
+    var Gdot = "Ġ";
+    var gdot = "ġ";
+    var ge = "≥";
+    var gE = "≧";
+    var gEl = "⪌";
+    var gel = "⋛";
+    var geq = "≥";
+    var geqq = "≧";
+    var geqslant = "⩾";
+    var gescc = "⪩";
+    var ges = "⩾";
+    var gesdot = "⪀";
+    var gesdoto = "⪂";
+    var gesdotol = "⪄";
+    var gesl = "⋛︀";
+    var gesles = "⪔";
+    var Gfr = "𝔊";
+    var gfr = "𝔤";
+    var gg = "≫";
+    var Gg = "⋙";
+    var ggg = "⋙";
+    var gimel = "ℷ";
+    var GJcy = "Ѓ";
+    var gjcy = "ѓ";
+    var gla = "⪥";
+    var gl = "≷";
+    var glE = "⪒";
+    var glj = "⪤";
+    var gnap = "⪊";
+    var gnapprox = "⪊";
+    var gne = "⪈";
+    var gnE = "≩";
+    var gneq = "⪈";
+    var gneqq = "≩";
+    var gnsim = "⋧";
+    var Gopf = "𝔾";
+    var gopf = "𝕘";
+    var grave = "`";
+    var GreaterEqual = "≥";
+    var GreaterEqualLess = "⋛";
+    var GreaterFullEqual = "≧";
+    var GreaterGreater = "⪢";
+    var GreaterLess = "≷";
+    var GreaterSlantEqual = "⩾";
+    var GreaterTilde = "≳";
+    var Gscr = "𝒢";
+    var gscr = "ℊ";
+    var gsim = "≳";
+    var gsime = "⪎";
+    var gsiml = "⪐";
+    var gtcc = "⪧";
+    var gtcir = "⩺";
+    var gt = ">";
+    var GT = ">";
+    var Gt = "≫";
+    var gtdot = "⋗";
+    var gtlPar = "⦕";
+    var gtquest = "⩼";
+    var gtrapprox = "⪆";
+    var gtrarr = "⥸";
+    var gtrdot = "⋗";
+    var gtreqless = "⋛";
+    var gtreqqless = "⪌";
+    var gtrless = "≷";
+    var gtrsim = "≳";
+    var gvertneqq = "≩︀";
+    var gvnE = "≩︀";
+    var Hacek = "ˇ";
+    var hairsp = " ";
+    var half = "½";
+    var hamilt = "ℋ";
+    var HARDcy = "Ъ";
+    var hardcy = "ъ";
+    var harrcir = "⥈";
+    var harr = "↔";
+    var hArr = "⇔";
+    var harrw = "↭";
+    var Hat = "^";
+    var hbar = "ℏ";
+    var Hcirc = "Ĥ";
+    var hcirc = "ĥ";
+    var hearts = "♥";
+    var heartsuit = "♥";
+    var hellip = "…";
+    var hercon = "⊹";
+    var hfr = "𝔥";
+    var Hfr = "ℌ";
+    var HilbertSpace = "ℋ";
+    var hksearow = "⤥";
+    var hkswarow = "⤦";
+    var hoarr = "⇿";
+    var homtht = "∻";
+    var hookleftarrow = "↩";
+    var hookrightarrow = "↪";
+    var hopf = "𝕙";
+    var Hopf = "ℍ";
+    var horbar = "―";
+    var HorizontalLine = "─";
+    var hscr = "𝒽";
+    var Hscr = "ℋ";
+    var hslash = "ℏ";
+    var Hstrok = "Ħ";
+    var hstrok = "ħ";
+    var HumpDownHump = "≎";
+    var HumpEqual = "≏";
+    var hybull = "⁃";
+    var hyphen = "‐";
+    var Iacute = "Í";
+    var iacute = "í";
+    var ic = "⁣";
+    var Icirc = "Î";
+    var icirc = "î";
+    var Icy = "И";
+    var icy = "и";
+    var Idot = "İ";
+    var IEcy = "Е";
+    var iecy = "е";
+    var iexcl = "¡";
+    var iff = "⇔";
+    var ifr = "𝔦";
+    var Ifr = "ℑ";
+    var Igrave = "Ì";
+    var igrave = "ì";
+    var ii = "ⅈ";
+    var iiiint = "⨌";
+    var iiint = "∭";
+    var iinfin = "⧜";
+    var iiota = "℩";
+    var IJlig = "Ĳ";
+    var ijlig = "ĳ";
+    var Imacr = "Ī";
+    var imacr = "ī";
+    var image = "ℑ";
+    var ImaginaryI = "ⅈ";
+    var imagline = "ℐ";
+    var imagpart = "ℑ";
+    var imath = "ı";
+    var Im = "ℑ";
+    var imof = "⊷";
+    var imped = "Ƶ";
+    var Implies = "⇒";
+    var incare = "℅";
+    var infin = "∞";
+    var infintie = "⧝";
+    var inodot = "ı";
+    var intcal = "⊺";
+    var int = "∫";
+    var Int = "∬";
+    var integers = "ℤ";
+    var Integral = "∫";
+    var intercal = "⊺";
+    var Intersection = "⋂";
+    var intlarhk = "⨗";
+    var intprod = "⨼";
+    var InvisibleComma = "⁣";
+    var InvisibleTimes = "⁢";
+    var IOcy = "Ё";
+    var iocy = "ё";
+    var Iogon = "Į";
+    var iogon = "į";
+    var Iopf = "𝕀";
+    var iopf = "𝕚";
+    var Iota = "Ι";
+    var iota = "ι";
+    var iprod = "⨼";
+    var iquest = "¿";
+    var iscr = "𝒾";
+    var Iscr = "ℐ";
+    var isin = "∈";
+    var isindot = "⋵";
+    var isinE = "⋹";
+    var isins = "⋴";
+    var isinsv = "⋳";
+    var isinv = "∈";
+    var it = "⁢";
+    var Itilde = "Ĩ";
+    var itilde = "ĩ";
+    var Iukcy = "І";
+    var iukcy = "і";
+    var Iuml = "Ï";
+    var iuml = "ï";
+    var Jcirc = "Ĵ";
+    var jcirc = "ĵ";
+    var Jcy = "Й";
+    var jcy = "й";
+    var Jfr = "𝔍";
+    var jfr = "𝔧";
+    var jmath = "ȷ";
+    var Jopf = "𝕁";
+    var jopf = "𝕛";
+    var Jscr = "𝒥";
+    var jscr = "𝒿";
+    var Jsercy = "Ј";
+    var jsercy = "ј";
+    var Jukcy = "Є";
+    var jukcy = "є";
+    var Kappa = "Κ";
+    var kappa = "κ";
+    var kappav = "ϰ";
+    var Kcedil = "Ķ";
+    var kcedil = "ķ";
+    var Kcy = "К";
+    var kcy = "к";
+    var Kfr = "𝔎";
+    var kfr = "𝔨";
+    var kgreen = "ĸ";
+    var KHcy = "Х";
+    var khcy = "х";
+    var KJcy = "Ќ";
+    var kjcy = "ќ";
+    var Kopf = "𝕂";
+    var kopf = "𝕜";
+    var Kscr = "𝒦";
+    var kscr = "𝓀";
+    var lAarr = "⇚";
+    var Lacute = "Ĺ";
+    var lacute = "ĺ";
+    var laemptyv = "⦴";
+    var lagran = "ℒ";
+    var Lambda = "Λ";
+    var lambda = "λ";
+    var lang = "⟨";
+    var Lang = "⟪";
+    var langd = "⦑";
+    var langle = "⟨";
+    var lap = "⪅";
+    var Laplacetrf = "ℒ";
+    var laquo = "«";
+    var larrb = "⇤";
+    var larrbfs = "⤟";
+    var larr = "←";
+    var Larr = "↞";
+    var lArr = "⇐";
+    var larrfs = "⤝";
+    var larrhk = "↩";
+    var larrlp = "↫";
+    var larrpl = "⤹";
+    var larrsim = "⥳";
+    var larrtl = "↢";
+    var latail = "⤙";
+    var lAtail = "⤛";
+    var lat = "⪫";
+    var late = "⪭";
+    var lates = "⪭︀";
+    var lbarr = "⤌";
+    var lBarr = "⤎";
+    var lbbrk = "❲";
+    var lbrace = "{";
+    var lbrack = "[";
+    var lbrke = "⦋";
+    var lbrksld = "⦏";
+    var lbrkslu = "⦍";
+    var Lcaron = "Ľ";
+    var lcaron = "ľ";
+    var Lcedil = "Ļ";
+    var lcedil = "ļ";
+    var lceil = "⌈";
+    var lcub = "{";
+    var Lcy = "Л";
+    var lcy = "л";
+    var ldca = "⤶";
+    var ldquo = "“";
+    var ldquor = "„";
+    var ldrdhar = "⥧";
+    var ldrushar = "⥋";
+    var ldsh = "↲";
+    var le = "≤";
+    var lE = "≦";
+    var LeftAngleBracket = "⟨";
+    var LeftArrowBar = "⇤";
+    var leftarrow = "←";
+    var LeftArrow = "←";
+    var Leftarrow = "⇐";
+    var LeftArrowRightArrow = "⇆";
+    var leftarrowtail = "↢";
+    var LeftCeiling = "⌈";
+    var LeftDoubleBracket = "⟦";
+    var LeftDownTeeVector = "⥡";
+    var LeftDownVectorBar = "⥙";
+    var LeftDownVector = "⇃";
+    var LeftFloor = "⌊";
+    var leftharpoondown = "↽";
+    var leftharpoonup = "↼";
+    var leftleftarrows = "⇇";
+    var leftrightarrow = "↔";
+    var LeftRightArrow = "↔";
+    var Leftrightarrow = "⇔";
+    var leftrightarrows = "⇆";
+    var leftrightharpoons = "⇋";
+    var leftrightsquigarrow = "↭";
+    var LeftRightVector = "⥎";
+    var LeftTeeArrow = "↤";
+    var LeftTee = "⊣";
+    var LeftTeeVector = "⥚";
+    var leftthreetimes = "⋋";
+    var LeftTriangleBar = "⧏";
+    var LeftTriangle = "⊲";
+    var LeftTriangleEqual = "⊴";
+    var LeftUpDownVector = "⥑";
+    var LeftUpTeeVector = "⥠";
+    var LeftUpVectorBar = "⥘";
+    var LeftUpVector = "↿";
+    var LeftVectorBar = "⥒";
+    var LeftVector = "↼";
+    var lEg = "⪋";
+    var leg = "⋚";
+    var leq = "≤";
+    var leqq = "≦";
+    var leqslant = "⩽";
+    var lescc = "⪨";
+    var les = "⩽";
+    var lesdot = "⩿";
+    var lesdoto = "⪁";
+    var lesdotor = "⪃";
+    var lesg = "⋚︀";
+    var lesges = "⪓";
+    var lessapprox = "⪅";
+    var lessdot = "⋖";
+    var lesseqgtr = "⋚";
+    var lesseqqgtr = "⪋";
+    var LessEqualGreater = "⋚";
+    var LessFullEqual = "≦";
+    var LessGreater = "≶";
+    var lessgtr = "≶";
+    var LessLess = "⪡";
+    var lesssim = "≲";
+    var LessSlantEqual = "⩽";
+    var LessTilde = "≲";
+    var lfisht = "⥼";
+    var lfloor = "⌊";
+    var Lfr = "𝔏";
+    var lfr = "𝔩";
+    var lg = "≶";
+    var lgE = "⪑";
+    var lHar = "⥢";
+    var lhard = "↽";
+    var lharu = "↼";
+    var lharul = "⥪";
+    var lhblk = "▄";
+    var LJcy = "Љ";
+    var ljcy = "љ";
+    var llarr = "⇇";
+    var ll = "≪";
+    var Ll = "⋘";
+    var llcorner = "⌞";
+    var Lleftarrow = "⇚";
+    var llhard = "⥫";
+    var lltri = "◺";
+    var Lmidot = "Ŀ";
+    var lmidot = "ŀ";
+    var lmoustache = "⎰";
+    var lmoust = "⎰";
+    var lnap = "⪉";
+    var lnapprox = "⪉";
+    var lne = "⪇";
+    var lnE = "≨";
+    var lneq = "⪇";
+    var lneqq = "≨";
+    var lnsim = "⋦";
+    var loang = "⟬";
+    var loarr = "⇽";
+    var lobrk = "⟦";
+    var longleftarrow = "⟵";
+    var LongLeftArrow = "⟵";
+    var Longleftarrow = "⟸";
+    var longleftrightarrow = "⟷";
+    var LongLeftRightArrow = "⟷";
+    var Longleftrightarrow = "⟺";
+    var longmapsto = "⟼";
+    var longrightarrow = "⟶";
+    var LongRightArrow = "⟶";
+    var Longrightarrow = "⟹";
+    var looparrowleft = "↫";
+    var looparrowright = "↬";
+    var lopar = "⦅";
+    var Lopf = "𝕃";
+    var lopf = "𝕝";
+    var loplus = "⨭";
+    var lotimes = "⨴";
+    var lowast = "∗";
+    var lowbar = "_";
+    var LowerLeftArrow = "↙";
+    var LowerRightArrow = "↘";
+    var loz = "◊";
+    var lozenge = "◊";
+    var lozf = "⧫";
+    var lpar = "(";
+    var lparlt = "⦓";
+    var lrarr = "⇆";
+    var lrcorner = "⌟";
+    var lrhar = "⇋";
+    var lrhard = "⥭";
+    var lrm = "‎";
+    var lrtri = "⊿";
+    var lsaquo = "‹";
+    var lscr = "𝓁";
+    var Lscr = "ℒ";
+    var lsh = "↰";
+    var Lsh = "↰";
+    var lsim = "≲";
+    var lsime = "⪍";
+    var lsimg = "⪏";
+    var lsqb = "[";
+    var lsquo = "‘";
+    var lsquor = "‚";
+    var Lstrok = "Ł";
+    var lstrok = "ł";
+    var ltcc = "⪦";
+    var ltcir = "⩹";
+    var lt = "<";
+    var LT = "<";
+    var Lt = "≪";
+    var ltdot = "⋖";
+    var lthree = "⋋";
+    var ltimes = "⋉";
+    var ltlarr = "⥶";
+    var ltquest = "⩻";
+    var ltri = "◃";
+    var ltrie = "⊴";
+    var ltrif = "◂";
+    var ltrPar = "⦖";
+    var lurdshar = "⥊";
+    var luruhar = "⥦";
+    var lvertneqq = "≨︀";
+    var lvnE = "≨︀";
+    var macr = "¯";
+    var male = "♂";
+    var malt = "✠";
+    var maltese = "✠";
+    var map = "↦";
+    var mapsto = "↦";
+    var mapstodown = "↧";
+    var mapstoleft = "↤";
+    var mapstoup = "↥";
+    var marker = "▮";
+    var mcomma = "⨩";
+    var Mcy = "М";
+    var mcy = "м";
+    var mdash = "—";
+    var mDDot = "∺";
+    var measuredangle = "∡";
+    var MediumSpace = " ";
+    var Mellintrf = "ℳ";
+    var Mfr = "𝔐";
+    var mfr = "𝔪";
+    var mho = "℧";
+    var micro = "µ";
+    var midast = "*";
+    var midcir = "⫰";
+    var mid = "∣";
+    var middot = "·";
+    var minusb = "⊟";
+    var minus = "−";
+    var minusd = "∸";
+    var minusdu = "⨪";
+    var MinusPlus = "∓";
+    var mlcp = "⫛";
+    var mldr = "…";
+    var mnplus = "∓";
+    var models = "⊧";
+    var Mopf = "𝕄";
+    var mopf = "𝕞";
+    var mp = "∓";
+    var mscr = "𝓂";
+    var Mscr = "ℳ";
+    var mstpos = "∾";
+    var Mu = "Μ";
+    var mu = "μ";
+    var multimap = "⊸";
+    var mumap = "⊸";
+    var nabla = "∇";
+    var Nacute = "Ń";
+    var nacute = "ń";
+    var nang = "∠⃒";
+    var nap = "≉";
+    var napE = "⩰̸";
+    var napid = "≋̸";
+    var napos = "ŉ";
+    var napprox = "≉";
+    var natural = "♮";
+    var naturals = "ℕ";
+    var natur = "♮";
+    var nbsp = " ";
+    var nbump = "≎̸";
+    var nbumpe = "≏̸";
+    var ncap = "⩃";
+    var Ncaron = "Ň";
+    var ncaron = "ň";
+    var Ncedil = "Ņ";
+    var ncedil = "ņ";
+    var ncong = "≇";
+    var ncongdot = "⩭̸";
+    var ncup = "⩂";
+    var Ncy = "Н";
+    var ncy = "н";
+    var ndash = "–";
+    var nearhk = "⤤";
+    var nearr = "↗";
+    var neArr = "⇗";
+    var nearrow = "↗";
+    var ne = "≠";
+    var nedot = "≐̸";
+    var NegativeMediumSpace = "​";
+    var NegativeThickSpace = "​";
+    var NegativeThinSpace = "​";
+    var NegativeVeryThinSpace = "​";
+    var nequiv = "≢";
+    var nesear = "⤨";
+    var nesim = "≂̸";
+    var NestedGreaterGreater = "≫";
+    var NestedLessLess = "≪";
+    var NewLine = "\n";
+    var nexist = "∄";
+    var nexists = "∄";
+    var Nfr = "𝔑";
+    var nfr = "𝔫";
+    var ngE = "≧̸";
+    var nge = "≱";
+    var ngeq = "≱";
+    var ngeqq = "≧̸";
+    var ngeqslant = "⩾̸";
+    var nges = "⩾̸";
+    var nGg = "⋙̸";
+    var ngsim = "≵";
+    var nGt = "≫⃒";
+    var ngt = "≯";
+    var ngtr = "≯";
+    var nGtv = "≫̸";
+    var nharr = "↮";
+    var nhArr = "⇎";
+    var nhpar = "⫲";
+    var ni = "∋";
+    var nis = "⋼";
+    var nisd = "⋺";
+    var niv = "∋";
+    var NJcy = "Њ";
+    var njcy = "њ";
+    var nlarr = "↚";
+    var nlArr = "⇍";
+    var nldr = "‥";
+    var nlE = "≦̸";
+    var nle = "≰";
+    var nleftarrow = "↚";
+    var nLeftarrow = "⇍";
+    var nleftrightarrow = "↮";
+    var nLeftrightarrow = "⇎";
+    var nleq = "≰";
+    var nleqq = "≦̸";
+    var nleqslant = "⩽̸";
+    var nles = "⩽̸";
+    var nless = "≮";
+    var nLl = "⋘̸";
+    var nlsim = "≴";
+    var nLt = "≪⃒";
+    var nlt = "≮";
+    var nltri = "⋪";
+    var nltrie = "⋬";
+    var nLtv = "≪̸";
+    var nmid = "∤";
+    var NoBreak = "⁠";
+    var NonBreakingSpace = " ";
+    var nopf = "𝕟";
+    var Nopf = "ℕ";
+    var Not = "⫬";
+    var not = "¬";
+    var NotCongruent = "≢";
+    var NotCupCap = "≭";
+    var NotDoubleVerticalBar = "∦";
+    var NotElement = "∉";
+    var NotEqual = "≠";
+    var NotEqualTilde = "≂̸";
+    var NotExists = "∄";
+    var NotGreater = "≯";
+    var NotGreaterEqual = "≱";
+    var NotGreaterFullEqual = "≧̸";
+    var NotGreaterGreater = "≫̸";
+    var NotGreaterLess = "≹";
+    var NotGreaterSlantEqual = "⩾̸";
+    var NotGreaterTilde = "≵";
+    var NotHumpDownHump = "≎̸";
+    var NotHumpEqual = "≏̸";
+    var notin = "∉";
+    var notindot = "⋵̸";
+    var notinE = "⋹̸";
+    var notinva = "∉";
+    var notinvb = "⋷";
+    var notinvc = "⋶";
+    var NotLeftTriangleBar = "⧏̸";
+    var NotLeftTriangle = "⋪";
+    var NotLeftTriangleEqual = "⋬";
+    var NotLess = "≮";
+    var NotLessEqual = "≰";
+    var NotLessGreater = "≸";
+    var NotLessLess = "≪̸";
+    var NotLessSlantEqual = "⩽̸";
+    var NotLessTilde = "≴";
+    var NotNestedGreaterGreater = "⪢̸";
+    var NotNestedLessLess = "⪡̸";
+    var notni = "∌";
+    var notniva = "∌";
+    var notnivb = "⋾";
+    var notnivc = "⋽";
+    var NotPrecedes = "⊀";
+    var NotPrecedesEqual = "⪯̸";
+    var NotPrecedesSlantEqual = "⋠";
+    var NotReverseElement = "∌";
+    var NotRightTriangleBar = "⧐̸";
+    var NotRightTriangle = "⋫";
+    var NotRightTriangleEqual = "⋭";
+    var NotSquareSubset = "⊏̸";
+    var NotSquareSubsetEqual = "⋢";
+    var NotSquareSuperset = "⊐̸";
+    var NotSquareSupersetEqual = "⋣";
+    var NotSubset = "⊂⃒";
+    var NotSubsetEqual = "⊈";
+    var NotSucceeds = "⊁";
+    var NotSucceedsEqual = "⪰̸";
+    var NotSucceedsSlantEqual = "⋡";
+    var NotSucceedsTilde = "≿̸";
+    var NotSuperset = "⊃⃒";
+    var NotSupersetEqual = "⊉";
+    var NotTilde = "≁";
+    var NotTildeEqual = "≄";
+    var NotTildeFullEqual = "≇";
+    var NotTildeTilde = "≉";
+    var NotVerticalBar = "∤";
+    var nparallel = "∦";
+    var npar = "∦";
+    var nparsl = "⫽⃥";
+    var npart = "∂̸";
+    var npolint = "⨔";
+    var npr = "⊀";
+    var nprcue = "⋠";
+    var nprec = "⊀";
+    var npreceq = "⪯̸";
+    var npre = "⪯̸";
+    var nrarrc = "⤳̸";
+    var nrarr = "↛";
+    var nrArr = "⇏";
+    var nrarrw = "↝̸";
+    var nrightarrow = "↛";
+    var nRightarrow = "⇏";
+    var nrtri = "⋫";
+    var nrtrie = "⋭";
+    var nsc = "⊁";
+    var nsccue = "⋡";
+    var nsce = "⪰̸";
+    var Nscr = "𝒩";
+    var nscr = "𝓃";
+    var nshortmid = "∤";
+    var nshortparallel = "∦";
+    var nsim = "≁";
+    var nsime = "≄";
+    var nsimeq = "≄";
+    var nsmid = "∤";
+    var nspar = "∦";
+    var nsqsube = "⋢";
+    var nsqsupe = "⋣";
+    var nsub = "⊄";
+    var nsubE = "⫅̸";
+    var nsube = "⊈";
+    var nsubset = "⊂⃒";
+    var nsubseteq = "⊈";
+    var nsubseteqq = "⫅̸";
+    var nsucc = "⊁";
+    var nsucceq = "⪰̸";
+    var nsup = "⊅";
+    var nsupE = "⫆̸";
+    var nsupe = "⊉";
+    var nsupset = "⊃⃒";
+    var nsupseteq = "⊉";
+    var nsupseteqq = "⫆̸";
+    var ntgl = "≹";
+    var Ntilde = "Ñ";
+    var ntilde = "ñ";
+    var ntlg = "≸";
+    var ntriangleleft = "⋪";
+    var ntrianglelefteq = "⋬";
+    var ntriangleright = "⋫";
+    var ntrianglerighteq = "⋭";
+    var Nu = "Ν";
+    var nu = "ν";
+    var num = "#";
+    var numero = "№";
+    var numsp = " ";
+    var nvap = "≍⃒";
+    var nvdash = "⊬";
+    var nvDash = "⊭";
+    var nVdash = "⊮";
+    var nVDash = "⊯";
+    var nvge = "≥⃒";
+    var nvgt = ">⃒";
+    var nvHarr = "⤄";
+    var nvinfin = "⧞";
+    var nvlArr = "⤂";
+    var nvle = "≤⃒";
+    var nvlt = "<⃒";
+    var nvltrie = "⊴⃒";
+    var nvrArr = "⤃";
+    var nvrtrie = "⊵⃒";
+    var nvsim = "∼⃒";
+    var nwarhk = "⤣";
+    var nwarr = "↖";
+    var nwArr = "⇖";
+    var nwarrow = "↖";
+    var nwnear = "⤧";
+    var Oacute = "Ó";
+    var oacute = "ó";
+    var oast = "⊛";
+    var Ocirc = "Ô";
+    var ocirc = "ô";
+    var ocir = "⊚";
+    var Ocy = "О";
+    var ocy = "о";
+    var odash = "⊝";
+    var Odblac = "Ő";
+    var odblac = "ő";
+    var odiv = "⨸";
+    var odot = "⊙";
+    var odsold = "⦼";
+    var OElig = "Œ";
+    var oelig = "œ";
+    var ofcir = "⦿";
+    var Ofr = "𝔒";
+    var ofr = "𝔬";
+    var ogon = "˛";
+    var Ograve = "Ò";
+    var ograve = "ò";
+    var ogt = "⧁";
+    var ohbar = "⦵";
+    var ohm = "Ω";
+    var oint = "∮";
+    var olarr = "↺";
+    var olcir = "⦾";
+    var olcross = "⦻";
+    var oline = "‾";
+    var olt = "⧀";
+    var Omacr = "Ō";
+    var omacr = "ō";
+    var Omega = "Ω";
+    var omega = "ω";
+    var Omicron = "Ο";
+    var omicron = "ο";
+    var omid = "⦶";
+    var ominus = "⊖";
+    var Oopf = "𝕆";
+    var oopf = "𝕠";
+    var opar = "⦷";
+    var OpenCurlyDoubleQuote = "“";
+    var OpenCurlyQuote = "‘";
+    var operp = "⦹";
+    var oplus = "⊕";
+    var orarr = "↻";
+    var Or = "⩔";
+    var or = "∨";
+    var ord = "⩝";
+    var order = "ℴ";
+    var orderof = "ℴ";
+    var ordf = "ª";
+    var ordm = "º";
+    var origof = "⊶";
+    var oror = "⩖";
+    var orslope = "⩗";
+    var orv = "⩛";
+    var oS = "Ⓢ";
+    var Oscr = "𝒪";
+    var oscr = "ℴ";
+    var Oslash = "Ø";
+    var oslash = "ø";
+    var osol = "⊘";
+    var Otilde = "Õ";
+    var otilde = "õ";
+    var otimesas = "⨶";
+    var Otimes = "⨷";
+    var otimes = "⊗";
+    var Ouml = "Ö";
+    var ouml = "ö";
+    var ovbar = "⌽";
+    var OverBar = "‾";
+    var OverBrace = "⏞";
+    var OverBracket = "⎴";
+    var OverParenthesis = "⏜";
+    var para = "¶";
+    var parallel = "∥";
+    var par = "∥";
+    var parsim = "⫳";
+    var parsl = "⫽";
+    var part = "∂";
+    var PartialD = "∂";
+    var Pcy = "П";
+    var pcy = "п";
+    var percnt = "%";
+    var period = ".";
+    var permil = "‰";
+    var perp = "⊥";
+    var pertenk = "‱";
+    var Pfr = "𝔓";
+    var pfr = "𝔭";
+    var Phi = "Φ";
+    var phi = "φ";
+    var phiv = "ϕ";
+    var phmmat = "ℳ";
+    var phone = "☎";
+    var Pi = "Π";
+    var pi = "π";
+    var pitchfork = "⋔";
+    var piv = "ϖ";
+    var planck = "ℏ";
+    var planckh = "ℎ";
+    var plankv = "ℏ";
+    var plusacir = "⨣";
+    var plusb = "⊞";
+    var pluscir = "⨢";
+    var plus = "+";
+    var plusdo = "∔";
+    var plusdu = "⨥";
+    var pluse = "⩲";
+    var PlusMinus = "±";
+    var plusmn = "±";
+    var plussim = "⨦";
+    var plustwo = "⨧";
+    var pm = "±";
+    var Poincareplane = "ℌ";
+    var pointint = "⨕";
+    var popf = "𝕡";
+    var Popf = "ℙ";
+    var pound = "£";
+    var prap = "⪷";
+    var Pr = "⪻";
+    var pr = "≺";
+    var prcue = "≼";
+    var precapprox = "⪷";
+    var prec = "≺";
+    var preccurlyeq = "≼";
+    var Precedes = "≺";
+    var PrecedesEqual = "⪯";
+    var PrecedesSlantEqual = "≼";
+    var PrecedesTilde = "≾";
+    var preceq = "⪯";
+    var precnapprox = "⪹";
+    var precneqq = "⪵";
+    var precnsim = "⋨";
+    var pre = "⪯";
+    var prE = "⪳";
+    var precsim = "≾";
+    var prime = "′";
+    var Prime = "″";
+    var primes = "ℙ";
+    var prnap = "⪹";
+    var prnE = "⪵";
+    var prnsim = "⋨";
+    var prod = "∏";
+    var Product = "∏";
+    var profalar = "⌮";
+    var profline = "⌒";
+    var profsurf = "⌓";
+    var prop = "∝";
+    var Proportional = "∝";
+    var Proportion = "∷";
+    var propto = "∝";
+    var prsim = "≾";
+    var prurel = "⊰";
+    var Pscr = "𝒫";
+    var pscr = "𝓅";
+    var Psi = "Ψ";
+    var psi = "ψ";
+    var puncsp = " ";
+    var Qfr = "𝔔";
+    var qfr = "𝔮";
+    var qint = "⨌";
+    var qopf = "𝕢";
+    var Qopf = "ℚ";
+    var qprime = "⁗";
+    var Qscr = "𝒬";
+    var qscr = "𝓆";
+    var quaternions = "ℍ";
+    var quatint = "⨖";
+    var quest = "?";
+    var questeq = "≟";
+    var quot = "\"";
+    var QUOT = "\"";
+    var rAarr = "⇛";
+    var race = "∽̱";
+    var Racute = "Ŕ";
+    var racute = "ŕ";
+    var radic = "√";
+    var raemptyv = "⦳";
+    var rang = "⟩";
+    var Rang = "⟫";
+    var rangd = "⦒";
+    var range = "⦥";
+    var rangle = "⟩";
+    var raquo = "»";
+    var rarrap = "⥵";
+    var rarrb = "⇥";
+    var rarrbfs = "⤠";
+    var rarrc = "⤳";
+    var rarr = "→";
+    var Rarr = "↠";
+    var rArr = "⇒";
+    var rarrfs = "⤞";
+    var rarrhk = "↪";
+    var rarrlp = "↬";
+    var rarrpl = "⥅";
+    var rarrsim = "⥴";
+    var Rarrtl = "⤖";
+    var rarrtl = "↣";
+    var rarrw = "↝";
+    var ratail = "⤚";
+    var rAtail = "⤜";
+    var ratio = "∶";
+    var rationals = "ℚ";
+    var rbarr = "⤍";
+    var rBarr = "⤏";
+    var RBarr = "⤐";
+    var rbbrk = "❳";
+    var rbrace = "}";
+    var rbrack = "]";
+    var rbrke = "⦌";
+    var rbrksld = "⦎";
+    var rbrkslu = "⦐";
+    var Rcaron = "Ř";
+    var rcaron = "ř";
+    var Rcedil = "Ŗ";
+    var rcedil = "ŗ";
+    var rceil = "⌉";
+    var rcub = "}";
+    var Rcy = "Р";
+    var rcy = "р";
+    var rdca = "⤷";
+    var rdldhar = "⥩";
+    var rdquo = "”";
+    var rdquor = "”";
+    var rdsh = "↳";
+    var real = "ℜ";
+    var realine = "ℛ";
+    var realpart = "ℜ";
+    var reals = "ℝ";
+    var Re = "ℜ";
+    var rect = "▭";
+    var reg = "®";
+    var REG = "®";
+    var ReverseElement = "∋";
+    var ReverseEquilibrium = "⇋";
+    var ReverseUpEquilibrium = "⥯";
+    var rfisht = "⥽";
+    var rfloor = "⌋";
+    var rfr = "𝔯";
+    var Rfr = "ℜ";
+    var rHar = "⥤";
+    var rhard = "⇁";
+    var rharu = "⇀";
+    var rharul = "⥬";
+    var Rho = "Ρ";
+    var rho = "ρ";
+    var rhov = "ϱ";
+    var RightAngleBracket = "⟩";
+    var RightArrowBar = "⇥";
+    var rightarrow = "→";
+    var RightArrow = "→";
+    var Rightarrow = "⇒";
+    var RightArrowLeftArrow = "⇄";
+    var rightarrowtail = "↣";
+    var RightCeiling = "⌉";
+    var RightDoubleBracket = "⟧";
+    var RightDownTeeVector = "⥝";
+    var RightDownVectorBar = "⥕";
+    var RightDownVector = "⇂";
+    var RightFloor = "⌋";
+    var rightharpoondown = "⇁";
+    var rightharpoonup = "⇀";
+    var rightleftarrows = "⇄";
+    var rightleftharpoons = "⇌";
+    var rightrightarrows = "⇉";
+    var rightsquigarrow = "↝";
+    var RightTeeArrow = "↦";
+    var RightTee = "⊢";
+    var RightTeeVector = "⥛";
+    var rightthreetimes = "⋌";
+    var RightTriangleBar = "⧐";
+    var RightTriangle = "⊳";
+    var RightTriangleEqual = "⊵";
+    var RightUpDownVector = "⥏";
+    var RightUpTeeVector = "⥜";
+    var RightUpVectorBar = "⥔";
+    var RightUpVector = "↾";
+    var RightVectorBar = "⥓";
+    var RightVector = "⇀";
+    var ring = "˚";
+    var risingdotseq = "≓";
+    var rlarr = "⇄";
+    var rlhar = "⇌";
+    var rlm = "‏";
+    var rmoustache = "⎱";
+    var rmoust = "⎱";
+    var rnmid = "⫮";
+    var roang = "⟭";
+    var roarr = "⇾";
+    var robrk = "⟧";
+    var ropar = "⦆";
+    var ropf = "𝕣";
+    var Ropf = "ℝ";
+    var roplus = "⨮";
+    var rotimes = "⨵";
+    var RoundImplies = "⥰";
+    var rpar = ")";
+    var rpargt = "⦔";
+    var rppolint = "⨒";
+    var rrarr = "⇉";
+    var Rrightarrow = "⇛";
+    var rsaquo = "›";
+    var rscr = "𝓇";
+    var Rscr = "ℛ";
+    var rsh = "↱";
+    var Rsh = "↱";
+    var rsqb = "]";
+    var rsquo = "’";
+    var rsquor = "’";
+    var rthree = "⋌";
+    var rtimes = "⋊";
+    var rtri = "▹";
+    var rtrie = "⊵";
+    var rtrif = "▸";
+    var rtriltri = "⧎";
+    var RuleDelayed = "⧴";
+    var ruluhar = "⥨";
+    var rx = "℞";
+    var Sacute = "Ś";
+    var sacute = "ś";
+    var sbquo = "‚";
+    var scap = "⪸";
+    var Scaron = "Š";
+    var scaron = "š";
+    var Sc = "⪼";
+    var sc = "≻";
+    var sccue = "≽";
+    var sce = "⪰";
+    var scE = "⪴";
+    var Scedil = "Ş";
+    var scedil = "ş";
+    var Scirc = "Ŝ";
+    var scirc = "ŝ";
+    var scnap = "⪺";
+    var scnE = "⪶";
+    var scnsim = "⋩";
+    var scpolint = "⨓";
+    var scsim = "≿";
+    var Scy = "С";
+    var scy = "с";
+    var sdotb = "⊡";
+    var sdot = "⋅";
+    var sdote = "⩦";
+    var searhk = "⤥";
+    var searr = "↘";
+    var seArr = "⇘";
+    var searrow = "↘";
+    var sect = "§";
+    var semi = ";";
+    var seswar = "⤩";
+    var setminus = "∖";
+    var setmn = "∖";
+    var sext = "✶";
+    var Sfr = "𝔖";
+    var sfr = "𝔰";
+    var sfrown = "⌢";
+    var sharp = "♯";
+    var SHCHcy = "Щ";
+    var shchcy = "щ";
+    var SHcy = "Ш";
+    var shcy = "ш";
+    var ShortDownArrow = "↓";
+    var ShortLeftArrow = "←";
+    var shortmid = "∣";
+    var shortparallel = "∥";
+    var ShortRightArrow = "→";
+    var ShortUpArrow = "↑";
+    var shy = "­";
+    var Sigma = "Σ";
+    var sigma = "σ";
+    var sigmaf = "ς";
+    var sigmav = "ς";
+    var sim = "∼";
+    var simdot = "⩪";
+    var sime = "≃";
+    var simeq = "≃";
+    var simg = "⪞";
+    var simgE = "⪠";
+    var siml = "⪝";
+    var simlE = "⪟";
+    var simne = "≆";
+    var simplus = "⨤";
+    var simrarr = "⥲";
+    var slarr = "←";
+    var SmallCircle = "∘";
+    var smallsetminus = "∖";
+    var smashp = "⨳";
+    var smeparsl = "⧤";
+    var smid = "∣";
+    var smile = "⌣";
+    var smt = "⪪";
+    var smte = "⪬";
+    var smtes = "⪬︀";
+    var SOFTcy = "Ь";
+    var softcy = "ь";
+    var solbar = "⌿";
+    var solb = "⧄";
+    var sol = "/";
+    var Sopf = "𝕊";
+    var sopf = "𝕤";
+    var spades = "♠";
+    var spadesuit = "♠";
+    var spar = "∥";
+    var sqcap = "⊓";
+    var sqcaps = "⊓︀";
+    var sqcup = "⊔";
+    var sqcups = "⊔︀";
+    var Sqrt = "√";
+    var sqsub = "⊏";
+    var sqsube = "⊑";
+    var sqsubset = "⊏";
+    var sqsubseteq = "⊑";
+    var sqsup = "⊐";
+    var sqsupe = "⊒";
+    var sqsupset = "⊐";
+    var sqsupseteq = "⊒";
+    var square = "□";
+    var Square = "□";
+    var SquareIntersection = "⊓";
+    var SquareSubset = "⊏";
+    var SquareSubsetEqual = "⊑";
+    var SquareSuperset = "⊐";
+    var SquareSupersetEqual = "⊒";
+    var SquareUnion = "⊔";
+    var squarf = "▪";
+    var squ = "□";
+    var squf = "▪";
+    var srarr = "→";
+    var Sscr = "𝒮";
+    var sscr = "𝓈";
+    var ssetmn = "∖";
+    var ssmile = "⌣";
+    var sstarf = "⋆";
+    var Star = "⋆";
+    var star = "☆";
+    var starf = "★";
+    var straightepsilon = "ϵ";
+    var straightphi = "ϕ";
+    var strns = "¯";
+    var sub = "⊂";
+    var Sub = "⋐";
+    var subdot = "⪽";
+    var subE = "⫅";
+    var sube = "⊆";
+    var subedot = "⫃";
+    var submult = "⫁";
+    var subnE = "⫋";
+    var subne = "⊊";
+    var subplus = "⪿";
+    var subrarr = "⥹";
+    var subset = "⊂";
+    var Subset = "⋐";
+    var subseteq = "⊆";
+    var subseteqq = "⫅";
+    var SubsetEqual = "⊆";
+    var subsetneq = "⊊";
+    var subsetneqq = "⫋";
+    var subsim = "⫇";
+    var subsub = "⫕";
+    var subsup = "⫓";
+    var succapprox = "⪸";
+    var succ = "≻";
+    var succcurlyeq = "≽";
+    var Succeeds = "≻";
+    var SucceedsEqual = "⪰";
+    var SucceedsSlantEqual = "≽";
+    var SucceedsTilde = "≿";
+    var succeq = "⪰";
+    var succnapprox = "⪺";
+    var succneqq = "⪶";
+    var succnsim = "⋩";
+    var succsim = "≿";
+    var SuchThat = "∋";
+    var sum = "∑";
+    var Sum = "∑";
+    var sung = "♪";
+    var sup1 = "¹";
+    var sup2 = "²";
+    var sup3 = "³";
+    var sup = "⊃";
+    var Sup = "⋑";
+    var supdot = "⪾";
+    var supdsub = "⫘";
+    var supE = "⫆";
+    var supe = "⊇";
+    var supedot = "⫄";
+    var Superset = "⊃";
+    var SupersetEqual = "⊇";
+    var suphsol = "⟉";
+    var suphsub = "⫗";
+    var suplarr = "⥻";
+    var supmult = "⫂";
+    var supnE = "⫌";
+    var supne = "⊋";
+    var supplus = "⫀";
+    var supset = "⊃";
+    var Supset = "⋑";
+    var supseteq = "⊇";
+    var supseteqq = "⫆";
+    var supsetneq = "⊋";
+    var supsetneqq = "⫌";
+    var supsim = "⫈";
+    var supsub = "⫔";
+    var supsup = "⫖";
+    var swarhk = "⤦";
+    var swarr = "↙";
+    var swArr = "⇙";
+    var swarrow = "↙";
+    var swnwar = "⤪";
+    var szlig = "ß";
+    var Tab = "\t";
+    var target = "⌖";
+    var Tau = "Τ";
+    var tau = "τ";
+    var tbrk = "⎴";
+    var Tcaron = "Ť";
+    var tcaron = "ť";
+    var Tcedil = "Ţ";
+    var tcedil = "ţ";
+    var Tcy = "Т";
+    var tcy = "т";
+    var tdot = "⃛";
+    var telrec = "⌕";
+    var Tfr = "𝔗";
+    var tfr = "𝔱";
+    var there4 = "∴";
+    var therefore = "∴";
+    var Therefore = "∴";
+    var Theta = "Θ";
+    var theta = "θ";
+    var thetasym = "ϑ";
+    var thetav = "ϑ";
+    var thickapprox = "≈";
+    var thicksim = "∼";
+    var ThickSpace = "  ";
+    var ThinSpace = " ";
+    var thinsp = " ";
+    var thkap = "≈";
+    var thksim = "∼";
+    var THORN = "Þ";
+    var thorn = "þ";
+    var tilde = "˜";
+    var Tilde = "∼";
+    var TildeEqual = "≃";
+    var TildeFullEqual = "≅";
+    var TildeTilde = "≈";
+    var timesbar = "⨱";
+    var timesb = "⊠";
+    var times = "×";
+    var timesd = "⨰";
+    var tint = "∭";
+    var toea = "⤨";
+    var topbot = "⌶";
+    var topcir = "⫱";
+    var top = "⊤";
+    var Topf = "𝕋";
+    var topf = "𝕥";
+    var topfork = "⫚";
+    var tosa = "⤩";
+    var tprime = "‴";
+    var trade = "™";
+    var TRADE = "™";
+    var triangle = "▵";
+    var triangledown = "▿";
+    var triangleleft = "◃";
+    var trianglelefteq = "⊴";
+    var triangleq = "≜";
+    var triangleright = "▹";
+    var trianglerighteq = "⊵";
+    var tridot = "◬";
+    var trie = "≜";
+    var triminus = "⨺";
+    var TripleDot = "⃛";
+    var triplus = "⨹";
+    var trisb = "⧍";
+    var tritime = "⨻";
+    var trpezium = "⏢";
+    var Tscr = "𝒯";
+    var tscr = "𝓉";
+    var TScy = "Ц";
+    var tscy = "ц";
+    var TSHcy = "Ћ";
+    var tshcy = "ћ";
+    var Tstrok = "Ŧ";
+    var tstrok = "ŧ";
+    var twixt = "≬";
+    var twoheadleftarrow = "↞";
+    var twoheadrightarrow = "↠";
+    var Uacute = "Ú";
+    var uacute = "ú";
+    var uarr = "↑";
+    var Uarr = "↟";
+    var uArr = "⇑";
+    var Uarrocir = "⥉";
+    var Ubrcy = "Ў";
+    var ubrcy = "ў";
+    var Ubreve = "Ŭ";
+    var ubreve = "ŭ";
+    var Ucirc = "Û";
+    var ucirc = "û";
+    var Ucy = "У";
+    var ucy = "у";
+    var udarr = "⇅";
+    var Udblac = "Ű";
+    var udblac = "ű";
+    var udhar = "⥮";
+    var ufisht = "⥾";
+    var Ufr = "𝔘";
+    var ufr = "𝔲";
+    var Ugrave = "Ù";
+    var ugrave = "ù";
+    var uHar = "⥣";
+    var uharl = "↿";
+    var uharr = "↾";
+    var uhblk = "▀";
+    var ulcorn = "⌜";
+    var ulcorner = "⌜";
+    var ulcrop = "⌏";
+    var ultri = "◸";
+    var Umacr = "Ū";
+    var umacr = "ū";
+    var uml = "¨";
+    var UnderBar = "_";
+    var UnderBrace = "⏟";
+    var UnderBracket = "⎵";
+    var UnderParenthesis = "⏝";
+    var Union = "⋃";
+    var UnionPlus = "⊎";
+    var Uogon = "Ų";
+    var uogon = "ų";
+    var Uopf = "𝕌";
+    var uopf = "𝕦";
+    var UpArrowBar = "⤒";
+    var uparrow = "↑";
+    var UpArrow = "↑";
+    var Uparrow = "⇑";
+    var UpArrowDownArrow = "⇅";
+    var updownarrow = "↕";
+    var UpDownArrow = "↕";
+    var Updownarrow = "⇕";
+    var UpEquilibrium = "⥮";
+    var upharpoonleft = "↿";
+    var upharpoonright = "↾";
+    var uplus = "⊎";
+    var UpperLeftArrow = "↖";
+    var UpperRightArrow = "↗";
+    var upsi = "υ";
+    var Upsi = "ϒ";
+    var upsih = "ϒ";
+    var Upsilon = "Υ";
+    var upsilon = "υ";
+    var UpTeeArrow = "↥";
+    var UpTee = "⊥";
+    var upuparrows = "⇈";
+    var urcorn = "⌝";
+    var urcorner = "⌝";
+    var urcrop = "⌎";
+    var Uring = "Ů";
+    var uring = "ů";
+    var urtri = "◹";
+    var Uscr = "𝒰";
+    var uscr = "𝓊";
+    var utdot = "⋰";
+    var Utilde = "Ũ";
+    var utilde = "ũ";
+    var utri = "▵";
+    var utrif = "▴";
+    var uuarr = "⇈";
+    var Uuml = "Ü";
+    var uuml = "ü";
+    var uwangle = "⦧";
+    var vangrt = "⦜";
+    var varepsilon = "ϵ";
+    var varkappa = "ϰ";
+    var varnothing = "∅";
+    var varphi = "ϕ";
+    var varpi = "ϖ";
+    var varpropto = "∝";
+    var varr = "↕";
+    var vArr = "⇕";
+    var varrho = "ϱ";
+    var varsigma = "ς";
+    var varsubsetneq = "⊊︀";
+    var varsubsetneqq = "⫋︀";
+    var varsupsetneq = "⊋︀";
+    var varsupsetneqq = "⫌︀";
+    var vartheta = "ϑ";
+    var vartriangleleft = "⊲";
+    var vartriangleright = "⊳";
+    var vBar = "⫨";
+    var Vbar = "⫫";
+    var vBarv = "⫩";
+    var Vcy = "В";
+    var vcy = "в";
+    var vdash = "⊢";
+    var vDash = "⊨";
+    var Vdash = "⊩";
+    var VDash = "⊫";
+    var Vdashl = "⫦";
+    var veebar = "⊻";
+    var vee = "∨";
+    var Vee = "⋁";
+    var veeeq = "≚";
+    var vellip = "⋮";
+    var verbar = "|";
+    var Verbar = "‖";
+    var vert = "|";
+    var Vert = "‖";
+    var VerticalBar = "∣";
+    var VerticalLine = "|";
+    var VerticalSeparator = "❘";
+    var VerticalTilde = "≀";
+    var VeryThinSpace = " ";
+    var Vfr = "𝔙";
+    var vfr = "𝔳";
+    var vltri = "⊲";
+    var vnsub = "⊂⃒";
+    var vnsup = "⊃⃒";
+    var Vopf = "𝕍";
+    var vopf = "𝕧";
+    var vprop = "∝";
+    var vrtri = "⊳";
+    var Vscr = "𝒱";
+    var vscr = "𝓋";
+    var vsubnE = "⫋︀";
+    var vsubne = "⊊︀";
+    var vsupnE = "⫌︀";
+    var vsupne = "⊋︀";
+    var Vvdash = "⊪";
+    var vzigzag = "⦚";
+    var Wcirc = "Ŵ";
+    var wcirc = "ŵ";
+    var wedbar = "⩟";
+    var wedge = "∧";
+    var Wedge = "⋀";
+    var wedgeq = "≙";
+    var weierp = "℘";
+    var Wfr = "𝔚";
+    var wfr = "𝔴";
+    var Wopf = "𝕎";
+    var wopf = "𝕨";
+    var wp = "℘";
+    var wr = "≀";
+    var wreath = "≀";
+    var Wscr = "𝒲";
+    var wscr = "𝓌";
+    var xcap = "⋂";
+    var xcirc = "◯";
+    var xcup = "⋃";
+    var xdtri = "▽";
+    var Xfr = "𝔛";
+    var xfr = "𝔵";
+    var xharr = "⟷";
+    var xhArr = "⟺";
+    var Xi = "Ξ";
+    var xi = "ξ";
+    var xlarr = "⟵";
+    var xlArr = "⟸";
+    var xmap = "⟼";
+    var xnis = "⋻";
+    var xodot = "⨀";
+    var Xopf = "𝕏";
+    var xopf = "𝕩";
+    var xoplus = "⨁";
+    var xotime = "⨂";
+    var xrarr = "⟶";
+    var xrArr = "⟹";
+    var Xscr = "𝒳";
+    var xscr = "𝓍";
+    var xsqcup = "⨆";
+    var xuplus = "⨄";
+    var xutri = "△";
+    var xvee = "⋁";
+    var xwedge = "⋀";
+    var Yacute = "Ý";
+    var yacute = "ý";
+    var YAcy = "Я";
+    var yacy = "я";
+    var Ycirc = "Ŷ";
+    var ycirc = "ŷ";
+    var Ycy = "Ы";
+    var ycy = "ы";
+    var yen = "¥";
+    var Yfr = "𝔜";
+    var yfr = "𝔶";
+    var YIcy = "Ї";
+    var yicy = "ї";
+    var Yopf = "𝕐";
+    var yopf = "𝕪";
+    var Yscr = "𝒴";
+    var yscr = "𝓎";
+    var YUcy = "Ю";
+    var yucy = "ю";
+    var yuml = "ÿ";
+    var Yuml = "Ÿ";
+    var Zacute = "Ź";
+    var zacute = "ź";
+    var Zcaron = "Ž";
+    var zcaron = "ž";
+    var Zcy = "З";
+    var zcy = "з";
+    var Zdot = "Ż";
+    var zdot = "ż";
+    var zeetrf = "ℨ";
+    var ZeroWidthSpace = "​";
+    var Zeta = "Ζ";
+    var zeta = "ζ";
+    var zfr = "𝔷";
+    var Zfr = "ℨ";
+    var ZHcy = "Ж";
+    var zhcy = "ж";
+    var zigrarr = "⇝";
+    var zopf = "𝕫";
+    var Zopf = "ℤ";
+    var Zscr = "𝒵";
+    var zscr = "𝓏";
+    var zwj = "‍";
+    var zwnj = "‌";
+    var entities = {
+    	Aacute: Aacute,
+    	aacute: aacute,
+    	Abreve: Abreve,
+    	abreve: abreve,
+    	ac: ac,
+    	acd: acd,
+    	acE: acE,
+    	Acirc: Acirc,
+    	acirc: acirc,
+    	acute: acute,
+    	Acy: Acy,
+    	acy: acy,
+    	AElig: AElig,
+    	aelig: aelig,
+    	af: af,
+    	Afr: Afr,
+    	afr: afr,
+    	Agrave: Agrave,
+    	agrave: agrave,
+    	alefsym: alefsym,
+    	aleph: aleph,
+    	Alpha: Alpha,
+    	alpha: alpha,
+    	Amacr: Amacr,
+    	amacr: amacr,
+    	amalg: amalg,
+    	amp: amp,
+    	AMP: AMP,
+    	andand: andand,
+    	And: And,
+    	and: and,
+    	andd: andd,
+    	andslope: andslope,
+    	andv: andv,
+    	ang: ang,
+    	ange: ange,
+    	angle: angle,
+    	angmsdaa: angmsdaa,
+    	angmsdab: angmsdab,
+    	angmsdac: angmsdac,
+    	angmsdad: angmsdad,
+    	angmsdae: angmsdae,
+    	angmsdaf: angmsdaf,
+    	angmsdag: angmsdag,
+    	angmsdah: angmsdah,
+    	angmsd: angmsd,
+    	angrt: angrt,
+    	angrtvb: angrtvb,
+    	angrtvbd: angrtvbd,
+    	angsph: angsph,
+    	angst: angst,
+    	angzarr: angzarr,
+    	Aogon: Aogon,
+    	aogon: aogon,
+    	Aopf: Aopf,
+    	aopf: aopf,
+    	apacir: apacir,
+    	ap: ap,
+    	apE: apE,
+    	ape: ape,
+    	apid: apid,
+    	apos: apos,
+    	ApplyFunction: ApplyFunction,
+    	approx: approx,
+    	approxeq: approxeq,
+    	Aring: Aring,
+    	aring: aring,
+    	Ascr: Ascr,
+    	ascr: ascr,
+    	Assign: Assign,
+    	ast: ast,
+    	asymp: asymp,
+    	asympeq: asympeq,
+    	Atilde: Atilde,
+    	atilde: atilde,
+    	Auml: Auml,
+    	auml: auml,
+    	awconint: awconint,
+    	awint: awint,
+    	backcong: backcong,
+    	backepsilon: backepsilon,
+    	backprime: backprime,
+    	backsim: backsim,
+    	backsimeq: backsimeq,
+    	Backslash: Backslash,
+    	Barv: Barv,
+    	barvee: barvee,
+    	barwed: barwed,
+    	Barwed: Barwed,
+    	barwedge: barwedge,
+    	bbrk: bbrk,
+    	bbrktbrk: bbrktbrk,
+    	bcong: bcong,
+    	Bcy: Bcy,
+    	bcy: bcy,
+    	bdquo: bdquo,
+    	becaus: becaus,
+    	because: because,
+    	Because: Because,
+    	bemptyv: bemptyv,
+    	bepsi: bepsi,
+    	bernou: bernou,
+    	Bernoullis: Bernoullis,
+    	Beta: Beta,
+    	beta: beta,
+    	beth: beth,
+    	between: between,
+    	Bfr: Bfr,
+    	bfr: bfr,
+    	bigcap: bigcap,
+    	bigcirc: bigcirc,
+    	bigcup: bigcup,
+    	bigodot: bigodot,
+    	bigoplus: bigoplus,
+    	bigotimes: bigotimes,
+    	bigsqcup: bigsqcup,
+    	bigstar: bigstar,
+    	bigtriangledown: bigtriangledown,
+    	bigtriangleup: bigtriangleup,
+    	biguplus: biguplus,
+    	bigvee: bigvee,
+    	bigwedge: bigwedge,
+    	bkarow: bkarow,
+    	blacklozenge: blacklozenge,
+    	blacksquare: blacksquare,
+    	blacktriangle: blacktriangle,
+    	blacktriangledown: blacktriangledown,
+    	blacktriangleleft: blacktriangleleft,
+    	blacktriangleright: blacktriangleright,
+    	blank: blank,
+    	blk12: blk12,
+    	blk14: blk14,
+    	blk34: blk34,
+    	block: block,
+    	bne: bne,
+    	bnequiv: bnequiv,
+    	bNot: bNot,
+    	bnot: bnot,
+    	Bopf: Bopf,
+    	bopf: bopf,
+    	bot: bot,
+    	bottom: bottom,
+    	bowtie: bowtie,
+    	boxbox: boxbox,
+    	boxdl: boxdl,
+    	boxdL: boxdL,
+    	boxDl: boxDl,
+    	boxDL: boxDL,
+    	boxdr: boxdr,
+    	boxdR: boxdR,
+    	boxDr: boxDr,
+    	boxDR: boxDR,
+    	boxh: boxh,
+    	boxH: boxH,
+    	boxhd: boxhd,
+    	boxHd: boxHd,
+    	boxhD: boxhD,
+    	boxHD: boxHD,
+    	boxhu: boxhu,
+    	boxHu: boxHu,
+    	boxhU: boxhU,
+    	boxHU: boxHU,
+    	boxminus: boxminus,
+    	boxplus: boxplus,
+    	boxtimes: boxtimes,
+    	boxul: boxul,
+    	boxuL: boxuL,
+    	boxUl: boxUl,
+    	boxUL: boxUL,
+    	boxur: boxur,
+    	boxuR: boxuR,
+    	boxUr: boxUr,
+    	boxUR: boxUR,
+    	boxv: boxv,
+    	boxV: boxV,
+    	boxvh: boxvh,
+    	boxvH: boxvH,
+    	boxVh: boxVh,
+    	boxVH: boxVH,
+    	boxvl: boxvl,
+    	boxvL: boxvL,
+    	boxVl: boxVl,
+    	boxVL: boxVL,
+    	boxvr: boxvr,
+    	boxvR: boxvR,
+    	boxVr: boxVr,
+    	boxVR: boxVR,
+    	bprime: bprime,
+    	breve: breve,
+    	Breve: Breve,
+    	brvbar: brvbar,
+    	bscr: bscr,
+    	Bscr: Bscr,
+    	bsemi: bsemi,
+    	bsim: bsim,
+    	bsime: bsime,
+    	bsolb: bsolb,
+    	bsol: bsol,
+    	bsolhsub: bsolhsub,
+    	bull: bull,
+    	bullet: bullet,
+    	bump: bump,
+    	bumpE: bumpE,
+    	bumpe: bumpe,
+    	Bumpeq: Bumpeq,
+    	bumpeq: bumpeq,
+    	Cacute: Cacute,
+    	cacute: cacute,
+    	capand: capand,
+    	capbrcup: capbrcup,
+    	capcap: capcap,
+    	cap: cap,
+    	Cap: Cap,
+    	capcup: capcup,
+    	capdot: capdot,
+    	CapitalDifferentialD: CapitalDifferentialD,
+    	caps: caps,
+    	caret: caret,
+    	caron: caron,
+    	Cayleys: Cayleys,
+    	ccaps: ccaps,
+    	Ccaron: Ccaron,
+    	ccaron: ccaron,
+    	Ccedil: Ccedil,
+    	ccedil: ccedil,
+    	Ccirc: Ccirc,
+    	ccirc: ccirc,
+    	Cconint: Cconint,
+    	ccups: ccups,
+    	ccupssm: ccupssm,
+    	Cdot: Cdot,
+    	cdot: cdot,
+    	cedil: cedil,
+    	Cedilla: Cedilla,
+    	cemptyv: cemptyv,
+    	cent: cent,
+    	centerdot: centerdot,
+    	CenterDot: CenterDot,
+    	cfr: cfr,
+    	Cfr: Cfr,
+    	CHcy: CHcy,
+    	chcy: chcy,
+    	check: check,
+    	checkmark: checkmark,
+    	Chi: Chi,
+    	chi: chi,
+    	circ: circ,
+    	circeq: circeq,
+    	circlearrowleft: circlearrowleft,
+    	circlearrowright: circlearrowright,
+    	circledast: circledast,
+    	circledcirc: circledcirc,
+    	circleddash: circleddash,
+    	CircleDot: CircleDot,
+    	circledR: circledR,
+    	circledS: circledS,
+    	CircleMinus: CircleMinus,
+    	CirclePlus: CirclePlus,
+    	CircleTimes: CircleTimes,
+    	cir: cir,
+    	cirE: cirE,
+    	cire: cire,
+    	cirfnint: cirfnint,
+    	cirmid: cirmid,
+    	cirscir: cirscir,
+    	ClockwiseContourIntegral: ClockwiseContourIntegral,
+    	CloseCurlyDoubleQuote: CloseCurlyDoubleQuote,
+    	CloseCurlyQuote: CloseCurlyQuote,
+    	clubs: clubs,
+    	clubsuit: clubsuit,
+    	colon: colon,
+    	Colon: Colon,
+    	Colone: Colone,
+    	colone: colone,
+    	coloneq: coloneq,
+    	comma: comma,
+    	commat: commat,
+    	comp: comp,
+    	compfn: compfn,
+    	complement: complement,
+    	complexes: complexes,
+    	cong: cong,
+    	congdot: congdot,
+    	Congruent: Congruent,
+    	conint: conint,
+    	Conint: Conint,
+    	ContourIntegral: ContourIntegral,
+    	copf: copf,
+    	Copf: Copf,
+    	coprod: coprod,
+    	Coproduct: Coproduct,
+    	copy: copy,
+    	COPY: COPY,
+    	copysr: copysr,
+    	CounterClockwiseContourIntegral: CounterClockwiseContourIntegral,
+    	crarr: crarr,
+    	cross: cross,
+    	Cross: Cross,
+    	Cscr: Cscr,
+    	cscr: cscr,
+    	csub: csub,
+    	csube: csube,
+    	csup: csup,
+    	csupe: csupe,
+    	ctdot: ctdot,
+    	cudarrl: cudarrl,
+    	cudarrr: cudarrr,
+    	cuepr: cuepr,
+    	cuesc: cuesc,
+    	cularr: cularr,
+    	cularrp: cularrp,
+    	cupbrcap: cupbrcap,
+    	cupcap: cupcap,
+    	CupCap: CupCap,
+    	cup: cup,
+    	Cup: Cup,
+    	cupcup: cupcup,
+    	cupdot: cupdot,
+    	cupor: cupor,
+    	cups: cups,
+    	curarr: curarr,
+    	curarrm: curarrm,
+    	curlyeqprec: curlyeqprec,
+    	curlyeqsucc: curlyeqsucc,
+    	curlyvee: curlyvee,
+    	curlywedge: curlywedge,
+    	curren: curren,
+    	curvearrowleft: curvearrowleft,
+    	curvearrowright: curvearrowright,
+    	cuvee: cuvee,
+    	cuwed: cuwed,
+    	cwconint: cwconint,
+    	cwint: cwint,
+    	cylcty: cylcty,
+    	dagger: dagger,
+    	Dagger: Dagger,
+    	daleth: daleth,
+    	darr: darr,
+    	Darr: Darr,
+    	dArr: dArr,
+    	dash: dash,
+    	Dashv: Dashv,
+    	dashv: dashv,
+    	dbkarow: dbkarow,
+    	dblac: dblac,
+    	Dcaron: Dcaron,
+    	dcaron: dcaron,
+    	Dcy: Dcy,
+    	dcy: dcy,
+    	ddagger: ddagger,
+    	ddarr: ddarr,
+    	DD: DD,
+    	dd: dd,
+    	DDotrahd: DDotrahd,
+    	ddotseq: ddotseq,
+    	deg: deg,
+    	Del: Del,
+    	Delta: Delta,
+    	delta: delta,
+    	demptyv: demptyv,
+    	dfisht: dfisht,
+    	Dfr: Dfr,
+    	dfr: dfr,
+    	dHar: dHar,
+    	dharl: dharl,
+    	dharr: dharr,
+    	DiacriticalAcute: DiacriticalAcute,
+    	DiacriticalDot: DiacriticalDot,
+    	DiacriticalDoubleAcute: DiacriticalDoubleAcute,
+    	DiacriticalGrave: DiacriticalGrave,
+    	DiacriticalTilde: DiacriticalTilde,
+    	diam: diam,
+    	diamond: diamond,
+    	Diamond: Diamond,
+    	diamondsuit: diamondsuit,
+    	diams: diams,
+    	die: die,
+    	DifferentialD: DifferentialD,
+    	digamma: digamma,
+    	disin: disin,
+    	div: div,
+    	divide: divide,
+    	divideontimes: divideontimes,
+    	divonx: divonx,
+    	DJcy: DJcy,
+    	djcy: djcy,
+    	dlcorn: dlcorn,
+    	dlcrop: dlcrop,
+    	dollar: dollar,
+    	Dopf: Dopf,
+    	dopf: dopf,
+    	Dot: Dot,
+    	dot: dot,
+    	DotDot: DotDot,
+    	doteq: doteq,
+    	doteqdot: doteqdot,
+    	DotEqual: DotEqual,
+    	dotminus: dotminus,
+    	dotplus: dotplus,
+    	dotsquare: dotsquare,
+    	doublebarwedge: doublebarwedge,
+    	DoubleContourIntegral: DoubleContourIntegral,
+    	DoubleDot: DoubleDot,
+    	DoubleDownArrow: DoubleDownArrow,
+    	DoubleLeftArrow: DoubleLeftArrow,
+    	DoubleLeftRightArrow: DoubleLeftRightArrow,
+    	DoubleLeftTee: DoubleLeftTee,
+    	DoubleLongLeftArrow: DoubleLongLeftArrow,
+    	DoubleLongLeftRightArrow: DoubleLongLeftRightArrow,
+    	DoubleLongRightArrow: DoubleLongRightArrow,
+    	DoubleRightArrow: DoubleRightArrow,
+    	DoubleRightTee: DoubleRightTee,
+    	DoubleUpArrow: DoubleUpArrow,
+    	DoubleUpDownArrow: DoubleUpDownArrow,
+    	DoubleVerticalBar: DoubleVerticalBar,
+    	DownArrowBar: DownArrowBar,
+    	downarrow: downarrow,
+    	DownArrow: DownArrow,
+    	Downarrow: Downarrow,
+    	DownArrowUpArrow: DownArrowUpArrow,
+    	DownBreve: DownBreve,
+    	downdownarrows: downdownarrows,
+    	downharpoonleft: downharpoonleft,
+    	downharpoonright: downharpoonright,
+    	DownLeftRightVector: DownLeftRightVector,
+    	DownLeftTeeVector: DownLeftTeeVector,
+    	DownLeftVectorBar: DownLeftVectorBar,
+    	DownLeftVector: DownLeftVector,
+    	DownRightTeeVector: DownRightTeeVector,
+    	DownRightVectorBar: DownRightVectorBar,
+    	DownRightVector: DownRightVector,
+    	DownTeeArrow: DownTeeArrow,
+    	DownTee: DownTee,
+    	drbkarow: drbkarow,
+    	drcorn: drcorn,
+    	drcrop: drcrop,
+    	Dscr: Dscr,
+    	dscr: dscr,
+    	DScy: DScy,
+    	dscy: dscy,
+    	dsol: dsol,
+    	Dstrok: Dstrok,
+    	dstrok: dstrok,
+    	dtdot: dtdot,
+    	dtri: dtri,
+    	dtrif: dtrif,
+    	duarr: duarr,
+    	duhar: duhar,
+    	dwangle: dwangle,
+    	DZcy: DZcy,
+    	dzcy: dzcy,
+    	dzigrarr: dzigrarr,
+    	Eacute: Eacute,
+    	eacute: eacute,
+    	easter: easter,
+    	Ecaron: Ecaron,
+    	ecaron: ecaron,
+    	Ecirc: Ecirc,
+    	ecirc: ecirc,
+    	ecir: ecir,
+    	ecolon: ecolon,
+    	Ecy: Ecy,
+    	ecy: ecy,
+    	eDDot: eDDot,
+    	Edot: Edot,
+    	edot: edot,
+    	eDot: eDot,
+    	ee: ee,
+    	efDot: efDot,
+    	Efr: Efr,
+    	efr: efr,
+    	eg: eg,
+    	Egrave: Egrave,
+    	egrave: egrave,
+    	egs: egs,
+    	egsdot: egsdot,
+    	el: el,
+    	Element: Element,
+    	elinters: elinters,
+    	ell: ell,
+    	els: els,
+    	elsdot: elsdot,
+    	Emacr: Emacr,
+    	emacr: emacr,
+    	empty: empty$1,
+    	emptyset: emptyset,
+    	EmptySmallSquare: EmptySmallSquare,
+    	emptyv: emptyv,
+    	EmptyVerySmallSquare: EmptyVerySmallSquare,
+    	emsp13: emsp13,
+    	emsp14: emsp14,
+    	emsp: emsp,
+    	ENG: ENG,
+    	eng: eng,
+    	ensp: ensp,
+    	Eogon: Eogon,
+    	eogon: eogon,
+    	Eopf: Eopf,
+    	eopf: eopf,
+    	epar: epar,
+    	eparsl: eparsl,
+    	eplus: eplus,
+    	epsi: epsi,
+    	Epsilon: Epsilon,
+    	epsilon: epsilon,
+    	epsiv: epsiv,
+    	eqcirc: eqcirc,
+    	eqcolon: eqcolon,
+    	eqsim: eqsim,
+    	eqslantgtr: eqslantgtr,
+    	eqslantless: eqslantless,
+    	Equal: Equal,
+    	equals: equals,
+    	EqualTilde: EqualTilde,
+    	equest: equest,
+    	Equilibrium: Equilibrium,
+    	equiv: equiv,
+    	equivDD: equivDD,
+    	eqvparsl: eqvparsl,
+    	erarr: erarr,
+    	erDot: erDot,
+    	escr: escr,
+    	Escr: Escr,
+    	esdot: esdot,
+    	Esim: Esim,
+    	esim: esim,
+    	Eta: Eta,
+    	eta: eta,
+    	ETH: ETH,
+    	eth: eth,
+    	Euml: Euml,
+    	euml: euml,
+    	euro: euro,
+    	excl: excl,
+    	exist: exist,
+    	Exists: Exists,
+    	expectation: expectation,
+    	exponentiale: exponentiale,
+    	ExponentialE: ExponentialE,
+    	fallingdotseq: fallingdotseq,
+    	Fcy: Fcy,
+    	fcy: fcy,
+    	female: female,
+    	ffilig: ffilig,
+    	fflig: fflig,
+    	ffllig: ffllig,
+    	Ffr: Ffr,
+    	ffr: ffr,
+    	filig: filig,
+    	FilledSmallSquare: FilledSmallSquare,
+    	FilledVerySmallSquare: FilledVerySmallSquare,
+    	fjlig: fjlig,
+    	flat: flat,
+    	fllig: fllig,
+    	fltns: fltns,
+    	fnof: fnof,
+    	Fopf: Fopf,
+    	fopf: fopf,
+    	forall: forall,
+    	ForAll: ForAll,
+    	fork: fork,
+    	forkv: forkv,
+    	Fouriertrf: Fouriertrf,
+    	fpartint: fpartint,
+    	frac12: frac12,
+    	frac13: frac13,
+    	frac14: frac14,
+    	frac15: frac15,
+    	frac16: frac16,
+    	frac18: frac18,
+    	frac23: frac23,
+    	frac25: frac25,
+    	frac34: frac34,
+    	frac35: frac35,
+    	frac38: frac38,
+    	frac45: frac45,
+    	frac56: frac56,
+    	frac58: frac58,
+    	frac78: frac78,
+    	frasl: frasl,
+    	frown: frown,
+    	fscr: fscr,
+    	Fscr: Fscr,
+    	gacute: gacute,
+    	Gamma: Gamma,
+    	gamma: gamma,
+    	Gammad: Gammad,
+    	gammad: gammad,
+    	gap: gap,
+    	Gbreve: Gbreve,
+    	gbreve: gbreve,
+    	Gcedil: Gcedil,
+    	Gcirc: Gcirc,
+    	gcirc: gcirc,
+    	Gcy: Gcy,
+    	gcy: gcy,
+    	Gdot: Gdot,
+    	gdot: gdot,
+    	ge: ge,
+    	gE: gE,
+    	gEl: gEl,
+    	gel: gel,
+    	geq: geq,
+    	geqq: geqq,
+    	geqslant: geqslant,
+    	gescc: gescc,
+    	ges: ges,
+    	gesdot: gesdot,
+    	gesdoto: gesdoto,
+    	gesdotol: gesdotol,
+    	gesl: gesl,
+    	gesles: gesles,
+    	Gfr: Gfr,
+    	gfr: gfr,
+    	gg: gg,
+    	Gg: Gg,
+    	ggg: ggg,
+    	gimel: gimel,
+    	GJcy: GJcy,
+    	gjcy: gjcy,
+    	gla: gla,
+    	gl: gl,
+    	glE: glE,
+    	glj: glj,
+    	gnap: gnap,
+    	gnapprox: gnapprox,
+    	gne: gne,
+    	gnE: gnE,
+    	gneq: gneq,
+    	gneqq: gneqq,
+    	gnsim: gnsim,
+    	Gopf: Gopf,
+    	gopf: gopf,
+    	grave: grave,
+    	GreaterEqual: GreaterEqual,
+    	GreaterEqualLess: GreaterEqualLess,
+    	GreaterFullEqual: GreaterFullEqual,
+    	GreaterGreater: GreaterGreater,
+    	GreaterLess: GreaterLess,
+    	GreaterSlantEqual: GreaterSlantEqual,
+    	GreaterTilde: GreaterTilde,
+    	Gscr: Gscr,
+    	gscr: gscr,
+    	gsim: gsim,
+    	gsime: gsime,
+    	gsiml: gsiml,
+    	gtcc: gtcc,
+    	gtcir: gtcir,
+    	gt: gt,
+    	GT: GT,
+    	Gt: Gt,
+    	gtdot: gtdot,
+    	gtlPar: gtlPar,
+    	gtquest: gtquest,
+    	gtrapprox: gtrapprox,
+    	gtrarr: gtrarr,
+    	gtrdot: gtrdot,
+    	gtreqless: gtreqless,
+    	gtreqqless: gtreqqless,
+    	gtrless: gtrless,
+    	gtrsim: gtrsim,
+    	gvertneqq: gvertneqq,
+    	gvnE: gvnE,
+    	Hacek: Hacek,
+    	hairsp: hairsp,
+    	half: half,
+    	hamilt: hamilt,
+    	HARDcy: HARDcy,
+    	hardcy: hardcy,
+    	harrcir: harrcir,
+    	harr: harr,
+    	hArr: hArr,
+    	harrw: harrw,
+    	Hat: Hat,
+    	hbar: hbar,
+    	Hcirc: Hcirc,
+    	hcirc: hcirc,
+    	hearts: hearts,
+    	heartsuit: heartsuit,
+    	hellip: hellip,
+    	hercon: hercon,
+    	hfr: hfr,
+    	Hfr: Hfr,
+    	HilbertSpace: HilbertSpace,
+    	hksearow: hksearow,
+    	hkswarow: hkswarow,
+    	hoarr: hoarr,
+    	homtht: homtht,
+    	hookleftarrow: hookleftarrow,
+    	hookrightarrow: hookrightarrow,
+    	hopf: hopf,
+    	Hopf: Hopf,
+    	horbar: horbar,
+    	HorizontalLine: HorizontalLine,
+    	hscr: hscr,
+    	Hscr: Hscr,
+    	hslash: hslash,
+    	Hstrok: Hstrok,
+    	hstrok: hstrok,
+    	HumpDownHump: HumpDownHump,
+    	HumpEqual: HumpEqual,
+    	hybull: hybull,
+    	hyphen: hyphen,
+    	Iacute: Iacute,
+    	iacute: iacute,
+    	ic: ic,
+    	Icirc: Icirc,
+    	icirc: icirc,
+    	Icy: Icy,
+    	icy: icy,
+    	Idot: Idot,
+    	IEcy: IEcy,
+    	iecy: iecy,
+    	iexcl: iexcl,
+    	iff: iff,
+    	ifr: ifr,
+    	Ifr: Ifr,
+    	Igrave: Igrave,
+    	igrave: igrave,
+    	ii: ii,
+    	iiiint: iiiint,
+    	iiint: iiint,
+    	iinfin: iinfin,
+    	iiota: iiota,
+    	IJlig: IJlig,
+    	ijlig: ijlig,
+    	Imacr: Imacr,
+    	imacr: imacr,
+    	image: image,
+    	ImaginaryI: ImaginaryI,
+    	imagline: imagline,
+    	imagpart: imagpart,
+    	imath: imath,
+    	Im: Im,
+    	imof: imof,
+    	imped: imped,
+    	Implies: Implies,
+    	incare: incare,
+    	"in": "∈",
+    	infin: infin,
+    	infintie: infintie,
+    	inodot: inodot,
+    	intcal: intcal,
+    	int: int,
+    	Int: Int,
+    	integers: integers,
+    	Integral: Integral,
+    	intercal: intercal,
+    	Intersection: Intersection,
+    	intlarhk: intlarhk,
+    	intprod: intprod,
+    	InvisibleComma: InvisibleComma,
+    	InvisibleTimes: InvisibleTimes,
+    	IOcy: IOcy,
+    	iocy: iocy,
+    	Iogon: Iogon,
+    	iogon: iogon,
+    	Iopf: Iopf,
+    	iopf: iopf,
+    	Iota: Iota,
+    	iota: iota,
+    	iprod: iprod,
+    	iquest: iquest,
+    	iscr: iscr,
+    	Iscr: Iscr,
+    	isin: isin,
+    	isindot: isindot,
+    	isinE: isinE,
+    	isins: isins,
+    	isinsv: isinsv,
+    	isinv: isinv,
+    	it: it,
+    	Itilde: Itilde,
+    	itilde: itilde,
+    	Iukcy: Iukcy,
+    	iukcy: iukcy,
+    	Iuml: Iuml,
+    	iuml: iuml,
+    	Jcirc: Jcirc,
+    	jcirc: jcirc,
+    	Jcy: Jcy,
+    	jcy: jcy,
+    	Jfr: Jfr,
+    	jfr: jfr,
+    	jmath: jmath,
+    	Jopf: Jopf,
+    	jopf: jopf,
+    	Jscr: Jscr,
+    	jscr: jscr,
+    	Jsercy: Jsercy,
+    	jsercy: jsercy,
+    	Jukcy: Jukcy,
+    	jukcy: jukcy,
+    	Kappa: Kappa,
+    	kappa: kappa,
+    	kappav: kappav,
+    	Kcedil: Kcedil,
+    	kcedil: kcedil,
+    	Kcy: Kcy,
+    	kcy: kcy,
+    	Kfr: Kfr,
+    	kfr: kfr,
+    	kgreen: kgreen,
+    	KHcy: KHcy,
+    	khcy: khcy,
+    	KJcy: KJcy,
+    	kjcy: kjcy,
+    	Kopf: Kopf,
+    	kopf: kopf,
+    	Kscr: Kscr,
+    	kscr: kscr,
+    	lAarr: lAarr,
+    	Lacute: Lacute,
+    	lacute: lacute,
+    	laemptyv: laemptyv,
+    	lagran: lagran,
+    	Lambda: Lambda,
+    	lambda: lambda,
+    	lang: lang,
+    	Lang: Lang,
+    	langd: langd,
+    	langle: langle,
+    	lap: lap,
+    	Laplacetrf: Laplacetrf,
+    	laquo: laquo,
+    	larrb: larrb,
+    	larrbfs: larrbfs,
+    	larr: larr,
+    	Larr: Larr,
+    	lArr: lArr,
+    	larrfs: larrfs,
+    	larrhk: larrhk,
+    	larrlp: larrlp,
+    	larrpl: larrpl,
+    	larrsim: larrsim,
+    	larrtl: larrtl,
+    	latail: latail,
+    	lAtail: lAtail,
+    	lat: lat,
+    	late: late,
+    	lates: lates,
+    	lbarr: lbarr,
+    	lBarr: lBarr,
+    	lbbrk: lbbrk,
+    	lbrace: lbrace,
+    	lbrack: lbrack,
+    	lbrke: lbrke,
+    	lbrksld: lbrksld,
+    	lbrkslu: lbrkslu,
+    	Lcaron: Lcaron,
+    	lcaron: lcaron,
+    	Lcedil: Lcedil,
+    	lcedil: lcedil,
+    	lceil: lceil,
+    	lcub: lcub,
+    	Lcy: Lcy,
+    	lcy: lcy,
+    	ldca: ldca,
+    	ldquo: ldquo,
+    	ldquor: ldquor,
+    	ldrdhar: ldrdhar,
+    	ldrushar: ldrushar,
+    	ldsh: ldsh,
+    	le: le,
+    	lE: lE,
+    	LeftAngleBracket: LeftAngleBracket,
+    	LeftArrowBar: LeftArrowBar,
+    	leftarrow: leftarrow,
+    	LeftArrow: LeftArrow,
+    	Leftarrow: Leftarrow,
+    	LeftArrowRightArrow: LeftArrowRightArrow,
+    	leftarrowtail: leftarrowtail,
+    	LeftCeiling: LeftCeiling,
+    	LeftDoubleBracket: LeftDoubleBracket,
+    	LeftDownTeeVector: LeftDownTeeVector,
+    	LeftDownVectorBar: LeftDownVectorBar,
+    	LeftDownVector: LeftDownVector,
+    	LeftFloor: LeftFloor,
+    	leftharpoondown: leftharpoondown,
+    	leftharpoonup: leftharpoonup,
+    	leftleftarrows: leftleftarrows,
+    	leftrightarrow: leftrightarrow,
+    	LeftRightArrow: LeftRightArrow,
+    	Leftrightarrow: Leftrightarrow,
+    	leftrightarrows: leftrightarrows,
+    	leftrightharpoons: leftrightharpoons,
+    	leftrightsquigarrow: leftrightsquigarrow,
+    	LeftRightVector: LeftRightVector,
+    	LeftTeeArrow: LeftTeeArrow,
+    	LeftTee: LeftTee,
+    	LeftTeeVector: LeftTeeVector,
+    	leftthreetimes: leftthreetimes,
+    	LeftTriangleBar: LeftTriangleBar,
+    	LeftTriangle: LeftTriangle,
+    	LeftTriangleEqual: LeftTriangleEqual,
+    	LeftUpDownVector: LeftUpDownVector,
+    	LeftUpTeeVector: LeftUpTeeVector,
+    	LeftUpVectorBar: LeftUpVectorBar,
+    	LeftUpVector: LeftUpVector,
+    	LeftVectorBar: LeftVectorBar,
+    	LeftVector: LeftVector,
+    	lEg: lEg,
+    	leg: leg,
+    	leq: leq,
+    	leqq: leqq,
+    	leqslant: leqslant,
+    	lescc: lescc,
+    	les: les,
+    	lesdot: lesdot,
+    	lesdoto: lesdoto,
+    	lesdotor: lesdotor,
+    	lesg: lesg,
+    	lesges: lesges,
+    	lessapprox: lessapprox,
+    	lessdot: lessdot,
+    	lesseqgtr: lesseqgtr,
+    	lesseqqgtr: lesseqqgtr,
+    	LessEqualGreater: LessEqualGreater,
+    	LessFullEqual: LessFullEqual,
+    	LessGreater: LessGreater,
+    	lessgtr: lessgtr,
+    	LessLess: LessLess,
+    	lesssim: lesssim,
+    	LessSlantEqual: LessSlantEqual,
+    	LessTilde: LessTilde,
+    	lfisht: lfisht,
+    	lfloor: lfloor,
+    	Lfr: Lfr,
+    	lfr: lfr,
+    	lg: lg,
+    	lgE: lgE,
+    	lHar: lHar,
+    	lhard: lhard,
+    	lharu: lharu,
+    	lharul: lharul,
+    	lhblk: lhblk,
+    	LJcy: LJcy,
+    	ljcy: ljcy,
+    	llarr: llarr,
+    	ll: ll,
+    	Ll: Ll,
+    	llcorner: llcorner,
+    	Lleftarrow: Lleftarrow,
+    	llhard: llhard,
+    	lltri: lltri,
+    	Lmidot: Lmidot,
+    	lmidot: lmidot,
+    	lmoustache: lmoustache,
+    	lmoust: lmoust,
+    	lnap: lnap,
+    	lnapprox: lnapprox,
+    	lne: lne,
+    	lnE: lnE,
+    	lneq: lneq,
+    	lneqq: lneqq,
+    	lnsim: lnsim,
+    	loang: loang,
+    	loarr: loarr,
+    	lobrk: lobrk,
+    	longleftarrow: longleftarrow,
+    	LongLeftArrow: LongLeftArrow,
+    	Longleftarrow: Longleftarrow,
+    	longleftrightarrow: longleftrightarrow,
+    	LongLeftRightArrow: LongLeftRightArrow,
+    	Longleftrightarrow: Longleftrightarrow,
+    	longmapsto: longmapsto,
+    	longrightarrow: longrightarrow,
+    	LongRightArrow: LongRightArrow,
+    	Longrightarrow: Longrightarrow,
+    	looparrowleft: looparrowleft,
+    	looparrowright: looparrowright,
+    	lopar: lopar,
+    	Lopf: Lopf,
+    	lopf: lopf,
+    	loplus: loplus,
+    	lotimes: lotimes,
+    	lowast: lowast,
+    	lowbar: lowbar,
+    	LowerLeftArrow: LowerLeftArrow,
+    	LowerRightArrow: LowerRightArrow,
+    	loz: loz,
+    	lozenge: lozenge,
+    	lozf: lozf,
+    	lpar: lpar,
+    	lparlt: lparlt,
+    	lrarr: lrarr,
+    	lrcorner: lrcorner,
+    	lrhar: lrhar,
+    	lrhard: lrhard,
+    	lrm: lrm,
+    	lrtri: lrtri,
+    	lsaquo: lsaquo,
+    	lscr: lscr,
+    	Lscr: Lscr,
+    	lsh: lsh,
+    	Lsh: Lsh,
+    	lsim: lsim,
+    	lsime: lsime,
+    	lsimg: lsimg,
+    	lsqb: lsqb,
+    	lsquo: lsquo,
+    	lsquor: lsquor,
+    	Lstrok: Lstrok,
+    	lstrok: lstrok,
+    	ltcc: ltcc,
+    	ltcir: ltcir,
+    	lt: lt,
+    	LT: LT,
+    	Lt: Lt,
+    	ltdot: ltdot,
+    	lthree: lthree,
+    	ltimes: ltimes,
+    	ltlarr: ltlarr,
+    	ltquest: ltquest,
+    	ltri: ltri,
+    	ltrie: ltrie,
+    	ltrif: ltrif,
+    	ltrPar: ltrPar,
+    	lurdshar: lurdshar,
+    	luruhar: luruhar,
+    	lvertneqq: lvertneqq,
+    	lvnE: lvnE,
+    	macr: macr,
+    	male: male,
+    	malt: malt,
+    	maltese: maltese,
+    	"Map": "⤅",
+    	map: map,
+    	mapsto: mapsto,
+    	mapstodown: mapstodown,
+    	mapstoleft: mapstoleft,
+    	mapstoup: mapstoup,
+    	marker: marker,
+    	mcomma: mcomma,
+    	Mcy: Mcy,
+    	mcy: mcy,
+    	mdash: mdash,
+    	mDDot: mDDot,
+    	measuredangle: measuredangle,
+    	MediumSpace: MediumSpace,
+    	Mellintrf: Mellintrf,
+    	Mfr: Mfr,
+    	mfr: mfr,
+    	mho: mho,
+    	micro: micro,
+    	midast: midast,
+    	midcir: midcir,
+    	mid: mid,
+    	middot: middot,
+    	minusb: minusb,
+    	minus: minus,
+    	minusd: minusd,
+    	minusdu: minusdu,
+    	MinusPlus: MinusPlus,
+    	mlcp: mlcp,
+    	mldr: mldr,
+    	mnplus: mnplus,
+    	models: models,
+    	Mopf: Mopf,
+    	mopf: mopf,
+    	mp: mp,
+    	mscr: mscr,
+    	Mscr: Mscr,
+    	mstpos: mstpos,
+    	Mu: Mu,
+    	mu: mu,
+    	multimap: multimap,
+    	mumap: mumap,
+    	nabla: nabla,
+    	Nacute: Nacute,
+    	nacute: nacute,
+    	nang: nang,
+    	nap: nap,
+    	napE: napE,
+    	napid: napid,
+    	napos: napos,
+    	napprox: napprox,
+    	natural: natural,
+    	naturals: naturals,
+    	natur: natur,
+    	nbsp: nbsp,
+    	nbump: nbump,
+    	nbumpe: nbumpe,
+    	ncap: ncap,
+    	Ncaron: Ncaron,
+    	ncaron: ncaron,
+    	Ncedil: Ncedil,
+    	ncedil: ncedil,
+    	ncong: ncong,
+    	ncongdot: ncongdot,
+    	ncup: ncup,
+    	Ncy: Ncy,
+    	ncy: ncy,
+    	ndash: ndash,
+    	nearhk: nearhk,
+    	nearr: nearr,
+    	neArr: neArr,
+    	nearrow: nearrow,
+    	ne: ne,
+    	nedot: nedot,
+    	NegativeMediumSpace: NegativeMediumSpace,
+    	NegativeThickSpace: NegativeThickSpace,
+    	NegativeThinSpace: NegativeThinSpace,
+    	NegativeVeryThinSpace: NegativeVeryThinSpace,
+    	nequiv: nequiv,
+    	nesear: nesear,
+    	nesim: nesim,
+    	NestedGreaterGreater: NestedGreaterGreater,
+    	NestedLessLess: NestedLessLess,
+    	NewLine: NewLine,
+    	nexist: nexist,
+    	nexists: nexists,
+    	Nfr: Nfr,
+    	nfr: nfr,
+    	ngE: ngE,
+    	nge: nge,
+    	ngeq: ngeq,
+    	ngeqq: ngeqq,
+    	ngeqslant: ngeqslant,
+    	nges: nges,
+    	nGg: nGg,
+    	ngsim: ngsim,
+    	nGt: nGt,
+    	ngt: ngt,
+    	ngtr: ngtr,
+    	nGtv: nGtv,
+    	nharr: nharr,
+    	nhArr: nhArr,
+    	nhpar: nhpar,
+    	ni: ni,
+    	nis: nis,
+    	nisd: nisd,
+    	niv: niv,
+    	NJcy: NJcy,
+    	njcy: njcy,
+    	nlarr: nlarr,
+    	nlArr: nlArr,
+    	nldr: nldr,
+    	nlE: nlE,
+    	nle: nle,
+    	nleftarrow: nleftarrow,
+    	nLeftarrow: nLeftarrow,
+    	nleftrightarrow: nleftrightarrow,
+    	nLeftrightarrow: nLeftrightarrow,
+    	nleq: nleq,
+    	nleqq: nleqq,
+    	nleqslant: nleqslant,
+    	nles: nles,
+    	nless: nless,
+    	nLl: nLl,
+    	nlsim: nlsim,
+    	nLt: nLt,
+    	nlt: nlt,
+    	nltri: nltri,
+    	nltrie: nltrie,
+    	nLtv: nLtv,
+    	nmid: nmid,
+    	NoBreak: NoBreak,
+    	NonBreakingSpace: NonBreakingSpace,
+    	nopf: nopf,
+    	Nopf: Nopf,
+    	Not: Not,
+    	not: not,
+    	NotCongruent: NotCongruent,
+    	NotCupCap: NotCupCap,
+    	NotDoubleVerticalBar: NotDoubleVerticalBar,
+    	NotElement: NotElement,
+    	NotEqual: NotEqual,
+    	NotEqualTilde: NotEqualTilde,
+    	NotExists: NotExists,
+    	NotGreater: NotGreater,
+    	NotGreaterEqual: NotGreaterEqual,
+    	NotGreaterFullEqual: NotGreaterFullEqual,
+    	NotGreaterGreater: NotGreaterGreater,
+    	NotGreaterLess: NotGreaterLess,
+    	NotGreaterSlantEqual: NotGreaterSlantEqual,
+    	NotGreaterTilde: NotGreaterTilde,
+    	NotHumpDownHump: NotHumpDownHump,
+    	NotHumpEqual: NotHumpEqual,
+    	notin: notin,
+    	notindot: notindot,
+    	notinE: notinE,
+    	notinva: notinva,
+    	notinvb: notinvb,
+    	notinvc: notinvc,
+    	NotLeftTriangleBar: NotLeftTriangleBar,
+    	NotLeftTriangle: NotLeftTriangle,
+    	NotLeftTriangleEqual: NotLeftTriangleEqual,
+    	NotLess: NotLess,
+    	NotLessEqual: NotLessEqual,
+    	NotLessGreater: NotLessGreater,
+    	NotLessLess: NotLessLess,
+    	NotLessSlantEqual: NotLessSlantEqual,
+    	NotLessTilde: NotLessTilde,
+    	NotNestedGreaterGreater: NotNestedGreaterGreater,
+    	NotNestedLessLess: NotNestedLessLess,
+    	notni: notni,
+    	notniva: notniva,
+    	notnivb: notnivb,
+    	notnivc: notnivc,
+    	NotPrecedes: NotPrecedes,
+    	NotPrecedesEqual: NotPrecedesEqual,
+    	NotPrecedesSlantEqual: NotPrecedesSlantEqual,
+    	NotReverseElement: NotReverseElement,
+    	NotRightTriangleBar: NotRightTriangleBar,
+    	NotRightTriangle: NotRightTriangle,
+    	NotRightTriangleEqual: NotRightTriangleEqual,
+    	NotSquareSubset: NotSquareSubset,
+    	NotSquareSubsetEqual: NotSquareSubsetEqual,
+    	NotSquareSuperset: NotSquareSuperset,
+    	NotSquareSupersetEqual: NotSquareSupersetEqual,
+    	NotSubset: NotSubset,
+    	NotSubsetEqual: NotSubsetEqual,
+    	NotSucceeds: NotSucceeds,
+    	NotSucceedsEqual: NotSucceedsEqual,
+    	NotSucceedsSlantEqual: NotSucceedsSlantEqual,
+    	NotSucceedsTilde: NotSucceedsTilde,
+    	NotSuperset: NotSuperset,
+    	NotSupersetEqual: NotSupersetEqual,
+    	NotTilde: NotTilde,
+    	NotTildeEqual: NotTildeEqual,
+    	NotTildeFullEqual: NotTildeFullEqual,
+    	NotTildeTilde: NotTildeTilde,
+    	NotVerticalBar: NotVerticalBar,
+    	nparallel: nparallel,
+    	npar: npar,
+    	nparsl: nparsl,
+    	npart: npart,
+    	npolint: npolint,
+    	npr: npr,
+    	nprcue: nprcue,
+    	nprec: nprec,
+    	npreceq: npreceq,
+    	npre: npre,
+    	nrarrc: nrarrc,
+    	nrarr: nrarr,
+    	nrArr: nrArr,
+    	nrarrw: nrarrw,
+    	nrightarrow: nrightarrow,
+    	nRightarrow: nRightarrow,
+    	nrtri: nrtri,
+    	nrtrie: nrtrie,
+    	nsc: nsc,
+    	nsccue: nsccue,
+    	nsce: nsce,
+    	Nscr: Nscr,
+    	nscr: nscr,
+    	nshortmid: nshortmid,
+    	nshortparallel: nshortparallel,
+    	nsim: nsim,
+    	nsime: nsime,
+    	nsimeq: nsimeq,
+    	nsmid: nsmid,
+    	nspar: nspar,
+    	nsqsube: nsqsube,
+    	nsqsupe: nsqsupe,
+    	nsub: nsub,
+    	nsubE: nsubE,
+    	nsube: nsube,
+    	nsubset: nsubset,
+    	nsubseteq: nsubseteq,
+    	nsubseteqq: nsubseteqq,
+    	nsucc: nsucc,
+    	nsucceq: nsucceq,
+    	nsup: nsup,
+    	nsupE: nsupE,
+    	nsupe: nsupe,
+    	nsupset: nsupset,
+    	nsupseteq: nsupseteq,
+    	nsupseteqq: nsupseteqq,
+    	ntgl: ntgl,
+    	Ntilde: Ntilde,
+    	ntilde: ntilde,
+    	ntlg: ntlg,
+    	ntriangleleft: ntriangleleft,
+    	ntrianglelefteq: ntrianglelefteq,
+    	ntriangleright: ntriangleright,
+    	ntrianglerighteq: ntrianglerighteq,
+    	Nu: Nu,
+    	nu: nu,
+    	num: num,
+    	numero: numero,
+    	numsp: numsp,
+    	nvap: nvap,
+    	nvdash: nvdash,
+    	nvDash: nvDash,
+    	nVdash: nVdash,
+    	nVDash: nVDash,
+    	nvge: nvge,
+    	nvgt: nvgt,
+    	nvHarr: nvHarr,
+    	nvinfin: nvinfin,
+    	nvlArr: nvlArr,
+    	nvle: nvle,
+    	nvlt: nvlt,
+    	nvltrie: nvltrie,
+    	nvrArr: nvrArr,
+    	nvrtrie: nvrtrie,
+    	nvsim: nvsim,
+    	nwarhk: nwarhk,
+    	nwarr: nwarr,
+    	nwArr: nwArr,
+    	nwarrow: nwarrow,
+    	nwnear: nwnear,
+    	Oacute: Oacute,
+    	oacute: oacute,
+    	oast: oast,
+    	Ocirc: Ocirc,
+    	ocirc: ocirc,
+    	ocir: ocir,
+    	Ocy: Ocy,
+    	ocy: ocy,
+    	odash: odash,
+    	Odblac: Odblac,
+    	odblac: odblac,
+    	odiv: odiv,
+    	odot: odot,
+    	odsold: odsold,
+    	OElig: OElig,
+    	oelig: oelig,
+    	ofcir: ofcir,
+    	Ofr: Ofr,
+    	ofr: ofr,
+    	ogon: ogon,
+    	Ograve: Ograve,
+    	ograve: ograve,
+    	ogt: ogt,
+    	ohbar: ohbar,
+    	ohm: ohm,
+    	oint: oint,
+    	olarr: olarr,
+    	olcir: olcir,
+    	olcross: olcross,
+    	oline: oline,
+    	olt: olt,
+    	Omacr: Omacr,
+    	omacr: omacr,
+    	Omega: Omega,
+    	omega: omega,
+    	Omicron: Omicron,
+    	omicron: omicron,
+    	omid: omid,
+    	ominus: ominus,
+    	Oopf: Oopf,
+    	oopf: oopf,
+    	opar: opar,
+    	OpenCurlyDoubleQuote: OpenCurlyDoubleQuote,
+    	OpenCurlyQuote: OpenCurlyQuote,
+    	operp: operp,
+    	oplus: oplus,
+    	orarr: orarr,
+    	Or: Or,
+    	or: or,
+    	ord: ord,
+    	order: order,
+    	orderof: orderof,
+    	ordf: ordf,
+    	ordm: ordm,
+    	origof: origof,
+    	oror: oror,
+    	orslope: orslope,
+    	orv: orv,
+    	oS: oS,
+    	Oscr: Oscr,
+    	oscr: oscr,
+    	Oslash: Oslash,
+    	oslash: oslash,
+    	osol: osol,
+    	Otilde: Otilde,
+    	otilde: otilde,
+    	otimesas: otimesas,
+    	Otimes: Otimes,
+    	otimes: otimes,
+    	Ouml: Ouml,
+    	ouml: ouml,
+    	ovbar: ovbar,
+    	OverBar: OverBar,
+    	OverBrace: OverBrace,
+    	OverBracket: OverBracket,
+    	OverParenthesis: OverParenthesis,
+    	para: para,
+    	parallel: parallel,
+    	par: par,
+    	parsim: parsim,
+    	parsl: parsl,
+    	part: part,
+    	PartialD: PartialD,
+    	Pcy: Pcy,
+    	pcy: pcy,
+    	percnt: percnt,
+    	period: period,
+    	permil: permil,
+    	perp: perp,
+    	pertenk: pertenk,
+    	Pfr: Pfr,
+    	pfr: pfr,
+    	Phi: Phi,
+    	phi: phi,
+    	phiv: phiv,
+    	phmmat: phmmat,
+    	phone: phone,
+    	Pi: Pi,
+    	pi: pi,
+    	pitchfork: pitchfork,
+    	piv: piv,
+    	planck: planck,
+    	planckh: planckh,
+    	plankv: plankv,
+    	plusacir: plusacir,
+    	plusb: plusb,
+    	pluscir: pluscir,
+    	plus: plus,
+    	plusdo: plusdo,
+    	plusdu: plusdu,
+    	pluse: pluse,
+    	PlusMinus: PlusMinus,
+    	plusmn: plusmn,
+    	plussim: plussim,
+    	plustwo: plustwo,
+    	pm: pm,
+    	Poincareplane: Poincareplane,
+    	pointint: pointint,
+    	popf: popf,
+    	Popf: Popf,
+    	pound: pound,
+    	prap: prap,
+    	Pr: Pr,
+    	pr: pr,
+    	prcue: prcue,
+    	precapprox: precapprox,
+    	prec: prec,
+    	preccurlyeq: preccurlyeq,
+    	Precedes: Precedes,
+    	PrecedesEqual: PrecedesEqual,
+    	PrecedesSlantEqual: PrecedesSlantEqual,
+    	PrecedesTilde: PrecedesTilde,
+    	preceq: preceq,
+    	precnapprox: precnapprox,
+    	precneqq: precneqq,
+    	precnsim: precnsim,
+    	pre: pre,
+    	prE: prE,
+    	precsim: precsim,
+    	prime: prime,
+    	Prime: Prime,
+    	primes: primes,
+    	prnap: prnap,
+    	prnE: prnE,
+    	prnsim: prnsim,
+    	prod: prod,
+    	Product: Product,
+    	profalar: profalar,
+    	profline: profline,
+    	profsurf: profsurf,
+    	prop: prop,
+    	Proportional: Proportional,
+    	Proportion: Proportion,
+    	propto: propto,
+    	prsim: prsim,
+    	prurel: prurel,
+    	Pscr: Pscr,
+    	pscr: pscr,
+    	Psi: Psi,
+    	psi: psi,
+    	puncsp: puncsp,
+    	Qfr: Qfr,
+    	qfr: qfr,
+    	qint: qint,
+    	qopf: qopf,
+    	Qopf: Qopf,
+    	qprime: qprime,
+    	Qscr: Qscr,
+    	qscr: qscr,
+    	quaternions: quaternions,
+    	quatint: quatint,
+    	quest: quest,
+    	questeq: questeq,
+    	quot: quot,
+    	QUOT: QUOT,
+    	rAarr: rAarr,
+    	race: race,
+    	Racute: Racute,
+    	racute: racute,
+    	radic: radic,
+    	raemptyv: raemptyv,
+    	rang: rang,
+    	Rang: Rang,
+    	rangd: rangd,
+    	range: range,
+    	rangle: rangle,
+    	raquo: raquo,
+    	rarrap: rarrap,
+    	rarrb: rarrb,
+    	rarrbfs: rarrbfs,
+    	rarrc: rarrc,
+    	rarr: rarr,
+    	Rarr: Rarr,
+    	rArr: rArr,
+    	rarrfs: rarrfs,
+    	rarrhk: rarrhk,
+    	rarrlp: rarrlp,
+    	rarrpl: rarrpl,
+    	rarrsim: rarrsim,
+    	Rarrtl: Rarrtl,
+    	rarrtl: rarrtl,
+    	rarrw: rarrw,
+    	ratail: ratail,
+    	rAtail: rAtail,
+    	ratio: ratio,
+    	rationals: rationals,
+    	rbarr: rbarr,
+    	rBarr: rBarr,
+    	RBarr: RBarr,
+    	rbbrk: rbbrk,
+    	rbrace: rbrace,
+    	rbrack: rbrack,
+    	rbrke: rbrke,
+    	rbrksld: rbrksld,
+    	rbrkslu: rbrkslu,
+    	Rcaron: Rcaron,
+    	rcaron: rcaron,
+    	Rcedil: Rcedil,
+    	rcedil: rcedil,
+    	rceil: rceil,
+    	rcub: rcub,
+    	Rcy: Rcy,
+    	rcy: rcy,
+    	rdca: rdca,
+    	rdldhar: rdldhar,
+    	rdquo: rdquo,
+    	rdquor: rdquor,
+    	rdsh: rdsh,
+    	real: real,
+    	realine: realine,
+    	realpart: realpart,
+    	reals: reals,
+    	Re: Re,
+    	rect: rect,
+    	reg: reg,
+    	REG: REG,
+    	ReverseElement: ReverseElement,
+    	ReverseEquilibrium: ReverseEquilibrium,
+    	ReverseUpEquilibrium: ReverseUpEquilibrium,
+    	rfisht: rfisht,
+    	rfloor: rfloor,
+    	rfr: rfr,
+    	Rfr: Rfr,
+    	rHar: rHar,
+    	rhard: rhard,
+    	rharu: rharu,
+    	rharul: rharul,
+    	Rho: Rho,
+    	rho: rho,
+    	rhov: rhov,
+    	RightAngleBracket: RightAngleBracket,
+    	RightArrowBar: RightArrowBar,
+    	rightarrow: rightarrow,
+    	RightArrow: RightArrow,
+    	Rightarrow: Rightarrow,
+    	RightArrowLeftArrow: RightArrowLeftArrow,
+    	rightarrowtail: rightarrowtail,
+    	RightCeiling: RightCeiling,
+    	RightDoubleBracket: RightDoubleBracket,
+    	RightDownTeeVector: RightDownTeeVector,
+    	RightDownVectorBar: RightDownVectorBar,
+    	RightDownVector: RightDownVector,
+    	RightFloor: RightFloor,
+    	rightharpoondown: rightharpoondown,
+    	rightharpoonup: rightharpoonup,
+    	rightleftarrows: rightleftarrows,
+    	rightleftharpoons: rightleftharpoons,
+    	rightrightarrows: rightrightarrows,
+    	rightsquigarrow: rightsquigarrow,
+    	RightTeeArrow: RightTeeArrow,
+    	RightTee: RightTee,
+    	RightTeeVector: RightTeeVector,
+    	rightthreetimes: rightthreetimes,
+    	RightTriangleBar: RightTriangleBar,
+    	RightTriangle: RightTriangle,
+    	RightTriangleEqual: RightTriangleEqual,
+    	RightUpDownVector: RightUpDownVector,
+    	RightUpTeeVector: RightUpTeeVector,
+    	RightUpVectorBar: RightUpVectorBar,
+    	RightUpVector: RightUpVector,
+    	RightVectorBar: RightVectorBar,
+    	RightVector: RightVector,
+    	ring: ring,
+    	risingdotseq: risingdotseq,
+    	rlarr: rlarr,
+    	rlhar: rlhar,
+    	rlm: rlm,
+    	rmoustache: rmoustache,
+    	rmoust: rmoust,
+    	rnmid: rnmid,
+    	roang: roang,
+    	roarr: roarr,
+    	robrk: robrk,
+    	ropar: ropar,
+    	ropf: ropf,
+    	Ropf: Ropf,
+    	roplus: roplus,
+    	rotimes: rotimes,
+    	RoundImplies: RoundImplies,
+    	rpar: rpar,
+    	rpargt: rpargt,
+    	rppolint: rppolint,
+    	rrarr: rrarr,
+    	Rrightarrow: Rrightarrow,
+    	rsaquo: rsaquo,
+    	rscr: rscr,
+    	Rscr: Rscr,
+    	rsh: rsh,
+    	Rsh: Rsh,
+    	rsqb: rsqb,
+    	rsquo: rsquo,
+    	rsquor: rsquor,
+    	rthree: rthree,
+    	rtimes: rtimes,
+    	rtri: rtri,
+    	rtrie: rtrie,
+    	rtrif: rtrif,
+    	rtriltri: rtriltri,
+    	RuleDelayed: RuleDelayed,
+    	ruluhar: ruluhar,
+    	rx: rx,
+    	Sacute: Sacute,
+    	sacute: sacute,
+    	sbquo: sbquo,
+    	scap: scap,
+    	Scaron: Scaron,
+    	scaron: scaron,
+    	Sc: Sc,
+    	sc: sc,
+    	sccue: sccue,
+    	sce: sce,
+    	scE: scE,
+    	Scedil: Scedil,
+    	scedil: scedil,
+    	Scirc: Scirc,
+    	scirc: scirc,
+    	scnap: scnap,
+    	scnE: scnE,
+    	scnsim: scnsim,
+    	scpolint: scpolint,
+    	scsim: scsim,
+    	Scy: Scy,
+    	scy: scy,
+    	sdotb: sdotb,
+    	sdot: sdot,
+    	sdote: sdote,
+    	searhk: searhk,
+    	searr: searr,
+    	seArr: seArr,
+    	searrow: searrow,
+    	sect: sect,
+    	semi: semi,
+    	seswar: seswar,
+    	setminus: setminus,
+    	setmn: setmn,
+    	sext: sext,
+    	Sfr: Sfr,
+    	sfr: sfr,
+    	sfrown: sfrown,
+    	sharp: sharp,
+    	SHCHcy: SHCHcy,
+    	shchcy: shchcy,
+    	SHcy: SHcy,
+    	shcy: shcy,
+    	ShortDownArrow: ShortDownArrow,
+    	ShortLeftArrow: ShortLeftArrow,
+    	shortmid: shortmid,
+    	shortparallel: shortparallel,
+    	ShortRightArrow: ShortRightArrow,
+    	ShortUpArrow: ShortUpArrow,
+    	shy: shy,
+    	Sigma: Sigma,
+    	sigma: sigma,
+    	sigmaf: sigmaf,
+    	sigmav: sigmav,
+    	sim: sim,
+    	simdot: simdot,
+    	sime: sime,
+    	simeq: simeq,
+    	simg: simg,
+    	simgE: simgE,
+    	siml: siml,
+    	simlE: simlE,
+    	simne: simne,
+    	simplus: simplus,
+    	simrarr: simrarr,
+    	slarr: slarr,
+    	SmallCircle: SmallCircle,
+    	smallsetminus: smallsetminus,
+    	smashp: smashp,
+    	smeparsl: smeparsl,
+    	smid: smid,
+    	smile: smile,
+    	smt: smt,
+    	smte: smte,
+    	smtes: smtes,
+    	SOFTcy: SOFTcy,
+    	softcy: softcy,
+    	solbar: solbar,
+    	solb: solb,
+    	sol: sol,
+    	Sopf: Sopf,
+    	sopf: sopf,
+    	spades: spades,
+    	spadesuit: spadesuit,
+    	spar: spar,
+    	sqcap: sqcap,
+    	sqcaps: sqcaps,
+    	sqcup: sqcup,
+    	sqcups: sqcups,
+    	Sqrt: Sqrt,
+    	sqsub: sqsub,
+    	sqsube: sqsube,
+    	sqsubset: sqsubset,
+    	sqsubseteq: sqsubseteq,
+    	sqsup: sqsup,
+    	sqsupe: sqsupe,
+    	sqsupset: sqsupset,
+    	sqsupseteq: sqsupseteq,
+    	square: square,
+    	Square: Square,
+    	SquareIntersection: SquareIntersection,
+    	SquareSubset: SquareSubset,
+    	SquareSubsetEqual: SquareSubsetEqual,
+    	SquareSuperset: SquareSuperset,
+    	SquareSupersetEqual: SquareSupersetEqual,
+    	SquareUnion: SquareUnion,
+    	squarf: squarf,
+    	squ: squ,
+    	squf: squf,
+    	srarr: srarr,
+    	Sscr: Sscr,
+    	sscr: sscr,
+    	ssetmn: ssetmn,
+    	ssmile: ssmile,
+    	sstarf: sstarf,
+    	Star: Star,
+    	star: star,
+    	starf: starf,
+    	straightepsilon: straightepsilon,
+    	straightphi: straightphi,
+    	strns: strns,
+    	sub: sub,
+    	Sub: Sub,
+    	subdot: subdot,
+    	subE: subE,
+    	sube: sube,
+    	subedot: subedot,
+    	submult: submult,
+    	subnE: subnE,
+    	subne: subne,
+    	subplus: subplus,
+    	subrarr: subrarr,
+    	subset: subset,
+    	Subset: Subset,
+    	subseteq: subseteq,
+    	subseteqq: subseteqq,
+    	SubsetEqual: SubsetEqual,
+    	subsetneq: subsetneq,
+    	subsetneqq: subsetneqq,
+    	subsim: subsim,
+    	subsub: subsub,
+    	subsup: subsup,
+    	succapprox: succapprox,
+    	succ: succ,
+    	succcurlyeq: succcurlyeq,
+    	Succeeds: Succeeds,
+    	SucceedsEqual: SucceedsEqual,
+    	SucceedsSlantEqual: SucceedsSlantEqual,
+    	SucceedsTilde: SucceedsTilde,
+    	succeq: succeq,
+    	succnapprox: succnapprox,
+    	succneqq: succneqq,
+    	succnsim: succnsim,
+    	succsim: succsim,
+    	SuchThat: SuchThat,
+    	sum: sum,
+    	Sum: Sum,
+    	sung: sung,
+    	sup1: sup1,
+    	sup2: sup2,
+    	sup3: sup3,
+    	sup: sup,
+    	Sup: Sup,
+    	supdot: supdot,
+    	supdsub: supdsub,
+    	supE: supE,
+    	supe: supe,
+    	supedot: supedot,
+    	Superset: Superset,
+    	SupersetEqual: SupersetEqual,
+    	suphsol: suphsol,
+    	suphsub: suphsub,
+    	suplarr: suplarr,
+    	supmult: supmult,
+    	supnE: supnE,
+    	supne: supne,
+    	supplus: supplus,
+    	supset: supset,
+    	Supset: Supset,
+    	supseteq: supseteq,
+    	supseteqq: supseteqq,
+    	supsetneq: supsetneq,
+    	supsetneqq: supsetneqq,
+    	supsim: supsim,
+    	supsub: supsub,
+    	supsup: supsup,
+    	swarhk: swarhk,
+    	swarr: swarr,
+    	swArr: swArr,
+    	swarrow: swarrow,
+    	swnwar: swnwar,
+    	szlig: szlig,
+    	Tab: Tab,
+    	target: target,
+    	Tau: Tau,
+    	tau: tau,
+    	tbrk: tbrk,
+    	Tcaron: Tcaron,
+    	tcaron: tcaron,
+    	Tcedil: Tcedil,
+    	tcedil: tcedil,
+    	Tcy: Tcy,
+    	tcy: tcy,
+    	tdot: tdot,
+    	telrec: telrec,
+    	Tfr: Tfr,
+    	tfr: tfr,
+    	there4: there4,
+    	therefore: therefore,
+    	Therefore: Therefore,
+    	Theta: Theta,
+    	theta: theta,
+    	thetasym: thetasym,
+    	thetav: thetav,
+    	thickapprox: thickapprox,
+    	thicksim: thicksim,
+    	ThickSpace: ThickSpace,
+    	ThinSpace: ThinSpace,
+    	thinsp: thinsp,
+    	thkap: thkap,
+    	thksim: thksim,
+    	THORN: THORN,
+    	thorn: thorn,
+    	tilde: tilde,
+    	Tilde: Tilde,
+    	TildeEqual: TildeEqual,
+    	TildeFullEqual: TildeFullEqual,
+    	TildeTilde: TildeTilde,
+    	timesbar: timesbar,
+    	timesb: timesb,
+    	times: times,
+    	timesd: timesd,
+    	tint: tint,
+    	toea: toea,
+    	topbot: topbot,
+    	topcir: topcir,
+    	top: top,
+    	Topf: Topf,
+    	topf: topf,
+    	topfork: topfork,
+    	tosa: tosa,
+    	tprime: tprime,
+    	trade: trade,
+    	TRADE: TRADE,
+    	triangle: triangle,
+    	triangledown: triangledown,
+    	triangleleft: triangleleft,
+    	trianglelefteq: trianglelefteq,
+    	triangleq: triangleq,
+    	triangleright: triangleright,
+    	trianglerighteq: trianglerighteq,
+    	tridot: tridot,
+    	trie: trie,
+    	triminus: triminus,
+    	TripleDot: TripleDot,
+    	triplus: triplus,
+    	trisb: trisb,
+    	tritime: tritime,
+    	trpezium: trpezium,
+    	Tscr: Tscr,
+    	tscr: tscr,
+    	TScy: TScy,
+    	tscy: tscy,
+    	TSHcy: TSHcy,
+    	tshcy: tshcy,
+    	Tstrok: Tstrok,
+    	tstrok: tstrok,
+    	twixt: twixt,
+    	twoheadleftarrow: twoheadleftarrow,
+    	twoheadrightarrow: twoheadrightarrow,
+    	Uacute: Uacute,
+    	uacute: uacute,
+    	uarr: uarr,
+    	Uarr: Uarr,
+    	uArr: uArr,
+    	Uarrocir: Uarrocir,
+    	Ubrcy: Ubrcy,
+    	ubrcy: ubrcy,
+    	Ubreve: Ubreve,
+    	ubreve: ubreve,
+    	Ucirc: Ucirc,
+    	ucirc: ucirc,
+    	Ucy: Ucy,
+    	ucy: ucy,
+    	udarr: udarr,
+    	Udblac: Udblac,
+    	udblac: udblac,
+    	udhar: udhar,
+    	ufisht: ufisht,
+    	Ufr: Ufr,
+    	ufr: ufr,
+    	Ugrave: Ugrave,
+    	ugrave: ugrave,
+    	uHar: uHar,
+    	uharl: uharl,
+    	uharr: uharr,
+    	uhblk: uhblk,
+    	ulcorn: ulcorn,
+    	ulcorner: ulcorner,
+    	ulcrop: ulcrop,
+    	ultri: ultri,
+    	Umacr: Umacr,
+    	umacr: umacr,
+    	uml: uml,
+    	UnderBar: UnderBar,
+    	UnderBrace: UnderBrace,
+    	UnderBracket: UnderBracket,
+    	UnderParenthesis: UnderParenthesis,
+    	Union: Union,
+    	UnionPlus: UnionPlus,
+    	Uogon: Uogon,
+    	uogon: uogon,
+    	Uopf: Uopf,
+    	uopf: uopf,
+    	UpArrowBar: UpArrowBar,
+    	uparrow: uparrow,
+    	UpArrow: UpArrow,
+    	Uparrow: Uparrow,
+    	UpArrowDownArrow: UpArrowDownArrow,
+    	updownarrow: updownarrow,
+    	UpDownArrow: UpDownArrow,
+    	Updownarrow: Updownarrow,
+    	UpEquilibrium: UpEquilibrium,
+    	upharpoonleft: upharpoonleft,
+    	upharpoonright: upharpoonright,
+    	uplus: uplus,
+    	UpperLeftArrow: UpperLeftArrow,
+    	UpperRightArrow: UpperRightArrow,
+    	upsi: upsi,
+    	Upsi: Upsi,
+    	upsih: upsih,
+    	Upsilon: Upsilon,
+    	upsilon: upsilon,
+    	UpTeeArrow: UpTeeArrow,
+    	UpTee: UpTee,
+    	upuparrows: upuparrows,
+    	urcorn: urcorn,
+    	urcorner: urcorner,
+    	urcrop: urcrop,
+    	Uring: Uring,
+    	uring: uring,
+    	urtri: urtri,
+    	Uscr: Uscr,
+    	uscr: uscr,
+    	utdot: utdot,
+    	Utilde: Utilde,
+    	utilde: utilde,
+    	utri: utri,
+    	utrif: utrif,
+    	uuarr: uuarr,
+    	Uuml: Uuml,
+    	uuml: uuml,
+    	uwangle: uwangle,
+    	vangrt: vangrt,
+    	varepsilon: varepsilon,
+    	varkappa: varkappa,
+    	varnothing: varnothing,
+    	varphi: varphi,
+    	varpi: varpi,
+    	varpropto: varpropto,
+    	varr: varr,
+    	vArr: vArr,
+    	varrho: varrho,
+    	varsigma: varsigma,
+    	varsubsetneq: varsubsetneq,
+    	varsubsetneqq: varsubsetneqq,
+    	varsupsetneq: varsupsetneq,
+    	varsupsetneqq: varsupsetneqq,
+    	vartheta: vartheta,
+    	vartriangleleft: vartriangleleft,
+    	vartriangleright: vartriangleright,
+    	vBar: vBar,
+    	Vbar: Vbar,
+    	vBarv: vBarv,
+    	Vcy: Vcy,
+    	vcy: vcy,
+    	vdash: vdash,
+    	vDash: vDash,
+    	Vdash: Vdash,
+    	VDash: VDash,
+    	Vdashl: Vdashl,
+    	veebar: veebar,
+    	vee: vee,
+    	Vee: Vee,
+    	veeeq: veeeq,
+    	vellip: vellip,
+    	verbar: verbar,
+    	Verbar: Verbar,
+    	vert: vert,
+    	Vert: Vert,
+    	VerticalBar: VerticalBar,
+    	VerticalLine: VerticalLine,
+    	VerticalSeparator: VerticalSeparator,
+    	VerticalTilde: VerticalTilde,
+    	VeryThinSpace: VeryThinSpace,
+    	Vfr: Vfr,
+    	vfr: vfr,
+    	vltri: vltri,
+    	vnsub: vnsub,
+    	vnsup: vnsup,
+    	Vopf: Vopf,
+    	vopf: vopf,
+    	vprop: vprop,
+    	vrtri: vrtri,
+    	Vscr: Vscr,
+    	vscr: vscr,
+    	vsubnE: vsubnE,
+    	vsubne: vsubne,
+    	vsupnE: vsupnE,
+    	vsupne: vsupne,
+    	Vvdash: Vvdash,
+    	vzigzag: vzigzag,
+    	Wcirc: Wcirc,
+    	wcirc: wcirc,
+    	wedbar: wedbar,
+    	wedge: wedge,
+    	Wedge: Wedge,
+    	wedgeq: wedgeq,
+    	weierp: weierp,
+    	Wfr: Wfr,
+    	wfr: wfr,
+    	Wopf: Wopf,
+    	wopf: wopf,
+    	wp: wp,
+    	wr: wr,
+    	wreath: wreath,
+    	Wscr: Wscr,
+    	wscr: wscr,
+    	xcap: xcap,
+    	xcirc: xcirc,
+    	xcup: xcup,
+    	xdtri: xdtri,
+    	Xfr: Xfr,
+    	xfr: xfr,
+    	xharr: xharr,
+    	xhArr: xhArr,
+    	Xi: Xi,
+    	xi: xi,
+    	xlarr: xlarr,
+    	xlArr: xlArr,
+    	xmap: xmap,
+    	xnis: xnis,
+    	xodot: xodot,
+    	Xopf: Xopf,
+    	xopf: xopf,
+    	xoplus: xoplus,
+    	xotime: xotime,
+    	xrarr: xrarr,
+    	xrArr: xrArr,
+    	Xscr: Xscr,
+    	xscr: xscr,
+    	xsqcup: xsqcup,
+    	xuplus: xuplus,
+    	xutri: xutri,
+    	xvee: xvee,
+    	xwedge: xwedge,
+    	Yacute: Yacute,
+    	yacute: yacute,
+    	YAcy: YAcy,
+    	yacy: yacy,
+    	Ycirc: Ycirc,
+    	ycirc: ycirc,
+    	Ycy: Ycy,
+    	ycy: ycy,
+    	yen: yen,
+    	Yfr: Yfr,
+    	yfr: yfr,
+    	YIcy: YIcy,
+    	yicy: yicy,
+    	Yopf: Yopf,
+    	yopf: yopf,
+    	Yscr: Yscr,
+    	yscr: yscr,
+    	YUcy: YUcy,
+    	yucy: yucy,
+    	yuml: yuml,
+    	Yuml: Yuml,
+    	Zacute: Zacute,
+    	zacute: zacute,
+    	Zcaron: Zcaron,
+    	zcaron: zcaron,
+    	Zcy: Zcy,
+    	zcy: zcy,
+    	Zdot: Zdot,
+    	zdot: zdot,
+    	zeetrf: zeetrf,
+    	ZeroWidthSpace: ZeroWidthSpace,
+    	Zeta: Zeta,
+    	zeta: zeta,
+    	zfr: zfr,
+    	Zfr: Zfr,
+    	ZHcy: ZHcy,
+    	zhcy: zhcy,
+    	zigrarr: zigrarr,
+    	zopf: zopf,
+    	Zopf: Zopf,
+    	Zscr: Zscr,
+    	zscr: zscr,
+    	zwj: zwj,
+    	zwnj: zwnj
+    };
+
+    var entities$1 = /*#__PURE__*/Object.freeze({
+        Aacute: Aacute,
+        aacute: aacute,
+        Abreve: Abreve,
+        abreve: abreve,
+        ac: ac,
+        acd: acd,
+        acE: acE,
+        Acirc: Acirc,
+        acirc: acirc,
+        acute: acute,
+        Acy: Acy,
+        acy: acy,
+        AElig: AElig,
+        aelig: aelig,
+        af: af,
+        Afr: Afr,
+        afr: afr,
+        Agrave: Agrave,
+        agrave: agrave,
+        alefsym: alefsym,
+        aleph: aleph,
+        Alpha: Alpha,
+        alpha: alpha,
+        Amacr: Amacr,
+        amacr: amacr,
+        amalg: amalg,
+        amp: amp,
+        AMP: AMP,
+        andand: andand,
+        And: And,
+        and: and,
+        andd: andd,
+        andslope: andslope,
+        andv: andv,
+        ang: ang,
+        ange: ange,
+        angle: angle,
+        angmsdaa: angmsdaa,
+        angmsdab: angmsdab,
+        angmsdac: angmsdac,
+        angmsdad: angmsdad,
+        angmsdae: angmsdae,
+        angmsdaf: angmsdaf,
+        angmsdag: angmsdag,
+        angmsdah: angmsdah,
+        angmsd: angmsd,
+        angrt: angrt,
+        angrtvb: angrtvb,
+        angrtvbd: angrtvbd,
+        angsph: angsph,
+        angst: angst,
+        angzarr: angzarr,
+        Aogon: Aogon,
+        aogon: aogon,
+        Aopf: Aopf,
+        aopf: aopf,
+        apacir: apacir,
+        ap: ap,
+        apE: apE,
+        ape: ape,
+        apid: apid,
+        apos: apos,
+        ApplyFunction: ApplyFunction,
+        approx: approx,
+        approxeq: approxeq,
+        Aring: Aring,
+        aring: aring,
+        Ascr: Ascr,
+        ascr: ascr,
+        Assign: Assign,
+        ast: ast,
+        asymp: asymp,
+        asympeq: asympeq,
+        Atilde: Atilde,
+        atilde: atilde,
+        Auml: Auml,
+        auml: auml,
+        awconint: awconint,
+        awint: awint,
+        backcong: backcong,
+        backepsilon: backepsilon,
+        backprime: backprime,
+        backsim: backsim,
+        backsimeq: backsimeq,
+        Backslash: Backslash,
+        Barv: Barv,
+        barvee: barvee,
+        barwed: barwed,
+        Barwed: Barwed,
+        barwedge: barwedge,
+        bbrk: bbrk,
+        bbrktbrk: bbrktbrk,
+        bcong: bcong,
+        Bcy: Bcy,
+        bcy: bcy,
+        bdquo: bdquo,
+        becaus: becaus,
+        because: because,
+        Because: Because,
+        bemptyv: bemptyv,
+        bepsi: bepsi,
+        bernou: bernou,
+        Bernoullis: Bernoullis,
+        Beta: Beta,
+        beta: beta,
+        beth: beth,
+        between: between,
+        Bfr: Bfr,
+        bfr: bfr,
+        bigcap: bigcap,
+        bigcirc: bigcirc,
+        bigcup: bigcup,
+        bigodot: bigodot,
+        bigoplus: bigoplus,
+        bigotimes: bigotimes,
+        bigsqcup: bigsqcup,
+        bigstar: bigstar,
+        bigtriangledown: bigtriangledown,
+        bigtriangleup: bigtriangleup,
+        biguplus: biguplus,
+        bigvee: bigvee,
+        bigwedge: bigwedge,
+        bkarow: bkarow,
+        blacklozenge: blacklozenge,
+        blacksquare: blacksquare,
+        blacktriangle: blacktriangle,
+        blacktriangledown: blacktriangledown,
+        blacktriangleleft: blacktriangleleft,
+        blacktriangleright: blacktriangleright,
+        blank: blank,
+        blk12: blk12,
+        blk14: blk14,
+        blk34: blk34,
+        block: block,
+        bne: bne,
+        bnequiv: bnequiv,
+        bNot: bNot,
+        bnot: bnot,
+        Bopf: Bopf,
+        bopf: bopf,
+        bot: bot,
+        bottom: bottom,
+        bowtie: bowtie,
+        boxbox: boxbox,
+        boxdl: boxdl,
+        boxdL: boxdL,
+        boxDl: boxDl,
+        boxDL: boxDL,
+        boxdr: boxdr,
+        boxdR: boxdR,
+        boxDr: boxDr,
+        boxDR: boxDR,
+        boxh: boxh,
+        boxH: boxH,
+        boxhd: boxhd,
+        boxHd: boxHd,
+        boxhD: boxhD,
+        boxHD: boxHD,
+        boxhu: boxhu,
+        boxHu: boxHu,
+        boxhU: boxhU,
+        boxHU: boxHU,
+        boxminus: boxminus,
+        boxplus: boxplus,
+        boxtimes: boxtimes,
+        boxul: boxul,
+        boxuL: boxuL,
+        boxUl: boxUl,
+        boxUL: boxUL,
+        boxur: boxur,
+        boxuR: boxuR,
+        boxUr: boxUr,
+        boxUR: boxUR,
+        boxv: boxv,
+        boxV: boxV,
+        boxvh: boxvh,
+        boxvH: boxvH,
+        boxVh: boxVh,
+        boxVH: boxVH,
+        boxvl: boxvl,
+        boxvL: boxvL,
+        boxVl: boxVl,
+        boxVL: boxVL,
+        boxvr: boxvr,
+        boxvR: boxvR,
+        boxVr: boxVr,
+        boxVR: boxVR,
+        bprime: bprime,
+        breve: breve,
+        Breve: Breve,
+        brvbar: brvbar,
+        bscr: bscr,
+        Bscr: Bscr,
+        bsemi: bsemi,
+        bsim: bsim,
+        bsime: bsime,
+        bsolb: bsolb,
+        bsol: bsol,
+        bsolhsub: bsolhsub,
+        bull: bull,
+        bullet: bullet,
+        bump: bump,
+        bumpE: bumpE,
+        bumpe: bumpe,
+        Bumpeq: Bumpeq,
+        bumpeq: bumpeq,
+        Cacute: Cacute,
+        cacute: cacute,
+        capand: capand,
+        capbrcup: capbrcup,
+        capcap: capcap,
+        cap: cap,
+        Cap: Cap,
+        capcup: capcup,
+        capdot: capdot,
+        CapitalDifferentialD: CapitalDifferentialD,
+        caps: caps,
+        caret: caret,
+        caron: caron,
+        Cayleys: Cayleys,
+        ccaps: ccaps,
+        Ccaron: Ccaron,
+        ccaron: ccaron,
+        Ccedil: Ccedil,
+        ccedil: ccedil,
+        Ccirc: Ccirc,
+        ccirc: ccirc,
+        Cconint: Cconint,
+        ccups: ccups,
+        ccupssm: ccupssm,
+        Cdot: Cdot,
+        cdot: cdot,
+        cedil: cedil,
+        Cedilla: Cedilla,
+        cemptyv: cemptyv,
+        cent: cent,
+        centerdot: centerdot,
+        CenterDot: CenterDot,
+        cfr: cfr,
+        Cfr: Cfr,
+        CHcy: CHcy,
+        chcy: chcy,
+        check: check,
+        checkmark: checkmark,
+        Chi: Chi,
+        chi: chi,
+        circ: circ,
+        circeq: circeq,
+        circlearrowleft: circlearrowleft,
+        circlearrowright: circlearrowright,
+        circledast: circledast,
+        circledcirc: circledcirc,
+        circleddash: circleddash,
+        CircleDot: CircleDot,
+        circledR: circledR,
+        circledS: circledS,
+        CircleMinus: CircleMinus,
+        CirclePlus: CirclePlus,
+        CircleTimes: CircleTimes,
+        cir: cir,
+        cirE: cirE,
+        cire: cire,
+        cirfnint: cirfnint,
+        cirmid: cirmid,
+        cirscir: cirscir,
+        ClockwiseContourIntegral: ClockwiseContourIntegral,
+        CloseCurlyDoubleQuote: CloseCurlyDoubleQuote,
+        CloseCurlyQuote: CloseCurlyQuote,
+        clubs: clubs,
+        clubsuit: clubsuit,
+        colon: colon,
+        Colon: Colon,
+        Colone: Colone,
+        colone: colone,
+        coloneq: coloneq,
+        comma: comma,
+        commat: commat,
+        comp: comp,
+        compfn: compfn,
+        complement: complement,
+        complexes: complexes,
+        cong: cong,
+        congdot: congdot,
+        Congruent: Congruent,
+        conint: conint,
+        Conint: Conint,
+        ContourIntegral: ContourIntegral,
+        copf: copf,
+        Copf: Copf,
+        coprod: coprod,
+        Coproduct: Coproduct,
+        copy: copy,
+        COPY: COPY,
+        copysr: copysr,
+        CounterClockwiseContourIntegral: CounterClockwiseContourIntegral,
+        crarr: crarr,
+        cross: cross,
+        Cross: Cross,
+        Cscr: Cscr,
+        cscr: cscr,
+        csub: csub,
+        csube: csube,
+        csup: csup,
+        csupe: csupe,
+        ctdot: ctdot,
+        cudarrl: cudarrl,
+        cudarrr: cudarrr,
+        cuepr: cuepr,
+        cuesc: cuesc,
+        cularr: cularr,
+        cularrp: cularrp,
+        cupbrcap: cupbrcap,
+        cupcap: cupcap,
+        CupCap: CupCap,
+        cup: cup,
+        Cup: Cup,
+        cupcup: cupcup,
+        cupdot: cupdot,
+        cupor: cupor,
+        cups: cups,
+        curarr: curarr,
+        curarrm: curarrm,
+        curlyeqprec: curlyeqprec,
+        curlyeqsucc: curlyeqsucc,
+        curlyvee: curlyvee,
+        curlywedge: curlywedge,
+        curren: curren,
+        curvearrowleft: curvearrowleft,
+        curvearrowright: curvearrowright,
+        cuvee: cuvee,
+        cuwed: cuwed,
+        cwconint: cwconint,
+        cwint: cwint,
+        cylcty: cylcty,
+        dagger: dagger,
+        Dagger: Dagger,
+        daleth: daleth,
+        darr: darr,
+        Darr: Darr,
+        dArr: dArr,
+        dash: dash,
+        Dashv: Dashv,
+        dashv: dashv,
+        dbkarow: dbkarow,
+        dblac: dblac,
+        Dcaron: Dcaron,
+        dcaron: dcaron,
+        Dcy: Dcy,
+        dcy: dcy,
+        ddagger: ddagger,
+        ddarr: ddarr,
+        DD: DD,
+        dd: dd,
+        DDotrahd: DDotrahd,
+        ddotseq: ddotseq,
+        deg: deg,
+        Del: Del,
+        Delta: Delta,
+        delta: delta,
+        demptyv: demptyv,
+        dfisht: dfisht,
+        Dfr: Dfr,
+        dfr: dfr,
+        dHar: dHar,
+        dharl: dharl,
+        dharr: dharr,
+        DiacriticalAcute: DiacriticalAcute,
+        DiacriticalDot: DiacriticalDot,
+        DiacriticalDoubleAcute: DiacriticalDoubleAcute,
+        DiacriticalGrave: DiacriticalGrave,
+        DiacriticalTilde: DiacriticalTilde,
+        diam: diam,
+        diamond: diamond,
+        Diamond: Diamond,
+        diamondsuit: diamondsuit,
+        diams: diams,
+        die: die,
+        DifferentialD: DifferentialD,
+        digamma: digamma,
+        disin: disin,
+        div: div,
+        divide: divide,
+        divideontimes: divideontimes,
+        divonx: divonx,
+        DJcy: DJcy,
+        djcy: djcy,
+        dlcorn: dlcorn,
+        dlcrop: dlcrop,
+        dollar: dollar,
+        Dopf: Dopf,
+        dopf: dopf,
+        Dot: Dot,
+        dot: dot,
+        DotDot: DotDot,
+        doteq: doteq,
+        doteqdot: doteqdot,
+        DotEqual: DotEqual,
+        dotminus: dotminus,
+        dotplus: dotplus,
+        dotsquare: dotsquare,
+        doublebarwedge: doublebarwedge,
+        DoubleContourIntegral: DoubleContourIntegral,
+        DoubleDot: DoubleDot,
+        DoubleDownArrow: DoubleDownArrow,
+        DoubleLeftArrow: DoubleLeftArrow,
+        DoubleLeftRightArrow: DoubleLeftRightArrow,
+        DoubleLeftTee: DoubleLeftTee,
+        DoubleLongLeftArrow: DoubleLongLeftArrow,
+        DoubleLongLeftRightArrow: DoubleLongLeftRightArrow,
+        DoubleLongRightArrow: DoubleLongRightArrow,
+        DoubleRightArrow: DoubleRightArrow,
+        DoubleRightTee: DoubleRightTee,
+        DoubleUpArrow: DoubleUpArrow,
+        DoubleUpDownArrow: DoubleUpDownArrow,
+        DoubleVerticalBar: DoubleVerticalBar,
+        DownArrowBar: DownArrowBar,
+        downarrow: downarrow,
+        DownArrow: DownArrow,
+        Downarrow: Downarrow,
+        DownArrowUpArrow: DownArrowUpArrow,
+        DownBreve: DownBreve,
+        downdownarrows: downdownarrows,
+        downharpoonleft: downharpoonleft,
+        downharpoonright: downharpoonright,
+        DownLeftRightVector: DownLeftRightVector,
+        DownLeftTeeVector: DownLeftTeeVector,
+        DownLeftVectorBar: DownLeftVectorBar,
+        DownLeftVector: DownLeftVector,
+        DownRightTeeVector: DownRightTeeVector,
+        DownRightVectorBar: DownRightVectorBar,
+        DownRightVector: DownRightVector,
+        DownTeeArrow: DownTeeArrow,
+        DownTee: DownTee,
+        drbkarow: drbkarow,
+        drcorn: drcorn,
+        drcrop: drcrop,
+        Dscr: Dscr,
+        dscr: dscr,
+        DScy: DScy,
+        dscy: dscy,
+        dsol: dsol,
+        Dstrok: Dstrok,
+        dstrok: dstrok,
+        dtdot: dtdot,
+        dtri: dtri,
+        dtrif: dtrif,
+        duarr: duarr,
+        duhar: duhar,
+        dwangle: dwangle,
+        DZcy: DZcy,
+        dzcy: dzcy,
+        dzigrarr: dzigrarr,
+        Eacute: Eacute,
+        eacute: eacute,
+        easter: easter,
+        Ecaron: Ecaron,
+        ecaron: ecaron,
+        Ecirc: Ecirc,
+        ecirc: ecirc,
+        ecir: ecir,
+        ecolon: ecolon,
+        Ecy: Ecy,
+        ecy: ecy,
+        eDDot: eDDot,
+        Edot: Edot,
+        edot: edot,
+        eDot: eDot,
+        ee: ee,
+        efDot: efDot,
+        Efr: Efr,
+        efr: efr,
+        eg: eg,
+        Egrave: Egrave,
+        egrave: egrave,
+        egs: egs,
+        egsdot: egsdot,
+        el: el,
+        Element: Element,
+        elinters: elinters,
+        ell: ell,
+        els: els,
+        elsdot: elsdot,
+        Emacr: Emacr,
+        emacr: emacr,
+        empty: empty$1,
+        emptyset: emptyset,
+        EmptySmallSquare: EmptySmallSquare,
+        emptyv: emptyv,
+        EmptyVerySmallSquare: EmptyVerySmallSquare,
+        emsp13: emsp13,
+        emsp14: emsp14,
+        emsp: emsp,
+        ENG: ENG,
+        eng: eng,
+        ensp: ensp,
+        Eogon: Eogon,
+        eogon: eogon,
+        Eopf: Eopf,
+        eopf: eopf,
+        epar: epar,
+        eparsl: eparsl,
+        eplus: eplus,
+        epsi: epsi,
+        Epsilon: Epsilon,
+        epsilon: epsilon,
+        epsiv: epsiv,
+        eqcirc: eqcirc,
+        eqcolon: eqcolon,
+        eqsim: eqsim,
+        eqslantgtr: eqslantgtr,
+        eqslantless: eqslantless,
+        Equal: Equal,
+        equals: equals,
+        EqualTilde: EqualTilde,
+        equest: equest,
+        Equilibrium: Equilibrium,
+        equiv: equiv,
+        equivDD: equivDD,
+        eqvparsl: eqvparsl,
+        erarr: erarr,
+        erDot: erDot,
+        escr: escr,
+        Escr: Escr,
+        esdot: esdot,
+        Esim: Esim,
+        esim: esim,
+        Eta: Eta,
+        eta: eta,
+        ETH: ETH,
+        eth: eth,
+        Euml: Euml,
+        euml: euml,
+        euro: euro,
+        excl: excl,
+        exist: exist,
+        Exists: Exists,
+        expectation: expectation,
+        exponentiale: exponentiale,
+        ExponentialE: ExponentialE,
+        fallingdotseq: fallingdotseq,
+        Fcy: Fcy,
+        fcy: fcy,
+        female: female,
+        ffilig: ffilig,
+        fflig: fflig,
+        ffllig: ffllig,
+        Ffr: Ffr,
+        ffr: ffr,
+        filig: filig,
+        FilledSmallSquare: FilledSmallSquare,
+        FilledVerySmallSquare: FilledVerySmallSquare,
+        fjlig: fjlig,
+        flat: flat,
+        fllig: fllig,
+        fltns: fltns,
+        fnof: fnof,
+        Fopf: Fopf,
+        fopf: fopf,
+        forall: forall,
+        ForAll: ForAll,
+        fork: fork,
+        forkv: forkv,
+        Fouriertrf: Fouriertrf,
+        fpartint: fpartint,
+        frac12: frac12,
+        frac13: frac13,
+        frac14: frac14,
+        frac15: frac15,
+        frac16: frac16,
+        frac18: frac18,
+        frac23: frac23,
+        frac25: frac25,
+        frac34: frac34,
+        frac35: frac35,
+        frac38: frac38,
+        frac45: frac45,
+        frac56: frac56,
+        frac58: frac58,
+        frac78: frac78,
+        frasl: frasl,
+        frown: frown,
+        fscr: fscr,
+        Fscr: Fscr,
+        gacute: gacute,
+        Gamma: Gamma,
+        gamma: gamma,
+        Gammad: Gammad,
+        gammad: gammad,
+        gap: gap,
+        Gbreve: Gbreve,
+        gbreve: gbreve,
+        Gcedil: Gcedil,
+        Gcirc: Gcirc,
+        gcirc: gcirc,
+        Gcy: Gcy,
+        gcy: gcy,
+        Gdot: Gdot,
+        gdot: gdot,
+        ge: ge,
+        gE: gE,
+        gEl: gEl,
+        gel: gel,
+        geq: geq,
+        geqq: geqq,
+        geqslant: geqslant,
+        gescc: gescc,
+        ges: ges,
+        gesdot: gesdot,
+        gesdoto: gesdoto,
+        gesdotol: gesdotol,
+        gesl: gesl,
+        gesles: gesles,
+        Gfr: Gfr,
+        gfr: gfr,
+        gg: gg,
+        Gg: Gg,
+        ggg: ggg,
+        gimel: gimel,
+        GJcy: GJcy,
+        gjcy: gjcy,
+        gla: gla,
+        gl: gl,
+        glE: glE,
+        glj: glj,
+        gnap: gnap,
+        gnapprox: gnapprox,
+        gne: gne,
+        gnE: gnE,
+        gneq: gneq,
+        gneqq: gneqq,
+        gnsim: gnsim,
+        Gopf: Gopf,
+        gopf: gopf,
+        grave: grave,
+        GreaterEqual: GreaterEqual,
+        GreaterEqualLess: GreaterEqualLess,
+        GreaterFullEqual: GreaterFullEqual,
+        GreaterGreater: GreaterGreater,
+        GreaterLess: GreaterLess,
+        GreaterSlantEqual: GreaterSlantEqual,
+        GreaterTilde: GreaterTilde,
+        Gscr: Gscr,
+        gscr: gscr,
+        gsim: gsim,
+        gsime: gsime,
+        gsiml: gsiml,
+        gtcc: gtcc,
+        gtcir: gtcir,
+        gt: gt,
+        GT: GT,
+        Gt: Gt,
+        gtdot: gtdot,
+        gtlPar: gtlPar,
+        gtquest: gtquest,
+        gtrapprox: gtrapprox,
+        gtrarr: gtrarr,
+        gtrdot: gtrdot,
+        gtreqless: gtreqless,
+        gtreqqless: gtreqqless,
+        gtrless: gtrless,
+        gtrsim: gtrsim,
+        gvertneqq: gvertneqq,
+        gvnE: gvnE,
+        Hacek: Hacek,
+        hairsp: hairsp,
+        half: half,
+        hamilt: hamilt,
+        HARDcy: HARDcy,
+        hardcy: hardcy,
+        harrcir: harrcir,
+        harr: harr,
+        hArr: hArr,
+        harrw: harrw,
+        Hat: Hat,
+        hbar: hbar,
+        Hcirc: Hcirc,
+        hcirc: hcirc,
+        hearts: hearts,
+        heartsuit: heartsuit,
+        hellip: hellip,
+        hercon: hercon,
+        hfr: hfr,
+        Hfr: Hfr,
+        HilbertSpace: HilbertSpace,
+        hksearow: hksearow,
+        hkswarow: hkswarow,
+        hoarr: hoarr,
+        homtht: homtht,
+        hookleftarrow: hookleftarrow,
+        hookrightarrow: hookrightarrow,
+        hopf: hopf,
+        Hopf: Hopf,
+        horbar: horbar,
+        HorizontalLine: HorizontalLine,
+        hscr: hscr,
+        Hscr: Hscr,
+        hslash: hslash,
+        Hstrok: Hstrok,
+        hstrok: hstrok,
+        HumpDownHump: HumpDownHump,
+        HumpEqual: HumpEqual,
+        hybull: hybull,
+        hyphen: hyphen,
+        Iacute: Iacute,
+        iacute: iacute,
+        ic: ic,
+        Icirc: Icirc,
+        icirc: icirc,
+        Icy: Icy,
+        icy: icy,
+        Idot: Idot,
+        IEcy: IEcy,
+        iecy: iecy,
+        iexcl: iexcl,
+        iff: iff,
+        ifr: ifr,
+        Ifr: Ifr,
+        Igrave: Igrave,
+        igrave: igrave,
+        ii: ii,
+        iiiint: iiiint,
+        iiint: iiint,
+        iinfin: iinfin,
+        iiota: iiota,
+        IJlig: IJlig,
+        ijlig: ijlig,
+        Imacr: Imacr,
+        imacr: imacr,
+        image: image,
+        ImaginaryI: ImaginaryI,
+        imagline: imagline,
+        imagpart: imagpart,
+        imath: imath,
+        Im: Im,
+        imof: imof,
+        imped: imped,
+        Implies: Implies,
+        incare: incare,
+        infin: infin,
+        infintie: infintie,
+        inodot: inodot,
+        intcal: intcal,
+        int: int,
+        Int: Int,
+        integers: integers,
+        Integral: Integral,
+        intercal: intercal,
+        Intersection: Intersection,
+        intlarhk: intlarhk,
+        intprod: intprod,
+        InvisibleComma: InvisibleComma,
+        InvisibleTimes: InvisibleTimes,
+        IOcy: IOcy,
+        iocy: iocy,
+        Iogon: Iogon,
+        iogon: iogon,
+        Iopf: Iopf,
+        iopf: iopf,
+        Iota: Iota,
+        iota: iota,
+        iprod: iprod,
+        iquest: iquest,
+        iscr: iscr,
+        Iscr: Iscr,
+        isin: isin,
+        isindot: isindot,
+        isinE: isinE,
+        isins: isins,
+        isinsv: isinsv,
+        isinv: isinv,
+        it: it,
+        Itilde: Itilde,
+        itilde: itilde,
+        Iukcy: Iukcy,
+        iukcy: iukcy,
+        Iuml: Iuml,
+        iuml: iuml,
+        Jcirc: Jcirc,
+        jcirc: jcirc,
+        Jcy: Jcy,
+        jcy: jcy,
+        Jfr: Jfr,
+        jfr: jfr,
+        jmath: jmath,
+        Jopf: Jopf,
+        jopf: jopf,
+        Jscr: Jscr,
+        jscr: jscr,
+        Jsercy: Jsercy,
+        jsercy: jsercy,
+        Jukcy: Jukcy,
+        jukcy: jukcy,
+        Kappa: Kappa,
+        kappa: kappa,
+        kappav: kappav,
+        Kcedil: Kcedil,
+        kcedil: kcedil,
+        Kcy: Kcy,
+        kcy: kcy,
+        Kfr: Kfr,
+        kfr: kfr,
+        kgreen: kgreen,
+        KHcy: KHcy,
+        khcy: khcy,
+        KJcy: KJcy,
+        kjcy: kjcy,
+        Kopf: Kopf,
+        kopf: kopf,
+        Kscr: Kscr,
+        kscr: kscr,
+        lAarr: lAarr,
+        Lacute: Lacute,
+        lacute: lacute,
+        laemptyv: laemptyv,
+        lagran: lagran,
+        Lambda: Lambda,
+        lambda: lambda,
+        lang: lang,
+        Lang: Lang,
+        langd: langd,
+        langle: langle,
+        lap: lap,
+        Laplacetrf: Laplacetrf,
+        laquo: laquo,
+        larrb: larrb,
+        larrbfs: larrbfs,
+        larr: larr,
+        Larr: Larr,
+        lArr: lArr,
+        larrfs: larrfs,
+        larrhk: larrhk,
+        larrlp: larrlp,
+        larrpl: larrpl,
+        larrsim: larrsim,
+        larrtl: larrtl,
+        latail: latail,
+        lAtail: lAtail,
+        lat: lat,
+        late: late,
+        lates: lates,
+        lbarr: lbarr,
+        lBarr: lBarr,
+        lbbrk: lbbrk,
+        lbrace: lbrace,
+        lbrack: lbrack,
+        lbrke: lbrke,
+        lbrksld: lbrksld,
+        lbrkslu: lbrkslu,
+        Lcaron: Lcaron,
+        lcaron: lcaron,
+        Lcedil: Lcedil,
+        lcedil: lcedil,
+        lceil: lceil,
+        lcub: lcub,
+        Lcy: Lcy,
+        lcy: lcy,
+        ldca: ldca,
+        ldquo: ldquo,
+        ldquor: ldquor,
+        ldrdhar: ldrdhar,
+        ldrushar: ldrushar,
+        ldsh: ldsh,
+        le: le,
+        lE: lE,
+        LeftAngleBracket: LeftAngleBracket,
+        LeftArrowBar: LeftArrowBar,
+        leftarrow: leftarrow,
+        LeftArrow: LeftArrow,
+        Leftarrow: Leftarrow,
+        LeftArrowRightArrow: LeftArrowRightArrow,
+        leftarrowtail: leftarrowtail,
+        LeftCeiling: LeftCeiling,
+        LeftDoubleBracket: LeftDoubleBracket,
+        LeftDownTeeVector: LeftDownTeeVector,
+        LeftDownVectorBar: LeftDownVectorBar,
+        LeftDownVector: LeftDownVector,
+        LeftFloor: LeftFloor,
+        leftharpoondown: leftharpoondown,
+        leftharpoonup: leftharpoonup,
+        leftleftarrows: leftleftarrows,
+        leftrightarrow: leftrightarrow,
+        LeftRightArrow: LeftRightArrow,
+        Leftrightarrow: Leftrightarrow,
+        leftrightarrows: leftrightarrows,
+        leftrightharpoons: leftrightharpoons,
+        leftrightsquigarrow: leftrightsquigarrow,
+        LeftRightVector: LeftRightVector,
+        LeftTeeArrow: LeftTeeArrow,
+        LeftTee: LeftTee,
+        LeftTeeVector: LeftTeeVector,
+        leftthreetimes: leftthreetimes,
+        LeftTriangleBar: LeftTriangleBar,
+        LeftTriangle: LeftTriangle,
+        LeftTriangleEqual: LeftTriangleEqual,
+        LeftUpDownVector: LeftUpDownVector,
+        LeftUpTeeVector: LeftUpTeeVector,
+        LeftUpVectorBar: LeftUpVectorBar,
+        LeftUpVector: LeftUpVector,
+        LeftVectorBar: LeftVectorBar,
+        LeftVector: LeftVector,
+        lEg: lEg,
+        leg: leg,
+        leq: leq,
+        leqq: leqq,
+        leqslant: leqslant,
+        lescc: lescc,
+        les: les,
+        lesdot: lesdot,
+        lesdoto: lesdoto,
+        lesdotor: lesdotor,
+        lesg: lesg,
+        lesges: lesges,
+        lessapprox: lessapprox,
+        lessdot: lessdot,
+        lesseqgtr: lesseqgtr,
+        lesseqqgtr: lesseqqgtr,
+        LessEqualGreater: LessEqualGreater,
+        LessFullEqual: LessFullEqual,
+        LessGreater: LessGreater,
+        lessgtr: lessgtr,
+        LessLess: LessLess,
+        lesssim: lesssim,
+        LessSlantEqual: LessSlantEqual,
+        LessTilde: LessTilde,
+        lfisht: lfisht,
+        lfloor: lfloor,
+        Lfr: Lfr,
+        lfr: lfr,
+        lg: lg,
+        lgE: lgE,
+        lHar: lHar,
+        lhard: lhard,
+        lharu: lharu,
+        lharul: lharul,
+        lhblk: lhblk,
+        LJcy: LJcy,
+        ljcy: ljcy,
+        llarr: llarr,
+        ll: ll,
+        Ll: Ll,
+        llcorner: llcorner,
+        Lleftarrow: Lleftarrow,
+        llhard: llhard,
+        lltri: lltri,
+        Lmidot: Lmidot,
+        lmidot: lmidot,
+        lmoustache: lmoustache,
+        lmoust: lmoust,
+        lnap: lnap,
+        lnapprox: lnapprox,
+        lne: lne,
+        lnE: lnE,
+        lneq: lneq,
+        lneqq: lneqq,
+        lnsim: lnsim,
+        loang: loang,
+        loarr: loarr,
+        lobrk: lobrk,
+        longleftarrow: longleftarrow,
+        LongLeftArrow: LongLeftArrow,
+        Longleftarrow: Longleftarrow,
+        longleftrightarrow: longleftrightarrow,
+        LongLeftRightArrow: LongLeftRightArrow,
+        Longleftrightarrow: Longleftrightarrow,
+        longmapsto: longmapsto,
+        longrightarrow: longrightarrow,
+        LongRightArrow: LongRightArrow,
+        Longrightarrow: Longrightarrow,
+        looparrowleft: looparrowleft,
+        looparrowright: looparrowright,
+        lopar: lopar,
+        Lopf: Lopf,
+        lopf: lopf,
+        loplus: loplus,
+        lotimes: lotimes,
+        lowast: lowast,
+        lowbar: lowbar,
+        LowerLeftArrow: LowerLeftArrow,
+        LowerRightArrow: LowerRightArrow,
+        loz: loz,
+        lozenge: lozenge,
+        lozf: lozf,
+        lpar: lpar,
+        lparlt: lparlt,
+        lrarr: lrarr,
+        lrcorner: lrcorner,
+        lrhar: lrhar,
+        lrhard: lrhard,
+        lrm: lrm,
+        lrtri: lrtri,
+        lsaquo: lsaquo,
+        lscr: lscr,
+        Lscr: Lscr,
+        lsh: lsh,
+        Lsh: Lsh,
+        lsim: lsim,
+        lsime: lsime,
+        lsimg: lsimg,
+        lsqb: lsqb,
+        lsquo: lsquo,
+        lsquor: lsquor,
+        Lstrok: Lstrok,
+        lstrok: lstrok,
+        ltcc: ltcc,
+        ltcir: ltcir,
+        lt: lt,
+        LT: LT,
+        Lt: Lt,
+        ltdot: ltdot,
+        lthree: lthree,
+        ltimes: ltimes,
+        ltlarr: ltlarr,
+        ltquest: ltquest,
+        ltri: ltri,
+        ltrie: ltrie,
+        ltrif: ltrif,
+        ltrPar: ltrPar,
+        lurdshar: lurdshar,
+        luruhar: luruhar,
+        lvertneqq: lvertneqq,
+        lvnE: lvnE,
+        macr: macr,
+        male: male,
+        malt: malt,
+        maltese: maltese,
+        map: map,
+        mapsto: mapsto,
+        mapstodown: mapstodown,
+        mapstoleft: mapstoleft,
+        mapstoup: mapstoup,
+        marker: marker,
+        mcomma: mcomma,
+        Mcy: Mcy,
+        mcy: mcy,
+        mdash: mdash,
+        mDDot: mDDot,
+        measuredangle: measuredangle,
+        MediumSpace: MediumSpace,
+        Mellintrf: Mellintrf,
+        Mfr: Mfr,
+        mfr: mfr,
+        mho: mho,
+        micro: micro,
+        midast: midast,
+        midcir: midcir,
+        mid: mid,
+        middot: middot,
+        minusb: minusb,
+        minus: minus,
+        minusd: minusd,
+        minusdu: minusdu,
+        MinusPlus: MinusPlus,
+        mlcp: mlcp,
+        mldr: mldr,
+        mnplus: mnplus,
+        models: models,
+        Mopf: Mopf,
+        mopf: mopf,
+        mp: mp,
+        mscr: mscr,
+        Mscr: Mscr,
+        mstpos: mstpos,
+        Mu: Mu,
+        mu: mu,
+        multimap: multimap,
+        mumap: mumap,
+        nabla: nabla,
+        Nacute: Nacute,
+        nacute: nacute,
+        nang: nang,
+        nap: nap,
+        napE: napE,
+        napid: napid,
+        napos: napos,
+        napprox: napprox,
+        natural: natural,
+        naturals: naturals,
+        natur: natur,
+        nbsp: nbsp,
+        nbump: nbump,
+        nbumpe: nbumpe,
+        ncap: ncap,
+        Ncaron: Ncaron,
+        ncaron: ncaron,
+        Ncedil: Ncedil,
+        ncedil: ncedil,
+        ncong: ncong,
+        ncongdot: ncongdot,
+        ncup: ncup,
+        Ncy: Ncy,
+        ncy: ncy,
+        ndash: ndash,
+        nearhk: nearhk,
+        nearr: nearr,
+        neArr: neArr,
+        nearrow: nearrow,
+        ne: ne,
+        nedot: nedot,
+        NegativeMediumSpace: NegativeMediumSpace,
+        NegativeThickSpace: NegativeThickSpace,
+        NegativeThinSpace: NegativeThinSpace,
+        NegativeVeryThinSpace: NegativeVeryThinSpace,
+        nequiv: nequiv,
+        nesear: nesear,
+        nesim: nesim,
+        NestedGreaterGreater: NestedGreaterGreater,
+        NestedLessLess: NestedLessLess,
+        NewLine: NewLine,
+        nexist: nexist,
+        nexists: nexists,
+        Nfr: Nfr,
+        nfr: nfr,
+        ngE: ngE,
+        nge: nge,
+        ngeq: ngeq,
+        ngeqq: ngeqq,
+        ngeqslant: ngeqslant,
+        nges: nges,
+        nGg: nGg,
+        ngsim: ngsim,
+        nGt: nGt,
+        ngt: ngt,
+        ngtr: ngtr,
+        nGtv: nGtv,
+        nharr: nharr,
+        nhArr: nhArr,
+        nhpar: nhpar,
+        ni: ni,
+        nis: nis,
+        nisd: nisd,
+        niv: niv,
+        NJcy: NJcy,
+        njcy: njcy,
+        nlarr: nlarr,
+        nlArr: nlArr,
+        nldr: nldr,
+        nlE: nlE,
+        nle: nle,
+        nleftarrow: nleftarrow,
+        nLeftarrow: nLeftarrow,
+        nleftrightarrow: nleftrightarrow,
+        nLeftrightarrow: nLeftrightarrow,
+        nleq: nleq,
+        nleqq: nleqq,
+        nleqslant: nleqslant,
+        nles: nles,
+        nless: nless,
+        nLl: nLl,
+        nlsim: nlsim,
+        nLt: nLt,
+        nlt: nlt,
+        nltri: nltri,
+        nltrie: nltrie,
+        nLtv: nLtv,
+        nmid: nmid,
+        NoBreak: NoBreak,
+        NonBreakingSpace: NonBreakingSpace,
+        nopf: nopf,
+        Nopf: Nopf,
+        Not: Not,
+        not: not,
+        NotCongruent: NotCongruent,
+        NotCupCap: NotCupCap,
+        NotDoubleVerticalBar: NotDoubleVerticalBar,
+        NotElement: NotElement,
+        NotEqual: NotEqual,
+        NotEqualTilde: NotEqualTilde,
+        NotExists: NotExists,
+        NotGreater: NotGreater,
+        NotGreaterEqual: NotGreaterEqual,
+        NotGreaterFullEqual: NotGreaterFullEqual,
+        NotGreaterGreater: NotGreaterGreater,
+        NotGreaterLess: NotGreaterLess,
+        NotGreaterSlantEqual: NotGreaterSlantEqual,
+        NotGreaterTilde: NotGreaterTilde,
+        NotHumpDownHump: NotHumpDownHump,
+        NotHumpEqual: NotHumpEqual,
+        notin: notin,
+        notindot: notindot,
+        notinE: notinE,
+        notinva: notinva,
+        notinvb: notinvb,
+        notinvc: notinvc,
+        NotLeftTriangleBar: NotLeftTriangleBar,
+        NotLeftTriangle: NotLeftTriangle,
+        NotLeftTriangleEqual: NotLeftTriangleEqual,
+        NotLess: NotLess,
+        NotLessEqual: NotLessEqual,
+        NotLessGreater: NotLessGreater,
+        NotLessLess: NotLessLess,
+        NotLessSlantEqual: NotLessSlantEqual,
+        NotLessTilde: NotLessTilde,
+        NotNestedGreaterGreater: NotNestedGreaterGreater,
+        NotNestedLessLess: NotNestedLessLess,
+        notni: notni,
+        notniva: notniva,
+        notnivb: notnivb,
+        notnivc: notnivc,
+        NotPrecedes: NotPrecedes,
+        NotPrecedesEqual: NotPrecedesEqual,
+        NotPrecedesSlantEqual: NotPrecedesSlantEqual,
+        NotReverseElement: NotReverseElement,
+        NotRightTriangleBar: NotRightTriangleBar,
+        NotRightTriangle: NotRightTriangle,
+        NotRightTriangleEqual: NotRightTriangleEqual,
+        NotSquareSubset: NotSquareSubset,
+        NotSquareSubsetEqual: NotSquareSubsetEqual,
+        NotSquareSuperset: NotSquareSuperset,
+        NotSquareSupersetEqual: NotSquareSupersetEqual,
+        NotSubset: NotSubset,
+        NotSubsetEqual: NotSubsetEqual,
+        NotSucceeds: NotSucceeds,
+        NotSucceedsEqual: NotSucceedsEqual,
+        NotSucceedsSlantEqual: NotSucceedsSlantEqual,
+        NotSucceedsTilde: NotSucceedsTilde,
+        NotSuperset: NotSuperset,
+        NotSupersetEqual: NotSupersetEqual,
+        NotTilde: NotTilde,
+        NotTildeEqual: NotTildeEqual,
+        NotTildeFullEqual: NotTildeFullEqual,
+        NotTildeTilde: NotTildeTilde,
+        NotVerticalBar: NotVerticalBar,
+        nparallel: nparallel,
+        npar: npar,
+        nparsl: nparsl,
+        npart: npart,
+        npolint: npolint,
+        npr: npr,
+        nprcue: nprcue,
+        nprec: nprec,
+        npreceq: npreceq,
+        npre: npre,
+        nrarrc: nrarrc,
+        nrarr: nrarr,
+        nrArr: nrArr,
+        nrarrw: nrarrw,
+        nrightarrow: nrightarrow,
+        nRightarrow: nRightarrow,
+        nrtri: nrtri,
+        nrtrie: nrtrie,
+        nsc: nsc,
+        nsccue: nsccue,
+        nsce: nsce,
+        Nscr: Nscr,
+        nscr: nscr,
+        nshortmid: nshortmid,
+        nshortparallel: nshortparallel,
+        nsim: nsim,
+        nsime: nsime,
+        nsimeq: nsimeq,
+        nsmid: nsmid,
+        nspar: nspar,
+        nsqsube: nsqsube,
+        nsqsupe: nsqsupe,
+        nsub: nsub,
+        nsubE: nsubE,
+        nsube: nsube,
+        nsubset: nsubset,
+        nsubseteq: nsubseteq,
+        nsubseteqq: nsubseteqq,
+        nsucc: nsucc,
+        nsucceq: nsucceq,
+        nsup: nsup,
+        nsupE: nsupE,
+        nsupe: nsupe,
+        nsupset: nsupset,
+        nsupseteq: nsupseteq,
+        nsupseteqq: nsupseteqq,
+        ntgl: ntgl,
+        Ntilde: Ntilde,
+        ntilde: ntilde,
+        ntlg: ntlg,
+        ntriangleleft: ntriangleleft,
+        ntrianglelefteq: ntrianglelefteq,
+        ntriangleright: ntriangleright,
+        ntrianglerighteq: ntrianglerighteq,
+        Nu: Nu,
+        nu: nu,
+        num: num,
+        numero: numero,
+        numsp: numsp,
+        nvap: nvap,
+        nvdash: nvdash,
+        nvDash: nvDash,
+        nVdash: nVdash,
+        nVDash: nVDash,
+        nvge: nvge,
+        nvgt: nvgt,
+        nvHarr: nvHarr,
+        nvinfin: nvinfin,
+        nvlArr: nvlArr,
+        nvle: nvle,
+        nvlt: nvlt,
+        nvltrie: nvltrie,
+        nvrArr: nvrArr,
+        nvrtrie: nvrtrie,
+        nvsim: nvsim,
+        nwarhk: nwarhk,
+        nwarr: nwarr,
+        nwArr: nwArr,
+        nwarrow: nwarrow,
+        nwnear: nwnear,
+        Oacute: Oacute,
+        oacute: oacute,
+        oast: oast,
+        Ocirc: Ocirc,
+        ocirc: ocirc,
+        ocir: ocir,
+        Ocy: Ocy,
+        ocy: ocy,
+        odash: odash,
+        Odblac: Odblac,
+        odblac: odblac,
+        odiv: odiv,
+        odot: odot,
+        odsold: odsold,
+        OElig: OElig,
+        oelig: oelig,
+        ofcir: ofcir,
+        Ofr: Ofr,
+        ofr: ofr,
+        ogon: ogon,
+        Ograve: Ograve,
+        ograve: ograve,
+        ogt: ogt,
+        ohbar: ohbar,
+        ohm: ohm,
+        oint: oint,
+        olarr: olarr,
+        olcir: olcir,
+        olcross: olcross,
+        oline: oline,
+        olt: olt,
+        Omacr: Omacr,
+        omacr: omacr,
+        Omega: Omega,
+        omega: omega,
+        Omicron: Omicron,
+        omicron: omicron,
+        omid: omid,
+        ominus: ominus,
+        Oopf: Oopf,
+        oopf: oopf,
+        opar: opar,
+        OpenCurlyDoubleQuote: OpenCurlyDoubleQuote,
+        OpenCurlyQuote: OpenCurlyQuote,
+        operp: operp,
+        oplus: oplus,
+        orarr: orarr,
+        Or: Or,
+        or: or,
+        ord: ord,
+        order: order,
+        orderof: orderof,
+        ordf: ordf,
+        ordm: ordm,
+        origof: origof,
+        oror: oror,
+        orslope: orslope,
+        orv: orv,
+        oS: oS,
+        Oscr: Oscr,
+        oscr: oscr,
+        Oslash: Oslash,
+        oslash: oslash,
+        osol: osol,
+        Otilde: Otilde,
+        otilde: otilde,
+        otimesas: otimesas,
+        Otimes: Otimes,
+        otimes: otimes,
+        Ouml: Ouml,
+        ouml: ouml,
+        ovbar: ovbar,
+        OverBar: OverBar,
+        OverBrace: OverBrace,
+        OverBracket: OverBracket,
+        OverParenthesis: OverParenthesis,
+        para: para,
+        parallel: parallel,
+        par: par,
+        parsim: parsim,
+        parsl: parsl,
+        part: part,
+        PartialD: PartialD,
+        Pcy: Pcy,
+        pcy: pcy,
+        percnt: percnt,
+        period: period,
+        permil: permil,
+        perp: perp,
+        pertenk: pertenk,
+        Pfr: Pfr,
+        pfr: pfr,
+        Phi: Phi,
+        phi: phi,
+        phiv: phiv,
+        phmmat: phmmat,
+        phone: phone,
+        Pi: Pi,
+        pi: pi,
+        pitchfork: pitchfork,
+        piv: piv,
+        planck: planck,
+        planckh: planckh,
+        plankv: plankv,
+        plusacir: plusacir,
+        plusb: plusb,
+        pluscir: pluscir,
+        plus: plus,
+        plusdo: plusdo,
+        plusdu: plusdu,
+        pluse: pluse,
+        PlusMinus: PlusMinus,
+        plusmn: plusmn,
+        plussim: plussim,
+        plustwo: plustwo,
+        pm: pm,
+        Poincareplane: Poincareplane,
+        pointint: pointint,
+        popf: popf,
+        Popf: Popf,
+        pound: pound,
+        prap: prap,
+        Pr: Pr,
+        pr: pr,
+        prcue: prcue,
+        precapprox: precapprox,
+        prec: prec,
+        preccurlyeq: preccurlyeq,
+        Precedes: Precedes,
+        PrecedesEqual: PrecedesEqual,
+        PrecedesSlantEqual: PrecedesSlantEqual,
+        PrecedesTilde: PrecedesTilde,
+        preceq: preceq,
+        precnapprox: precnapprox,
+        precneqq: precneqq,
+        precnsim: precnsim,
+        pre: pre,
+        prE: prE,
+        precsim: precsim,
+        prime: prime,
+        Prime: Prime,
+        primes: primes,
+        prnap: prnap,
+        prnE: prnE,
+        prnsim: prnsim,
+        prod: prod,
+        Product: Product,
+        profalar: profalar,
+        profline: profline,
+        profsurf: profsurf,
+        prop: prop,
+        Proportional: Proportional,
+        Proportion: Proportion,
+        propto: propto,
+        prsim: prsim,
+        prurel: prurel,
+        Pscr: Pscr,
+        pscr: pscr,
+        Psi: Psi,
+        psi: psi,
+        puncsp: puncsp,
+        Qfr: Qfr,
+        qfr: qfr,
+        qint: qint,
+        qopf: qopf,
+        Qopf: Qopf,
+        qprime: qprime,
+        Qscr: Qscr,
+        qscr: qscr,
+        quaternions: quaternions,
+        quatint: quatint,
+        quest: quest,
+        questeq: questeq,
+        quot: quot,
+        QUOT: QUOT,
+        rAarr: rAarr,
+        race: race,
+        Racute: Racute,
+        racute: racute,
+        radic: radic,
+        raemptyv: raemptyv,
+        rang: rang,
+        Rang: Rang,
+        rangd: rangd,
+        range: range,
+        rangle: rangle,
+        raquo: raquo,
+        rarrap: rarrap,
+        rarrb: rarrb,
+        rarrbfs: rarrbfs,
+        rarrc: rarrc,
+        rarr: rarr,
+        Rarr: Rarr,
+        rArr: rArr,
+        rarrfs: rarrfs,
+        rarrhk: rarrhk,
+        rarrlp: rarrlp,
+        rarrpl: rarrpl,
+        rarrsim: rarrsim,
+        Rarrtl: Rarrtl,
+        rarrtl: rarrtl,
+        rarrw: rarrw,
+        ratail: ratail,
+        rAtail: rAtail,
+        ratio: ratio,
+        rationals: rationals,
+        rbarr: rbarr,
+        rBarr: rBarr,
+        RBarr: RBarr,
+        rbbrk: rbbrk,
+        rbrace: rbrace,
+        rbrack: rbrack,
+        rbrke: rbrke,
+        rbrksld: rbrksld,
+        rbrkslu: rbrkslu,
+        Rcaron: Rcaron,
+        rcaron: rcaron,
+        Rcedil: Rcedil,
+        rcedil: rcedil,
+        rceil: rceil,
+        rcub: rcub,
+        Rcy: Rcy,
+        rcy: rcy,
+        rdca: rdca,
+        rdldhar: rdldhar,
+        rdquo: rdquo,
+        rdquor: rdquor,
+        rdsh: rdsh,
+        real: real,
+        realine: realine,
+        realpart: realpart,
+        reals: reals,
+        Re: Re,
+        rect: rect,
+        reg: reg,
+        REG: REG,
+        ReverseElement: ReverseElement,
+        ReverseEquilibrium: ReverseEquilibrium,
+        ReverseUpEquilibrium: ReverseUpEquilibrium,
+        rfisht: rfisht,
+        rfloor: rfloor,
+        rfr: rfr,
+        Rfr: Rfr,
+        rHar: rHar,
+        rhard: rhard,
+        rharu: rharu,
+        rharul: rharul,
+        Rho: Rho,
+        rho: rho,
+        rhov: rhov,
+        RightAngleBracket: RightAngleBracket,
+        RightArrowBar: RightArrowBar,
+        rightarrow: rightarrow,
+        RightArrow: RightArrow,
+        Rightarrow: Rightarrow,
+        RightArrowLeftArrow: RightArrowLeftArrow,
+        rightarrowtail: rightarrowtail,
+        RightCeiling: RightCeiling,
+        RightDoubleBracket: RightDoubleBracket,
+        RightDownTeeVector: RightDownTeeVector,
+        RightDownVectorBar: RightDownVectorBar,
+        RightDownVector: RightDownVector,
+        RightFloor: RightFloor,
+        rightharpoondown: rightharpoondown,
+        rightharpoonup: rightharpoonup,
+        rightleftarrows: rightleftarrows,
+        rightleftharpoons: rightleftharpoons,
+        rightrightarrows: rightrightarrows,
+        rightsquigarrow: rightsquigarrow,
+        RightTeeArrow: RightTeeArrow,
+        RightTee: RightTee,
+        RightTeeVector: RightTeeVector,
+        rightthreetimes: rightthreetimes,
+        RightTriangleBar: RightTriangleBar,
+        RightTriangle: RightTriangle,
+        RightTriangleEqual: RightTriangleEqual,
+        RightUpDownVector: RightUpDownVector,
+        RightUpTeeVector: RightUpTeeVector,
+        RightUpVectorBar: RightUpVectorBar,
+        RightUpVector: RightUpVector,
+        RightVectorBar: RightVectorBar,
+        RightVector: RightVector,
+        ring: ring,
+        risingdotseq: risingdotseq,
+        rlarr: rlarr,
+        rlhar: rlhar,
+        rlm: rlm,
+        rmoustache: rmoustache,
+        rmoust: rmoust,
+        rnmid: rnmid,
+        roang: roang,
+        roarr: roarr,
+        robrk: robrk,
+        ropar: ropar,
+        ropf: ropf,
+        Ropf: Ropf,
+        roplus: roplus,
+        rotimes: rotimes,
+        RoundImplies: RoundImplies,
+        rpar: rpar,
+        rpargt: rpargt,
+        rppolint: rppolint,
+        rrarr: rrarr,
+        Rrightarrow: Rrightarrow,
+        rsaquo: rsaquo,
+        rscr: rscr,
+        Rscr: Rscr,
+        rsh: rsh,
+        Rsh: Rsh,
+        rsqb: rsqb,
+        rsquo: rsquo,
+        rsquor: rsquor,
+        rthree: rthree,
+        rtimes: rtimes,
+        rtri: rtri,
+        rtrie: rtrie,
+        rtrif: rtrif,
+        rtriltri: rtriltri,
+        RuleDelayed: RuleDelayed,
+        ruluhar: ruluhar,
+        rx: rx,
+        Sacute: Sacute,
+        sacute: sacute,
+        sbquo: sbquo,
+        scap: scap,
+        Scaron: Scaron,
+        scaron: scaron,
+        Sc: Sc,
+        sc: sc,
+        sccue: sccue,
+        sce: sce,
+        scE: scE,
+        Scedil: Scedil,
+        scedil: scedil,
+        Scirc: Scirc,
+        scirc: scirc,
+        scnap: scnap,
+        scnE: scnE,
+        scnsim: scnsim,
+        scpolint: scpolint,
+        scsim: scsim,
+        Scy: Scy,
+        scy: scy,
+        sdotb: sdotb,
+        sdot: sdot,
+        sdote: sdote,
+        searhk: searhk,
+        searr: searr,
+        seArr: seArr,
+        searrow: searrow,
+        sect: sect,
+        semi: semi,
+        seswar: seswar,
+        setminus: setminus,
+        setmn: setmn,
+        sext: sext,
+        Sfr: Sfr,
+        sfr: sfr,
+        sfrown: sfrown,
+        sharp: sharp,
+        SHCHcy: SHCHcy,
+        shchcy: shchcy,
+        SHcy: SHcy,
+        shcy: shcy,
+        ShortDownArrow: ShortDownArrow,
+        ShortLeftArrow: ShortLeftArrow,
+        shortmid: shortmid,
+        shortparallel: shortparallel,
+        ShortRightArrow: ShortRightArrow,
+        ShortUpArrow: ShortUpArrow,
+        shy: shy,
+        Sigma: Sigma,
+        sigma: sigma,
+        sigmaf: sigmaf,
+        sigmav: sigmav,
+        sim: sim,
+        simdot: simdot,
+        sime: sime,
+        simeq: simeq,
+        simg: simg,
+        simgE: simgE,
+        siml: siml,
+        simlE: simlE,
+        simne: simne,
+        simplus: simplus,
+        simrarr: simrarr,
+        slarr: slarr,
+        SmallCircle: SmallCircle,
+        smallsetminus: smallsetminus,
+        smashp: smashp,
+        smeparsl: smeparsl,
+        smid: smid,
+        smile: smile,
+        smt: smt,
+        smte: smte,
+        smtes: smtes,
+        SOFTcy: SOFTcy,
+        softcy: softcy,
+        solbar: solbar,
+        solb: solb,
+        sol: sol,
+        Sopf: Sopf,
+        sopf: sopf,
+        spades: spades,
+        spadesuit: spadesuit,
+        spar: spar,
+        sqcap: sqcap,
+        sqcaps: sqcaps,
+        sqcup: sqcup,
+        sqcups: sqcups,
+        Sqrt: Sqrt,
+        sqsub: sqsub,
+        sqsube: sqsube,
+        sqsubset: sqsubset,
+        sqsubseteq: sqsubseteq,
+        sqsup: sqsup,
+        sqsupe: sqsupe,
+        sqsupset: sqsupset,
+        sqsupseteq: sqsupseteq,
+        square: square,
+        Square: Square,
+        SquareIntersection: SquareIntersection,
+        SquareSubset: SquareSubset,
+        SquareSubsetEqual: SquareSubsetEqual,
+        SquareSuperset: SquareSuperset,
+        SquareSupersetEqual: SquareSupersetEqual,
+        SquareUnion: SquareUnion,
+        squarf: squarf,
+        squ: squ,
+        squf: squf,
+        srarr: srarr,
+        Sscr: Sscr,
+        sscr: sscr,
+        ssetmn: ssetmn,
+        ssmile: ssmile,
+        sstarf: sstarf,
+        Star: Star,
+        star: star,
+        starf: starf,
+        straightepsilon: straightepsilon,
+        straightphi: straightphi,
+        strns: strns,
+        sub: sub,
+        Sub: Sub,
+        subdot: subdot,
+        subE: subE,
+        sube: sube,
+        subedot: subedot,
+        submult: submult,
+        subnE: subnE,
+        subne: subne,
+        subplus: subplus,
+        subrarr: subrarr,
+        subset: subset,
+        Subset: Subset,
+        subseteq: subseteq,
+        subseteqq: subseteqq,
+        SubsetEqual: SubsetEqual,
+        subsetneq: subsetneq,
+        subsetneqq: subsetneqq,
+        subsim: subsim,
+        subsub: subsub,
+        subsup: subsup,
+        succapprox: succapprox,
+        succ: succ,
+        succcurlyeq: succcurlyeq,
+        Succeeds: Succeeds,
+        SucceedsEqual: SucceedsEqual,
+        SucceedsSlantEqual: SucceedsSlantEqual,
+        SucceedsTilde: SucceedsTilde,
+        succeq: succeq,
+        succnapprox: succnapprox,
+        succneqq: succneqq,
+        succnsim: succnsim,
+        succsim: succsim,
+        SuchThat: SuchThat,
+        sum: sum,
+        Sum: Sum,
+        sung: sung,
+        sup1: sup1,
+        sup2: sup2,
+        sup3: sup3,
+        sup: sup,
+        Sup: Sup,
+        supdot: supdot,
+        supdsub: supdsub,
+        supE: supE,
+        supe: supe,
+        supedot: supedot,
+        Superset: Superset,
+        SupersetEqual: SupersetEqual,
+        suphsol: suphsol,
+        suphsub: suphsub,
+        suplarr: suplarr,
+        supmult: supmult,
+        supnE: supnE,
+        supne: supne,
+        supplus: supplus,
+        supset: supset,
+        Supset: Supset,
+        supseteq: supseteq,
+        supseteqq: supseteqq,
+        supsetneq: supsetneq,
+        supsetneqq: supsetneqq,
+        supsim: supsim,
+        supsub: supsub,
+        supsup: supsup,
+        swarhk: swarhk,
+        swarr: swarr,
+        swArr: swArr,
+        swarrow: swarrow,
+        swnwar: swnwar,
+        szlig: szlig,
+        Tab: Tab,
+        target: target,
+        Tau: Tau,
+        tau: tau,
+        tbrk: tbrk,
+        Tcaron: Tcaron,
+        tcaron: tcaron,
+        Tcedil: Tcedil,
+        tcedil: tcedil,
+        Tcy: Tcy,
+        tcy: tcy,
+        tdot: tdot,
+        telrec: telrec,
+        Tfr: Tfr,
+        tfr: tfr,
+        there4: there4,
+        therefore: therefore,
+        Therefore: Therefore,
+        Theta: Theta,
+        theta: theta,
+        thetasym: thetasym,
+        thetav: thetav,
+        thickapprox: thickapprox,
+        thicksim: thicksim,
+        ThickSpace: ThickSpace,
+        ThinSpace: ThinSpace,
+        thinsp: thinsp,
+        thkap: thkap,
+        thksim: thksim,
+        THORN: THORN,
+        thorn: thorn,
+        tilde: tilde,
+        Tilde: Tilde,
+        TildeEqual: TildeEqual,
+        TildeFullEqual: TildeFullEqual,
+        TildeTilde: TildeTilde,
+        timesbar: timesbar,
+        timesb: timesb,
+        times: times,
+        timesd: timesd,
+        tint: tint,
+        toea: toea,
+        topbot: topbot,
+        topcir: topcir,
+        top: top,
+        Topf: Topf,
+        topf: topf,
+        topfork: topfork,
+        tosa: tosa,
+        tprime: tprime,
+        trade: trade,
+        TRADE: TRADE,
+        triangle: triangle,
+        triangledown: triangledown,
+        triangleleft: triangleleft,
+        trianglelefteq: trianglelefteq,
+        triangleq: triangleq,
+        triangleright: triangleright,
+        trianglerighteq: trianglerighteq,
+        tridot: tridot,
+        trie: trie,
+        triminus: triminus,
+        TripleDot: TripleDot,
+        triplus: triplus,
+        trisb: trisb,
+        tritime: tritime,
+        trpezium: trpezium,
+        Tscr: Tscr,
+        tscr: tscr,
+        TScy: TScy,
+        tscy: tscy,
+        TSHcy: TSHcy,
+        tshcy: tshcy,
+        Tstrok: Tstrok,
+        tstrok: tstrok,
+        twixt: twixt,
+        twoheadleftarrow: twoheadleftarrow,
+        twoheadrightarrow: twoheadrightarrow,
+        Uacute: Uacute,
+        uacute: uacute,
+        uarr: uarr,
+        Uarr: Uarr,
+        uArr: uArr,
+        Uarrocir: Uarrocir,
+        Ubrcy: Ubrcy,
+        ubrcy: ubrcy,
+        Ubreve: Ubreve,
+        ubreve: ubreve,
+        Ucirc: Ucirc,
+        ucirc: ucirc,
+        Ucy: Ucy,
+        ucy: ucy,
+        udarr: udarr,
+        Udblac: Udblac,
+        udblac: udblac,
+        udhar: udhar,
+        ufisht: ufisht,
+        Ufr: Ufr,
+        ufr: ufr,
+        Ugrave: Ugrave,
+        ugrave: ugrave,
+        uHar: uHar,
+        uharl: uharl,
+        uharr: uharr,
+        uhblk: uhblk,
+        ulcorn: ulcorn,
+        ulcorner: ulcorner,
+        ulcrop: ulcrop,
+        ultri: ultri,
+        Umacr: Umacr,
+        umacr: umacr,
+        uml: uml,
+        UnderBar: UnderBar,
+        UnderBrace: UnderBrace,
+        UnderBracket: UnderBracket,
+        UnderParenthesis: UnderParenthesis,
+        Union: Union,
+        UnionPlus: UnionPlus,
+        Uogon: Uogon,
+        uogon: uogon,
+        Uopf: Uopf,
+        uopf: uopf,
+        UpArrowBar: UpArrowBar,
+        uparrow: uparrow,
+        UpArrow: UpArrow,
+        Uparrow: Uparrow,
+        UpArrowDownArrow: UpArrowDownArrow,
+        updownarrow: updownarrow,
+        UpDownArrow: UpDownArrow,
+        Updownarrow: Updownarrow,
+        UpEquilibrium: UpEquilibrium,
+        upharpoonleft: upharpoonleft,
+        upharpoonright: upharpoonright,
+        uplus: uplus,
+        UpperLeftArrow: UpperLeftArrow,
+        UpperRightArrow: UpperRightArrow,
+        upsi: upsi,
+        Upsi: Upsi,
+        upsih: upsih,
+        Upsilon: Upsilon,
+        upsilon: upsilon,
+        UpTeeArrow: UpTeeArrow,
+        UpTee: UpTee,
+        upuparrows: upuparrows,
+        urcorn: urcorn,
+        urcorner: urcorner,
+        urcrop: urcrop,
+        Uring: Uring,
+        uring: uring,
+        urtri: urtri,
+        Uscr: Uscr,
+        uscr: uscr,
+        utdot: utdot,
+        Utilde: Utilde,
+        utilde: utilde,
+        utri: utri,
+        utrif: utrif,
+        uuarr: uuarr,
+        Uuml: Uuml,
+        uuml: uuml,
+        uwangle: uwangle,
+        vangrt: vangrt,
+        varepsilon: varepsilon,
+        varkappa: varkappa,
+        varnothing: varnothing,
+        varphi: varphi,
+        varpi: varpi,
+        varpropto: varpropto,
+        varr: varr,
+        vArr: vArr,
+        varrho: varrho,
+        varsigma: varsigma,
+        varsubsetneq: varsubsetneq,
+        varsubsetneqq: varsubsetneqq,
+        varsupsetneq: varsupsetneq,
+        varsupsetneqq: varsupsetneqq,
+        vartheta: vartheta,
+        vartriangleleft: vartriangleleft,
+        vartriangleright: vartriangleright,
+        vBar: vBar,
+        Vbar: Vbar,
+        vBarv: vBarv,
+        Vcy: Vcy,
+        vcy: vcy,
+        vdash: vdash,
+        vDash: vDash,
+        Vdash: Vdash,
+        VDash: VDash,
+        Vdashl: Vdashl,
+        veebar: veebar,
+        vee: vee,
+        Vee: Vee,
+        veeeq: veeeq,
+        vellip: vellip,
+        verbar: verbar,
+        Verbar: Verbar,
+        vert: vert,
+        Vert: Vert,
+        VerticalBar: VerticalBar,
+        VerticalLine: VerticalLine,
+        VerticalSeparator: VerticalSeparator,
+        VerticalTilde: VerticalTilde,
+        VeryThinSpace: VeryThinSpace,
+        Vfr: Vfr,
+        vfr: vfr,
+        vltri: vltri,
+        vnsub: vnsub,
+        vnsup: vnsup,
+        Vopf: Vopf,
+        vopf: vopf,
+        vprop: vprop,
+        vrtri: vrtri,
+        Vscr: Vscr,
+        vscr: vscr,
+        vsubnE: vsubnE,
+        vsubne: vsubne,
+        vsupnE: vsupnE,
+        vsupne: vsupne,
+        Vvdash: Vvdash,
+        vzigzag: vzigzag,
+        Wcirc: Wcirc,
+        wcirc: wcirc,
+        wedbar: wedbar,
+        wedge: wedge,
+        Wedge: Wedge,
+        wedgeq: wedgeq,
+        weierp: weierp,
+        Wfr: Wfr,
+        wfr: wfr,
+        Wopf: Wopf,
+        wopf: wopf,
+        wp: wp,
+        wr: wr,
+        wreath: wreath,
+        Wscr: Wscr,
+        wscr: wscr,
+        xcap: xcap,
+        xcirc: xcirc,
+        xcup: xcup,
+        xdtri: xdtri,
+        Xfr: Xfr,
+        xfr: xfr,
+        xharr: xharr,
+        xhArr: xhArr,
+        Xi: Xi,
+        xi: xi,
+        xlarr: xlarr,
+        xlArr: xlArr,
+        xmap: xmap,
+        xnis: xnis,
+        xodot: xodot,
+        Xopf: Xopf,
+        xopf: xopf,
+        xoplus: xoplus,
+        xotime: xotime,
+        xrarr: xrarr,
+        xrArr: xrArr,
+        Xscr: Xscr,
+        xscr: xscr,
+        xsqcup: xsqcup,
+        xuplus: xuplus,
+        xutri: xutri,
+        xvee: xvee,
+        xwedge: xwedge,
+        Yacute: Yacute,
+        yacute: yacute,
+        YAcy: YAcy,
+        yacy: yacy,
+        Ycirc: Ycirc,
+        ycirc: ycirc,
+        Ycy: Ycy,
+        ycy: ycy,
+        yen: yen,
+        Yfr: Yfr,
+        yfr: yfr,
+        YIcy: YIcy,
+        yicy: yicy,
+        Yopf: Yopf,
+        yopf: yopf,
+        Yscr: Yscr,
+        yscr: yscr,
+        YUcy: YUcy,
+        yucy: yucy,
+        yuml: yuml,
+        Yuml: Yuml,
+        Zacute: Zacute,
+        zacute: zacute,
+        Zcaron: Zcaron,
+        zcaron: zcaron,
+        Zcy: Zcy,
+        zcy: zcy,
+        Zdot: Zdot,
+        zdot: zdot,
+        zeetrf: zeetrf,
+        ZeroWidthSpace: ZeroWidthSpace,
+        Zeta: Zeta,
+        zeta: zeta,
+        zfr: zfr,
+        Zfr: Zfr,
+        ZHcy: ZHcy,
+        zhcy: zhcy,
+        zigrarr: zigrarr,
+        zopf: zopf,
+        Zopf: Zopf,
+        Zscr: Zscr,
+        zscr: zscr,
+        zwj: zwj,
+        zwnj: zwnj,
+        'default': entities
+    });
+
+    var require$$0 = getCjsExportFromNamespace(entities$1);
+
+    /*eslint quotes:0*/
+    var entities$2 = require$$0;
+
+    var regex=/[!-#%-\*,-\/:;\?@\[-\]_\{\}\xA1\xA7\xAB\xB6\xB7\xBB\xBF\u037E\u0387\u055A-\u055F\u0589\u058A\u05BE\u05C0\u05C3\u05C6\u05F3\u05F4\u0609\u060A\u060C\u060D\u061B\u061E\u061F\u066A-\u066D\u06D4\u0700-\u070D\u07F7-\u07F9\u0830-\u083E\u085E\u0964\u0965\u0970\u09FD\u0A76\u0AF0\u0C84\u0DF4\u0E4F\u0E5A\u0E5B\u0F04-\u0F12\u0F14\u0F3A-\u0F3D\u0F85\u0FD0-\u0FD4\u0FD9\u0FDA\u104A-\u104F\u10FB\u1360-\u1368\u1400\u166D\u166E\u169B\u169C\u16EB-\u16ED\u1735\u1736\u17D4-\u17D6\u17D8-\u17DA\u1800-\u180A\u1944\u1945\u1A1E\u1A1F\u1AA0-\u1AA6\u1AA8-\u1AAD\u1B5A-\u1B60\u1BFC-\u1BFF\u1C3B-\u1C3F\u1C7E\u1C7F\u1CC0-\u1CC7\u1CD3\u2010-\u2027\u2030-\u2043\u2045-\u2051\u2053-\u205E\u207D\u207E\u208D\u208E\u2308-\u230B\u2329\u232A\u2768-\u2775\u27C5\u27C6\u27E6-\u27EF\u2983-\u2998\u29D8-\u29DB\u29FC\u29FD\u2CF9-\u2CFC\u2CFE\u2CFF\u2D70\u2E00-\u2E2E\u2E30-\u2E4E\u3001-\u3003\u3008-\u3011\u3014-\u301F\u3030\u303D\u30A0\u30FB\uA4FE\uA4FF\uA60D-\uA60F\uA673\uA67E\uA6F2-\uA6F7\uA874-\uA877\uA8CE\uA8CF\uA8F8-\uA8FA\uA8FC\uA92E\uA92F\uA95F\uA9C1-\uA9CD\uA9DE\uA9DF\uAA5C-\uAA5F\uAADE\uAADF\uAAF0\uAAF1\uABEB\uFD3E\uFD3F\uFE10-\uFE19\uFE30-\uFE52\uFE54-\uFE61\uFE63\uFE68\uFE6A\uFE6B\uFF01-\uFF03\uFF05-\uFF0A\uFF0C-\uFF0F\uFF1A\uFF1B\uFF1F\uFF20\uFF3B-\uFF3D\uFF3F\uFF5B\uFF5D\uFF5F-\uFF65]|\uD800[\uDD00-\uDD02\uDF9F\uDFD0]|\uD801\uDD6F|\uD802[\uDC57\uDD1F\uDD3F\uDE50-\uDE58\uDE7F\uDEF0-\uDEF6\uDF39-\uDF3F\uDF99-\uDF9C]|\uD803[\uDF55-\uDF59]|\uD804[\uDC47-\uDC4D\uDCBB\uDCBC\uDCBE-\uDCC1\uDD40-\uDD43\uDD74\uDD75\uDDC5-\uDDC8\uDDCD\uDDDB\uDDDD-\uDDDF\uDE38-\uDE3D\uDEA9]|\uD805[\uDC4B-\uDC4F\uDC5B\uDC5D\uDCC6\uDDC1-\uDDD7\uDE41-\uDE43\uDE60-\uDE6C\uDF3C-\uDF3E]|\uD806[\uDC3B\uDE3F-\uDE46\uDE9A-\uDE9C\uDE9E-\uDEA2]|\uD807[\uDC41-\uDC45\uDC70\uDC71\uDEF7\uDEF8]|\uD809[\uDC70-\uDC74]|\uD81A[\uDE6E\uDE6F\uDEF5\uDF37-\uDF3B\uDF44]|\uD81B[\uDE97-\uDE9A]|\uD82F\uDC9F|\uD836[\uDE87-\uDE8B]|\uD83A[\uDD5E\uDD5F]/;
+
+    var encodeCache = {};
+
+
+    // Create a lookup array where anything but characters in `chars` string
+    // and alphanumeric chars is percent-encoded.
+    //
+    function getEncodeCache(exclude) {
+      var i, ch, cache = encodeCache[exclude];
+      if (cache) { return cache; }
+
+      cache = encodeCache[exclude] = [];
+
+      for (i = 0; i < 128; i++) {
+        ch = String.fromCharCode(i);
+
+        if (/^[0-9a-z]$/i.test(ch)) {
+          // always allow unencoded alphanumeric characters
+          cache.push(ch);
+        } else {
+          cache.push('%' + ('0' + i.toString(16).toUpperCase()).slice(-2));
+        }
+      }
+
+      for (i = 0; i < exclude.length; i++) {
+        cache[exclude.charCodeAt(i)] = exclude[i];
+      }
+
+      return cache;
+    }
+
+
+    // Encode unsafe characters with percent-encoding, skipping already
+    // encoded sequences.
+    //
+    //  - string       - string to encode
+    //  - exclude      - list of characters to ignore (in addition to a-zA-Z0-9)
+    //  - keepEscaped  - don't encode '%' in a correct escape sequence (default: true)
+    //
+    function encode(string, exclude, keepEscaped) {
+      var i, l, code, nextCode, cache,
+          result = '';
+
+      if (typeof exclude !== 'string') {
+        // encode(string, keepEscaped)
+        keepEscaped  = exclude;
+        exclude = encode.defaultChars;
+      }
+
+      if (typeof keepEscaped === 'undefined') {
+        keepEscaped = true;
+      }
+
+      cache = getEncodeCache(exclude);
+
+      for (i = 0, l = string.length; i < l; i++) {
+        code = string.charCodeAt(i);
+
+        if (keepEscaped && code === 0x25 /* % */ && i + 2 < l) {
+          if (/^[0-9a-f]{2}$/i.test(string.slice(i + 1, i + 3))) {
+            result += string.slice(i, i + 3);
+            i += 2;
+            continue;
+          }
+        }
+
+        if (code < 128) {
+          result += cache[code];
+          continue;
+        }
+
+        if (code >= 0xD800 && code <= 0xDFFF) {
+          if (code >= 0xD800 && code <= 0xDBFF && i + 1 < l) {
+            nextCode = string.charCodeAt(i + 1);
+            if (nextCode >= 0xDC00 && nextCode <= 0xDFFF) {
+              result += encodeURIComponent(string[i] + string[i + 1]);
+              i++;
+              continue;
+            }
+          }
+          result += '%EF%BF%BD';
+          continue;
+        }
+
+        result += encodeURIComponent(string[i]);
+      }
+
+      return result;
+    }
+
+    encode.defaultChars   = ";/?:@&=+$,-_.!~*'()#";
+    encode.componentChars = "-_.!~*'()";
+
+
+    var encode_1 = encode;
+
+    /* eslint-disable no-bitwise */
+
+    var decodeCache = {};
+
+    function getDecodeCache(exclude) {
+      var i, ch, cache = decodeCache[exclude];
+      if (cache) { return cache; }
+
+      cache = decodeCache[exclude] = [];
+
+      for (i = 0; i < 128; i++) {
+        ch = String.fromCharCode(i);
+        cache.push(ch);
+      }
+
+      for (i = 0; i < exclude.length; i++) {
+        ch = exclude.charCodeAt(i);
+        cache[ch] = '%' + ('0' + ch.toString(16).toUpperCase()).slice(-2);
+      }
+
+      return cache;
+    }
+
+
+    // Decode percent-encoded string.
+    //
+    function decode(string, exclude) {
+      var cache;
+
+      if (typeof exclude !== 'string') {
+        exclude = decode.defaultChars;
+      }
+
+      cache = getDecodeCache(exclude);
+
+      return string.replace(/(%[a-f0-9]{2})+/gi, function(seq) {
+        var i, l, b1, b2, b3, b4, chr,
+            result = '';
+
+        for (i = 0, l = seq.length; i < l; i += 3) {
+          b1 = parseInt(seq.slice(i + 1, i + 3), 16);
+
+          if (b1 < 0x80) {
+            result += cache[b1];
+            continue;
+          }
+
+          if ((b1 & 0xE0) === 0xC0 && (i + 3 < l)) {
+            // 110xxxxx 10xxxxxx
+            b2 = parseInt(seq.slice(i + 4, i + 6), 16);
+
+            if ((b2 & 0xC0) === 0x80) {
+              chr = ((b1 << 6) & 0x7C0) | (b2 & 0x3F);
+
+              if (chr < 0x80) {
+                result += '\ufffd\ufffd';
+              } else {
+                result += String.fromCharCode(chr);
+              }
+
+              i += 3;
+              continue;
+            }
+          }
+
+          if ((b1 & 0xF0) === 0xE0 && (i + 6 < l)) {
+            // 1110xxxx 10xxxxxx 10xxxxxx
+            b2 = parseInt(seq.slice(i + 4, i + 6), 16);
+            b3 = parseInt(seq.slice(i + 7, i + 9), 16);
+
+            if ((b2 & 0xC0) === 0x80 && (b3 & 0xC0) === 0x80) {
+              chr = ((b1 << 12) & 0xF000) | ((b2 << 6) & 0xFC0) | (b3 & 0x3F);
+
+              if (chr < 0x800 || (chr >= 0xD800 && chr <= 0xDFFF)) {
+                result += '\ufffd\ufffd\ufffd';
+              } else {
+                result += String.fromCharCode(chr);
+              }
+
+              i += 6;
+              continue;
+            }
+          }
+
+          if ((b1 & 0xF8) === 0xF0 && (i + 9 < l)) {
+            // 111110xx 10xxxxxx 10xxxxxx 10xxxxxx
+            b2 = parseInt(seq.slice(i + 4, i + 6), 16);
+            b3 = parseInt(seq.slice(i + 7, i + 9), 16);
+            b4 = parseInt(seq.slice(i + 10, i + 12), 16);
+
+            if ((b2 & 0xC0) === 0x80 && (b3 & 0xC0) === 0x80 && (b4 & 0xC0) === 0x80) {
+              chr = ((b1 << 18) & 0x1C0000) | ((b2 << 12) & 0x3F000) | ((b3 << 6) & 0xFC0) | (b4 & 0x3F);
+
+              if (chr < 0x10000 || chr > 0x10FFFF) {
+                result += '\ufffd\ufffd\ufffd\ufffd';
+              } else {
+                chr -= 0x10000;
+                result += String.fromCharCode(0xD800 + (chr >> 10), 0xDC00 + (chr & 0x3FF));
+              }
+
+              i += 9;
+              continue;
+            }
+          }
+
+          result += '\ufffd';
+        }
+
+        return result;
+      });
+    }
+
+
+    decode.defaultChars   = ';/?:@&=+$,#';
+    decode.componentChars = '';
+
+
+    var decode_1 = decode;
+
+    var format = function format(url) {
+      var result = '';
+
+      result += url.protocol || '';
+      result += url.slashes ? '//' : '';
+      result += url.auth ? url.auth + '@' : '';
+
+      if (url.hostname && url.hostname.indexOf(':') !== -1) {
+        // ipv6 address
+        result += '[' + url.hostname + ']';
+      } else {
+        result += url.hostname || '';
+      }
+
+      result += url.port ? ':' + url.port : '';
+      result += url.pathname || '';
+      result += url.search || '';
+      result += url.hash || '';
+
+      return result;
+    };
+
+    // Copyright Joyent, Inc. and other Node contributors.
+
+    //
+    // Changes from joyent/node:
+    //
+    // 1. No leading slash in paths,
+    //    e.g. in `url.parse('http://foo?bar')` pathname is ``, not `/`
+    //
+    // 2. Backslashes are not replaced with slashes,
+    //    so `http:\\example.org\` is treated like a relative path
+    //
+    // 3. Trailing colon is treated like a part of the path,
+    //    i.e. in `http://example.org:foo` pathname is `:foo`
+    //
+    // 4. Nothing is URL-encoded in the resulting object,
+    //    (in joyent/node some chars in auth and paths are encoded)
+    //
+    // 5. `url.parse()` does not have `parseQueryString` argument
+    //
+    // 6. Removed extraneous result properties: `host`, `path`, `query`, etc.,
+    //    which can be constructed using other parts of the url.
+    //
+
+
+    function Url() {
+      this.protocol = null;
+      this.slashes = null;
+      this.auth = null;
+      this.port = null;
+      this.hostname = null;
+      this.hash = null;
+      this.search = null;
+      this.pathname = null;
+    }
+
+    // Reference: RFC 3986, RFC 1808, RFC 2396
+
+    // define these here so at least they only have to be
+    // compiled once on the first module load.
+    var protocolPattern = /^([a-z0-9.+-]+:)/i,
+        portPattern = /:[0-9]*$/,
+
+        // Special case for a simple path URL
+        simplePathPattern = /^(\/\/?(?!\/)[^\?\s]*)(\?[^\s]*)?$/,
+
+        // RFC 2396: characters reserved for delimiting URLs.
+        // We actually just auto-escape these.
+        delims = [ '<', '>', '"', '`', ' ', '\r', '\n', '\t' ],
+
+        // RFC 2396: characters not allowed for various reasons.
+        unwise = [ '{', '}', '|', '\\', '^', '`' ].concat(delims),
+
+        // Allowed by RFCs, but cause of XSS attacks.  Always escape these.
+        autoEscape = [ '\'' ].concat(unwise),
+        // Characters that are never ever allowed in a hostname.
+        // Note that any invalid chars are also handled, but these
+        // are the ones that are *expected* to be seen, so we fast-path
+        // them.
+        nonHostChars = [ '%', '/', '?', ';', '#' ].concat(autoEscape),
+        hostEndingChars = [ '/', '?', '#' ],
+        hostnameMaxLen = 255,
+        hostnamePartPattern = /^[+a-z0-9A-Z_-]{0,63}$/,
+        hostnamePartStart = /^([+a-z0-9A-Z_-]{0,63})(.*)$/,
+        // protocols that can allow "unsafe" and "unwise" chars.
+        /* eslint-disable no-script-url */
+        // protocols that never have a hostname.
+        hostlessProtocol = {
+          'javascript': true,
+          'javascript:': true
+        },
+        // protocols that always contain a // bit.
+        slashedProtocol = {
+          'http': true,
+          'https': true,
+          'ftp': true,
+          'gopher': true,
+          'file': true,
+          'http:': true,
+          'https:': true,
+          'ftp:': true,
+          'gopher:': true,
+          'file:': true
+        };
+        /* eslint-enable no-script-url */
+
+    function urlParse(url, slashesDenoteHost) {
+      if (url && url instanceof Url) { return url; }
+
+      var u = new Url();
+      u.parse(url, slashesDenoteHost);
+      return u;
+    }
+
+    Url.prototype.parse = function(url, slashesDenoteHost) {
+      var i, l, lowerProto, hec, slashes,
+          rest = url;
+
+      // trim before proceeding.
+      // This is to support parse stuff like "  http://foo.com  \n"
+      rest = rest.trim();
+
+      if (!slashesDenoteHost && url.split('#').length === 1) {
+        // Try fast path regexp
+        var simplePath = simplePathPattern.exec(rest);
+        if (simplePath) {
+          this.pathname = simplePath[1];
+          if (simplePath[2]) {
+            this.search = simplePath[2];
+          }
+          return this;
+        }
+      }
+
+      var proto = protocolPattern.exec(rest);
+      if (proto) {
+        proto = proto[0];
+        lowerProto = proto.toLowerCase();
+        this.protocol = proto;
+        rest = rest.substr(proto.length);
+      }
+
+      // figure out if it's got a host
+      // user@server is *always* interpreted as a hostname, and url
+      // resolution will treat //foo/bar as host=foo,path=bar because that's
+      // how the browser resolves relative URLs.
+      if (slashesDenoteHost || proto || rest.match(/^\/\/[^@\/]+@[^@\/]+/)) {
+        slashes = rest.substr(0, 2) === '//';
+        if (slashes && !(proto && hostlessProtocol[proto])) {
+          rest = rest.substr(2);
+          this.slashes = true;
+        }
+      }
+
+      if (!hostlessProtocol[proto] &&
+          (slashes || (proto && !slashedProtocol[proto]))) {
+
+        // there's a hostname.
+        // the first instance of /, ?, ;, or # ends the host.
+        //
+        // If there is an @ in the hostname, then non-host chars *are* allowed
+        // to the left of the last @ sign, unless some host-ending character
+        // comes *before* the @-sign.
+        // URLs are obnoxious.
+        //
+        // ex:
+        // http://a@b@c/ => user:a@b host:c
+        // http://a@b?@c => user:a host:c path:/?@c
+
+        // v0.12 TODO(isaacs): This is not quite how Chrome does things.
+        // Review our test case against browsers more comprehensively.
+
+        // find the first instance of any hostEndingChars
+        var hostEnd = -1;
+        for (i = 0; i < hostEndingChars.length; i++) {
+          hec = rest.indexOf(hostEndingChars[i]);
+          if (hec !== -1 && (hostEnd === -1 || hec < hostEnd)) {
+            hostEnd = hec;
+          }
+        }
+
+        // at this point, either we have an explicit point where the
+        // auth portion cannot go past, or the last @ char is the decider.
+        var auth, atSign;
+        if (hostEnd === -1) {
+          // atSign can be anywhere.
+          atSign = rest.lastIndexOf('@');
+        } else {
+          // atSign must be in auth portion.
+          // http://a@b/c@d => host:b auth:a path:/c@d
+          atSign = rest.lastIndexOf('@', hostEnd);
+        }
+
+        // Now we have a portion which is definitely the auth.
+        // Pull that off.
+        if (atSign !== -1) {
+          auth = rest.slice(0, atSign);
+          rest = rest.slice(atSign + 1);
+          this.auth = auth;
+        }
+
+        // the host is the remaining to the left of the first non-host char
+        hostEnd = -1;
+        for (i = 0; i < nonHostChars.length; i++) {
+          hec = rest.indexOf(nonHostChars[i]);
+          if (hec !== -1 && (hostEnd === -1 || hec < hostEnd)) {
+            hostEnd = hec;
+          }
+        }
+        // if we still have not hit it, then the entire thing is a host.
+        if (hostEnd === -1) {
+          hostEnd = rest.length;
+        }
+
+        if (rest[hostEnd - 1] === ':') { hostEnd--; }
+        var host = rest.slice(0, hostEnd);
+        rest = rest.slice(hostEnd);
+
+        // pull out port.
+        this.parseHost(host);
+
+        // we've indicated that there is a hostname,
+        // so even if it's empty, it has to be present.
+        this.hostname = this.hostname || '';
+
+        // if hostname begins with [ and ends with ]
+        // assume that it's an IPv6 address.
+        var ipv6Hostname = this.hostname[0] === '[' &&
+            this.hostname[this.hostname.length - 1] === ']';
+
+        // validate a little.
+        if (!ipv6Hostname) {
+          var hostparts = this.hostname.split(/\./);
+          for (i = 0, l = hostparts.length; i < l; i++) {
+            var part = hostparts[i];
+            if (!part) { continue; }
+            if (!part.match(hostnamePartPattern)) {
+              var newpart = '';
+              for (var j = 0, k = part.length; j < k; j++) {
+                if (part.charCodeAt(j) > 127) {
+                  // we replace non-ASCII char with a temporary placeholder
+                  // we need this to make sure size of hostname is not
+                  // broken by replacing non-ASCII by nothing
+                  newpart += 'x';
+                } else {
+                  newpart += part[j];
+                }
+              }
+              // we test again with ASCII char only
+              if (!newpart.match(hostnamePartPattern)) {
+                var validParts = hostparts.slice(0, i);
+                var notHost = hostparts.slice(i + 1);
+                var bit = part.match(hostnamePartStart);
+                if (bit) {
+                  validParts.push(bit[1]);
+                  notHost.unshift(bit[2]);
+                }
+                if (notHost.length) {
+                  rest = notHost.join('.') + rest;
+                }
+                this.hostname = validParts.join('.');
+                break;
+              }
+            }
+          }
+        }
+
+        if (this.hostname.length > hostnameMaxLen) {
+          this.hostname = '';
+        }
+
+        // strip [ and ] from the hostname
+        // the host field still retains them, though
+        if (ipv6Hostname) {
+          this.hostname = this.hostname.substr(1, this.hostname.length - 2);
+        }
+      }
+
+      // chop off from the tail first.
+      var hash = rest.indexOf('#');
+      if (hash !== -1) {
+        // got a fragment string.
+        this.hash = rest.substr(hash);
+        rest = rest.slice(0, hash);
+      }
+      var qm = rest.indexOf('?');
+      if (qm !== -1) {
+        this.search = rest.substr(qm);
+        rest = rest.slice(0, qm);
+      }
+      if (rest) { this.pathname = rest; }
+      if (slashedProtocol[lowerProto] &&
+          this.hostname && !this.pathname) {
+        this.pathname = '';
+      }
+
+      return this;
+    };
+
+    Url.prototype.parseHost = function(host) {
+      var port = portPattern.exec(host);
+      if (port) {
+        port = port[0];
+        if (port !== ':') {
+          this.port = port.substr(1);
+        }
+        host = host.substr(0, host.length - port.length);
+      }
+      if (host) { this.hostname = host; }
+    };
+
+    var parse = urlParse;
+
+    var encode$1 = encode_1;
+    var decode$1 = decode_1;
+    var format$1 = format;
+    var parse$1  = parse;
+
+    var mdurl = {
+    	encode: encode$1,
+    	decode: decode$1,
+    	format: format$1,
+    	parse: parse$1
+    };
+
+    var regex$1=/[\0-\uD7FF\uE000-\uFFFF]|[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:[^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/;
+
+    var regex$2=/[\0-\x1F\x7F-\x9F]/;
+
+    var regex$3=/[\xAD\u0600-\u0605\u061C\u06DD\u070F\u08E2\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\uFEFF\uFFF9-\uFFFB]|\uD804[\uDCBD\uDCCD]|\uD82F[\uDCA0-\uDCA3]|\uD834[\uDD73-\uDD7A]|\uDB40[\uDC01\uDC20-\uDC7F]/;
+
+    var regex$4=/[ \xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/;
+
+    var Any = regex$1;
+    var Cc  = regex$2;
+    var Cf  = regex$3;
+    var P   = regex;
+    var Z   = regex$4;
+
+    var uc_micro = {
+    	Any: Any,
+    	Cc: Cc,
+    	Cf: Cf,
+    	P: P,
+    	Z: Z
+    };
+
+    var utils = createCommonjsModule(function (module, exports) {
+
+
+    function _class(obj) { return Object.prototype.toString.call(obj); }
+
+    function isString(obj) { return _class(obj) === '[object String]'; }
+
+    var _hasOwnProperty = Object.prototype.hasOwnProperty;
+
+    function has(object, key) {
+      return _hasOwnProperty.call(object, key);
+    }
+
+    // Merge objects
+    //
+    function assign(obj /*from1, from2, from3, ...*/) {
+      var sources = Array.prototype.slice.call(arguments, 1);
+
+      sources.forEach(function (source) {
+        if (!source) { return; }
+
+        if (typeof source !== 'object') {
+          throw new TypeError(source + 'must be object');
+        }
+
+        Object.keys(source).forEach(function (key) {
+          obj[key] = source[key];
+        });
+      });
+
+      return obj;
+    }
+
+    // Remove element from array and put another array at those position.
+    // Useful for some operations with tokens
+    function arrayReplaceAt(src, pos, newElements) {
+      return [].concat(src.slice(0, pos), newElements, src.slice(pos + 1));
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////
+
+    function isValidEntityCode(c) {
+      /*eslint no-bitwise:0*/
+      // broken sequence
+      if (c >= 0xD800 && c <= 0xDFFF) { return false; }
+      // never used
+      if (c >= 0xFDD0 && c <= 0xFDEF) { return false; }
+      if ((c & 0xFFFF) === 0xFFFF || (c & 0xFFFF) === 0xFFFE) { return false; }
+      // control codes
+      if (c >= 0x00 && c <= 0x08) { return false; }
+      if (c === 0x0B) { return false; }
+      if (c >= 0x0E && c <= 0x1F) { return false; }
+      if (c >= 0x7F && c <= 0x9F) { return false; }
+      // out of range
+      if (c > 0x10FFFF) { return false; }
+      return true;
+    }
+
+    function fromCodePoint(c) {
+      /*eslint no-bitwise:0*/
+      if (c > 0xffff) {
+        c -= 0x10000;
+        var surrogate1 = 0xd800 + (c >> 10),
+            surrogate2 = 0xdc00 + (c & 0x3ff);
+
+        return String.fromCharCode(surrogate1, surrogate2);
+      }
+      return String.fromCharCode(c);
+    }
+
+
+    var UNESCAPE_MD_RE  = /\\([!"#$%&'()*+,\-.\/:;<=>?@[\\\]^_`{|}~])/g;
+    var ENTITY_RE       = /&([a-z#][a-z0-9]{1,31});/gi;
+    var UNESCAPE_ALL_RE = new RegExp(UNESCAPE_MD_RE.source + '|' + ENTITY_RE.source, 'gi');
+
+    var DIGITAL_ENTITY_TEST_RE = /^#((?:x[a-f0-9]{1,8}|[0-9]{1,8}))/i;
+
+
+
+    function replaceEntityPattern(match, name) {
+      var code = 0;
+
+      if (has(entities$2, name)) {
+        return entities$2[name];
+      }
+
+      if (name.charCodeAt(0) === 0x23/* # */ && DIGITAL_ENTITY_TEST_RE.test(name)) {
+        code = name[1].toLowerCase() === 'x' ?
+          parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10);
+
+        if (isValidEntityCode(code)) {
+          return fromCodePoint(code);
+        }
+      }
+
+      return match;
+    }
+
+    /*function replaceEntities(str) {
+      if (str.indexOf('&') < 0) { return str; }
+
+      return str.replace(ENTITY_RE, replaceEntityPattern);
+    }*/
+
+    function unescapeMd(str) {
+      if (str.indexOf('\\') < 0) { return str; }
+      return str.replace(UNESCAPE_MD_RE, '$1');
+    }
+
+    function unescapeAll(str) {
+      if (str.indexOf('\\') < 0 && str.indexOf('&') < 0) { return str; }
+
+      return str.replace(UNESCAPE_ALL_RE, function (match, escaped, entity) {
+        if (escaped) { return escaped; }
+        return replaceEntityPattern(match, entity);
+      });
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////
+
+    var HTML_ESCAPE_TEST_RE = /[&<>"]/;
+    var HTML_ESCAPE_REPLACE_RE = /[&<>"]/g;
+    var HTML_REPLACEMENTS = {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;'
+    };
+
+    function replaceUnsafeChar(ch) {
+      return HTML_REPLACEMENTS[ch];
+    }
+
+    function escapeHtml(str) {
+      if (HTML_ESCAPE_TEST_RE.test(str)) {
+        return str.replace(HTML_ESCAPE_REPLACE_RE, replaceUnsafeChar);
+      }
+      return str;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////
+
+    var REGEXP_ESCAPE_RE = /[.?*+^$[\]\\(){}|-]/g;
+
+    function escapeRE(str) {
+      return str.replace(REGEXP_ESCAPE_RE, '\\$&');
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////
+
+    function isSpace(code) {
+      switch (code) {
+        case 0x09:
+        case 0x20:
+          return true;
+      }
+      return false;
+    }
+
+    // Zs (unicode class) || [\t\f\v\r\n]
+    function isWhiteSpace(code) {
+      if (code >= 0x2000 && code <= 0x200A) { return true; }
+      switch (code) {
+        case 0x09: // \t
+        case 0x0A: // \n
+        case 0x0B: // \v
+        case 0x0C: // \f
+        case 0x0D: // \r
+        case 0x20:
+        case 0xA0:
+        case 0x1680:
+        case 0x202F:
+        case 0x205F:
+        case 0x3000:
+          return true;
+      }
+      return false;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////
+
+    /*eslint-disable max-len*/
+
+
+    // Currently without astral characters support.
+    function isPunctChar(ch) {
+      return regex.test(ch);
+    }
+
+
+    // Markdown ASCII punctuation characters.
+    //
+    // !, ", #, $, %, &, ', (, ), *, +, ,, -, ., /, :, ;, <, =, >, ?, @, [, \, ], ^, _, `, {, |, }, or ~
+    // http://spec.commonmark.org/0.15/#ascii-punctuation-character
+    //
+    // Don't confuse with unicode punctuation !!! It lacks some chars in ascii range.
+    //
+    function isMdAsciiPunct(ch) {
+      switch (ch) {
+        case 0x21/* ! */:
+        case 0x22/* " */:
+        case 0x23/* # */:
+        case 0x24/* $ */:
+        case 0x25/* % */:
+        case 0x26/* & */:
+        case 0x27/* ' */:
+        case 0x28/* ( */:
+        case 0x29/* ) */:
+        case 0x2A/* * */:
+        case 0x2B/* + */:
+        case 0x2C/* , */:
+        case 0x2D/* - */:
+        case 0x2E/* . */:
+        case 0x2F/* / */:
+        case 0x3A/* : */:
+        case 0x3B/* ; */:
+        case 0x3C/* < */:
+        case 0x3D/* = */:
+        case 0x3E/* > */:
+        case 0x3F/* ? */:
+        case 0x40/* @ */:
+        case 0x5B/* [ */:
+        case 0x5C/* \ */:
+        case 0x5D/* ] */:
+        case 0x5E/* ^ */:
+        case 0x5F/* _ */:
+        case 0x60/* ` */:
+        case 0x7B/* { */:
+        case 0x7C/* | */:
+        case 0x7D/* } */:
+        case 0x7E/* ~ */:
+          return true;
+        default:
+          return false;
+      }
+    }
+
+    // Hepler to unify [reference labels].
+    //
+    function normalizeReference(str) {
+      // Trim and collapse whitespace
+      //
+      str = str.trim().replace(/\s+/g, ' ');
+
+      // In node v10 'ẞ'.toLowerCase() === 'Ṿ', which is presumed to be a bug
+      // fixed in v12 (couldn't find any details).
+      //
+      // So treat this one as a special case
+      // (remove this when node v10 is no longer supported).
+      //
+      if ('ẞ'.toLowerCase() === 'Ṿ') {
+        str = str.replace(/ẞ/g, 'ß');
+      }
+
+      // .toLowerCase().toUpperCase() should get rid of all differences
+      // between letter variants.
+      //
+      // Simple .toLowerCase() doesn't normalize 125 code points correctly,
+      // and .toUpperCase doesn't normalize 6 of them (list of exceptions:
+      // İ, ϴ, ẞ, Ω, K, Å - those are already uppercased, but have differently
+      // uppercased versions).
+      //
+      // Here's an example showing how it happens. Lets take greek letter omega:
+      // uppercase U+0398 (Θ), U+03f4 (ϴ) and lowercase U+03b8 (θ), U+03d1 (ϑ)
+      //
+      // Unicode entries:
+      // 0398;GREEK CAPITAL LETTER THETA;Lu;0;L;;;;;N;;;;03B8;
+      // 03B8;GREEK SMALL LETTER THETA;Ll;0;L;;;;;N;;;0398;;0398
+      // 03D1;GREEK THETA SYMBOL;Ll;0;L;<compat> 03B8;;;;N;GREEK SMALL LETTER SCRIPT THETA;;0398;;0398
+      // 03F4;GREEK CAPITAL THETA SYMBOL;Lu;0;L;<compat> 0398;;;;N;;;;03B8;
+      //
+      // Case-insensitive comparison should treat all of them as equivalent.
+      //
+      // But .toLowerCase() doesn't change ϑ (it's already lowercase),
+      // and .toUpperCase() doesn't change ϴ (already uppercase).
+      //
+      // Applying first lower then upper case normalizes any character:
+      // '\u0398\u03f4\u03b8\u03d1'.toLowerCase().toUpperCase() === '\u0398\u0398\u0398\u0398'
+      //
+      // Note: this is equivalent to unicode case folding; unicode normalization
+      // is a different step that is not required here.
+      //
+      // Final result should be uppercased, because it's later stored in an object
+      // (this avoid a conflict with Object.prototype members,
+      // most notably, `__proto__`)
+      //
+      return str.toLowerCase().toUpperCase();
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////
+
+    // Re-export libraries commonly used in both markdown-it and its plugins,
+    // so plugins won't have to depend on them explicitly, which reduces their
+    // bundled size (e.g. a browser build).
+    //
+    exports.lib                 = {};
+    exports.lib.mdurl           = mdurl;
+    exports.lib.ucmicro         = uc_micro;
+
+    exports.assign              = assign;
+    exports.isString            = isString;
+    exports.has                 = has;
+    exports.unescapeMd          = unescapeMd;
+    exports.unescapeAll         = unescapeAll;
+    exports.isValidEntityCode   = isValidEntityCode;
+    exports.fromCodePoint       = fromCodePoint;
+    // exports.replaceEntities     = replaceEntities;
+    exports.escapeHtml          = escapeHtml;
+    exports.arrayReplaceAt      = arrayReplaceAt;
+    exports.isSpace             = isSpace;
+    exports.isWhiteSpace        = isWhiteSpace;
+    exports.isMdAsciiPunct      = isMdAsciiPunct;
+    exports.isPunctChar         = isPunctChar;
+    exports.escapeRE            = escapeRE;
+    exports.normalizeReference  = normalizeReference;
+    });
+    var utils_1 = utils.lib;
+    var utils_2 = utils.assign;
+    var utils_3 = utils.isString;
+    var utils_4 = utils.has;
+    var utils_5 = utils.unescapeMd;
+    var utils_6 = utils.unescapeAll;
+    var utils_7 = utils.isValidEntityCode;
+    var utils_8 = utils.fromCodePoint;
+    var utils_9 = utils.escapeHtml;
+    var utils_10 = utils.arrayReplaceAt;
+    var utils_11 = utils.isSpace;
+    var utils_12 = utils.isWhiteSpace;
+    var utils_13 = utils.isMdAsciiPunct;
+    var utils_14 = utils.isPunctChar;
+    var utils_15 = utils.escapeRE;
+    var utils_16 = utils.normalizeReference;
+
+    // Parse link label
+
+    var parse_link_label = function parseLinkLabel(state, start, disableNested) {
+      var level, found, marker, prevPos,
+          labelEnd = -1,
+          max = state.posMax,
+          oldPos = state.pos;
+
+      state.pos = start + 1;
+      level = 1;
+
+      while (state.pos < max) {
+        marker = state.src.charCodeAt(state.pos);
+        if (marker === 0x5D /* ] */) {
+          level--;
+          if (level === 0) {
+            found = true;
+            break;
+          }
+        }
+
+        prevPos = state.pos;
+        state.md.inline.skipToken(state);
+        if (marker === 0x5B /* [ */) {
+          if (prevPos === state.pos - 1) {
+            // increase level if we find text `[`, which is not a part of any token
+            level++;
+          } else if (disableNested) {
+            state.pos = oldPos;
+            return -1;
+          }
+        }
+      }
+
+      if (found) {
+        labelEnd = state.pos;
+      }
+
+      // restore old state
+      state.pos = oldPos;
+
+      return labelEnd;
+    };
+
+    var unescapeAll = utils.unescapeAll;
+
+
+    var parse_link_destination = function parseLinkDestination(str, pos, max) {
+      var code, level,
+          lines = 0,
+          start = pos,
+          result = {
+            ok: false,
+            pos: 0,
+            lines: 0,
+            str: ''
+          };
+
+      if (str.charCodeAt(pos) === 0x3C /* < */) {
+        pos++;
+        while (pos < max) {
+          code = str.charCodeAt(pos);
+          if (code === 0x0A /* \n */) { return result; }
+          if (code === 0x3E /* > */) {
+            result.pos = pos + 1;
+            result.str = unescapeAll(str.slice(start + 1, pos));
+            result.ok = true;
+            return result;
+          }
+          if (code === 0x5C /* \ */ && pos + 1 < max) {
+            pos += 2;
+            continue;
+          }
+
+          pos++;
+        }
+
+        // no closing '>'
+        return result;
+      }
+
+      // this should be ... } else { ... branch
+
+      level = 0;
+      while (pos < max) {
+        code = str.charCodeAt(pos);
+
+        if (code === 0x20) { break; }
+
+        // ascii control characters
+        if (code < 0x20 || code === 0x7F) { break; }
+
+        if (code === 0x5C /* \ */ && pos + 1 < max) {
+          pos += 2;
+          continue;
+        }
+
+        if (code === 0x28 /* ( */) {
+          level++;
+        }
+
+        if (code === 0x29 /* ) */) {
+          if (level === 0) { break; }
+          level--;
+        }
+
+        pos++;
+      }
+
+      if (start === pos) { return result; }
+      if (level !== 0) { return result; }
+
+      result.str = unescapeAll(str.slice(start, pos));
+      result.lines = lines;
+      result.pos = pos;
+      result.ok = true;
+      return result;
+    };
+
+    var unescapeAll$1 = utils.unescapeAll;
+
+
+    var parse_link_title = function parseLinkTitle(str, pos, max) {
+      var code,
+          marker,
+          lines = 0,
+          start = pos,
+          result = {
+            ok: false,
+            pos: 0,
+            lines: 0,
+            str: ''
+          };
+
+      if (pos >= max) { return result; }
+
+      marker = str.charCodeAt(pos);
+
+      if (marker !== 0x22 /* " */ && marker !== 0x27 /* ' */ && marker !== 0x28 /* ( */) { return result; }
+
+      pos++;
+
+      // if opening marker is "(", switch it to closing marker ")"
+      if (marker === 0x28) { marker = 0x29; }
+
+      while (pos < max) {
+        code = str.charCodeAt(pos);
+        if (code === marker) {
+          result.pos = pos + 1;
+          result.lines = lines;
+          result.str = unescapeAll$1(str.slice(start + 1, pos));
+          result.ok = true;
+          return result;
+        } else if (code === 0x0A) {
+          lines++;
+        } else if (code === 0x5C /* \ */ && pos + 1 < max) {
+          pos++;
+          if (str.charCodeAt(pos) === 0x0A) {
+            lines++;
+          }
+        }
+
+        pos++;
+      }
+
+      return result;
+    };
+
+    var parseLinkLabel       = parse_link_label;
+    var parseLinkDestination = parse_link_destination;
+    var parseLinkTitle       = parse_link_title;
+
+    var helpers = {
+    	parseLinkLabel: parseLinkLabel,
+    	parseLinkDestination: parseLinkDestination,
+    	parseLinkTitle: parseLinkTitle
+    };
+
+    var assign          = utils.assign;
+    var unescapeAll$2     = utils.unescapeAll;
+    var escapeHtml      = utils.escapeHtml;
+
+
+    ////////////////////////////////////////////////////////////////////////////////
+
+    var default_rules = {};
+
+
+    default_rules.code_inline = function (tokens, idx, options, env, slf) {
+      var token = tokens[idx];
+
+      return  '<code' + slf.renderAttrs(token) + '>' +
+              escapeHtml(tokens[idx].content) +
+              '</code>';
+    };
+
+
+    default_rules.code_block = function (tokens, idx, options, env, slf) {
+      var token = tokens[idx];
+
+      return  '<pre' + slf.renderAttrs(token) + '><code>' +
+              escapeHtml(tokens[idx].content) +
+              '</code></pre>\n';
+    };
+
+
+    default_rules.fence = function (tokens, idx, options, env, slf) {
+      var token = tokens[idx],
+          info = token.info ? unescapeAll$2(token.info).trim() : '',
+          langName = '',
+          highlighted, i, tmpAttrs, tmpToken;
+
+      if (info) {
+        langName = info.split(/\s+/g)[0];
+      }
+
+      if (options.highlight) {
+        highlighted = options.highlight(token.content, langName) || escapeHtml(token.content);
+      } else {
+        highlighted = escapeHtml(token.content);
+      }
+
+      if (highlighted.indexOf('<pre') === 0) {
+        return highlighted + '\n';
+      }
+
+      // If language exists, inject class gently, without modifying original token.
+      // May be, one day we will add .clone() for token and simplify this part, but
+      // now we prefer to keep things local.
+      if (info) {
+        i        = token.attrIndex('class');
+        tmpAttrs = token.attrs ? token.attrs.slice() : [];
+
+        if (i < 0) {
+          tmpAttrs.push([ 'class', options.langPrefix + langName ]);
+        } else {
+          tmpAttrs[i][1] += ' ' + options.langPrefix + langName;
+        }
+
+        // Fake token just to render attributes
+        tmpToken = {
+          attrs: tmpAttrs
+        };
+
+        return  '<pre><code' + slf.renderAttrs(tmpToken) + '>'
+              + highlighted
+              + '</code></pre>\n';
+      }
+
+
+      return  '<pre><code' + slf.renderAttrs(token) + '>'
+            + highlighted
+            + '</code></pre>\n';
+    };
+
+
+    default_rules.image = function (tokens, idx, options, env, slf) {
+      var token = tokens[idx];
+
+      // "alt" attr MUST be set, even if empty. Because it's mandatory and
+      // should be placed on proper position for tests.
+      //
+      // Replace content with actual value
+
+      token.attrs[token.attrIndex('alt')][1] =
+        slf.renderInlineAsText(token.children, options, env);
+
+      return slf.renderToken(tokens, idx, options);
+    };
+
+
+    default_rules.hardbreak = function (tokens, idx, options /*, env */) {
+      return options.xhtmlOut ? '<br />\n' : '<br>\n';
+    };
+    default_rules.softbreak = function (tokens, idx, options /*, env */) {
+      return options.breaks ? (options.xhtmlOut ? '<br />\n' : '<br>\n') : '\n';
+    };
+
+
+    default_rules.text = function (tokens, idx /*, options, env */) {
+      return escapeHtml(tokens[idx].content);
+    };
+
+
+    default_rules.html_block = function (tokens, idx /*, options, env */) {
+      return tokens[idx].content;
+    };
+    default_rules.html_inline = function (tokens, idx /*, options, env */) {
+      return tokens[idx].content;
+    };
+
+
+    /**
+     * new Renderer()
+     *
+     * Creates new [[Renderer]] instance and fill [[Renderer#rules]] with defaults.
+     **/
+    function Renderer() {
+
+      /**
+       * Renderer#rules -> Object
+       *
+       * Contains render rules for tokens. Can be updated and extended.
+       *
+       * ##### Example
+       *
+       * ```javascript
+       * var md = require('markdown-it')();
+       *
+       * md.renderer.rules.strong_open  = function () { return '<b>'; };
+       * md.renderer.rules.strong_close = function () { return '</b>'; };
+       *
+       * var result = md.renderInline(...);
+       * ```
+       *
+       * Each rule is called as independent static function with fixed signature:
+       *
+       * ```javascript
+       * function my_token_render(tokens, idx, options, env, renderer) {
+       *   // ...
+       *   return renderedHTML;
+       * }
+       * ```
+       *
+       * See [source code](https://github.com/markdown-it/markdown-it/blob/master/lib/renderer.js)
+       * for more details and examples.
+       **/
+      this.rules = assign({}, default_rules);
+    }
+
+
+    /**
+     * Renderer.renderAttrs(token) -> String
+     *
+     * Render token attributes to string.
+     **/
+    Renderer.prototype.renderAttrs = function renderAttrs(token) {
+      var i, l, result;
+
+      if (!token.attrs) { return ''; }
+
+      result = '';
+
+      for (i = 0, l = token.attrs.length; i < l; i++) {
+        result += ' ' + escapeHtml(token.attrs[i][0]) + '="' + escapeHtml(token.attrs[i][1]) + '"';
+      }
+
+      return result;
+    };
+
+
+    /**
+     * Renderer.renderToken(tokens, idx, options) -> String
+     * - tokens (Array): list of tokens
+     * - idx (Numbed): token index to render
+     * - options (Object): params of parser instance
+     *
+     * Default token renderer. Can be overriden by custom function
+     * in [[Renderer#rules]].
+     **/
+    Renderer.prototype.renderToken = function renderToken(tokens, idx, options) {
+      var nextToken,
+          result = '',
+          needLf = false,
+          token = tokens[idx];
+
+      // Tight list paragraphs
+      if (token.hidden) {
+        return '';
+      }
+
+      // Insert a newline between hidden paragraph and subsequent opening
+      // block-level tag.
+      //
+      // For example, here we should insert a newline before blockquote:
+      //  - a
+      //    >
+      //
+      if (token.block && token.nesting !== -1 && idx && tokens[idx - 1].hidden) {
+        result += '\n';
+      }
+
+      // Add token name, e.g. `<img`
+      result += (token.nesting === -1 ? '</' : '<') + token.tag;
+
+      // Encode attributes, e.g. `<img src="foo"`
+      result += this.renderAttrs(token);
+
+      // Add a slash for self-closing tags, e.g. `<img src="foo" /`
+      if (token.nesting === 0 && options.xhtmlOut) {
+        result += ' /';
+      }
+
+      // Check if we need to add a newline after this tag
+      if (token.block) {
+        needLf = true;
+
+        if (token.nesting === 1) {
+          if (idx + 1 < tokens.length) {
+            nextToken = tokens[idx + 1];
+
+            if (nextToken.type === 'inline' || nextToken.hidden) {
+              // Block-level tag containing an inline tag.
+              //
+              needLf = false;
+
+            } else if (nextToken.nesting === -1 && nextToken.tag === token.tag) {
+              // Opening tag + closing tag of the same type. E.g. `<li></li>`.
+              //
+              needLf = false;
+            }
+          }
+        }
+      }
+
+      result += needLf ? '>\n' : '>';
+
+      return result;
+    };
+
+
+    /**
+     * Renderer.renderInline(tokens, options, env) -> String
+     * - tokens (Array): list on block tokens to renter
+     * - options (Object): params of parser instance
+     * - env (Object): additional data from parsed input (references, for example)
+     *
+     * The same as [[Renderer.render]], but for single token of `inline` type.
+     **/
+    Renderer.prototype.renderInline = function (tokens, options, env) {
+      var type,
+          result = '',
+          rules = this.rules;
+
+      for (var i = 0, len = tokens.length; i < len; i++) {
+        type = tokens[i].type;
+
+        if (typeof rules[type] !== 'undefined') {
+          result += rules[type](tokens, i, options, env, this);
+        } else {
+          result += this.renderToken(tokens, i, options);
+        }
+      }
+
+      return result;
+    };
+
+
+    /** internal
+     * Renderer.renderInlineAsText(tokens, options, env) -> String
+     * - tokens (Array): list on block tokens to renter
+     * - options (Object): params of parser instance
+     * - env (Object): additional data from parsed input (references, for example)
+     *
+     * Special kludge for image `alt` attributes to conform CommonMark spec.
+     * Don't try to use it! Spec requires to show `alt` content with stripped markup,
+     * instead of simple escaping.
+     **/
+    Renderer.prototype.renderInlineAsText = function (tokens, options, env) {
+      var result = '';
+
+      for (var i = 0, len = tokens.length; i < len; i++) {
+        if (tokens[i].type === 'text') {
+          result += tokens[i].content;
+        } else if (tokens[i].type === 'image') {
+          result += this.renderInlineAsText(tokens[i].children, options, env);
+        }
+      }
+
+      return result;
+    };
+
+
+    /**
+     * Renderer.render(tokens, options, env) -> String
+     * - tokens (Array): list on block tokens to renter
+     * - options (Object): params of parser instance
+     * - env (Object): additional data from parsed input (references, for example)
+     *
+     * Takes token stream and generates HTML. Probably, you will never need to call
+     * this method directly.
+     **/
+    Renderer.prototype.render = function (tokens, options, env) {
+      var i, len, type,
+          result = '',
+          rules = this.rules;
+
+      for (i = 0, len = tokens.length; i < len; i++) {
+        type = tokens[i].type;
+
+        if (type === 'inline') {
+          result += this.renderInline(tokens[i].children, options, env);
+        } else if (typeof rules[type] !== 'undefined') {
+          result += rules[tokens[i].type](tokens, i, options, env, this);
+        } else {
+          result += this.renderToken(tokens, i, options, env);
+        }
+      }
+
+      return result;
+    };
+
+    var renderer = Renderer;
+
+    /**
+     * class Ruler
+     *
+     * Helper class, used by [[MarkdownIt#core]], [[MarkdownIt#block]] and
+     * [[MarkdownIt#inline]] to manage sequences of functions (rules):
+     *
+     * - keep rules in defined order
+     * - assign the name to each rule
+     * - enable/disable rules
+     * - add/replace rules
+     * - allow assign rules to additional named chains (in the same)
+     * - cacheing lists of active rules
+     *
+     * You will not need use this class directly until write plugins. For simple
+     * rules control use [[MarkdownIt.disable]], [[MarkdownIt.enable]] and
+     * [[MarkdownIt.use]].
+     **/
+
+
+    /**
+     * new Ruler()
+     **/
+    function Ruler() {
+      // List of added rules. Each element is:
+      //
+      // {
+      //   name: XXX,
+      //   enabled: Boolean,
+      //   fn: Function(),
+      //   alt: [ name2, name3 ]
+      // }
+      //
+      this.__rules__ = [];
+
+      // Cached rule chains.
+      //
+      // First level - chain name, '' for default.
+      // Second level - diginal anchor for fast filtering by charcodes.
+      //
+      this.__cache__ = null;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // Helper methods, should not be used directly
+
+
+    // Find rule index by name
+    //
+    Ruler.prototype.__find__ = function (name) {
+      for (var i = 0; i < this.__rules__.length; i++) {
+        if (this.__rules__[i].name === name) {
+          return i;
+        }
+      }
+      return -1;
+    };
+
+
+    // Build rules lookup cache
+    //
+    Ruler.prototype.__compile__ = function () {
+      var self = this;
+      var chains = [ '' ];
+
+      // collect unique names
+      self.__rules__.forEach(function (rule) {
+        if (!rule.enabled) { return; }
+
+        rule.alt.forEach(function (altName) {
+          if (chains.indexOf(altName) < 0) {
+            chains.push(altName);
+          }
+        });
+      });
+
+      self.__cache__ = {};
+
+      chains.forEach(function (chain) {
+        self.__cache__[chain] = [];
+        self.__rules__.forEach(function (rule) {
+          if (!rule.enabled) { return; }
+
+          if (chain && rule.alt.indexOf(chain) < 0) { return; }
+
+          self.__cache__[chain].push(rule.fn);
+        });
+      });
+    };
+
+
+    /**
+     * Ruler.at(name, fn [, options])
+     * - name (String): rule name to replace.
+     * - fn (Function): new rule function.
+     * - options (Object): new rule options (not mandatory).
+     *
+     * Replace rule by name with new function & options. Throws error if name not
+     * found.
+     *
+     * ##### Options:
+     *
+     * - __alt__ - array with names of "alternate" chains.
+     *
+     * ##### Example
+     *
+     * Replace existing typographer replacement rule with new one:
+     *
+     * ```javascript
+     * var md = require('markdown-it')();
+     *
+     * md.core.ruler.at('replacements', function replace(state) {
+     *   //...
+     * });
+     * ```
+     **/
+    Ruler.prototype.at = function (name, fn, options) {
+      var index = this.__find__(name);
+      var opt = options || {};
+
+      if (index === -1) { throw new Error('Parser rule not found: ' + name); }
+
+      this.__rules__[index].fn = fn;
+      this.__rules__[index].alt = opt.alt || [];
+      this.__cache__ = null;
+    };
+
+
+    /**
+     * Ruler.before(beforeName, ruleName, fn [, options])
+     * - beforeName (String): new rule will be added before this one.
+     * - ruleName (String): name of added rule.
+     * - fn (Function): rule function.
+     * - options (Object): rule options (not mandatory).
+     *
+     * Add new rule to chain before one with given name. See also
+     * [[Ruler.after]], [[Ruler.push]].
+     *
+     * ##### Options:
+     *
+     * - __alt__ - array with names of "alternate" chains.
+     *
+     * ##### Example
+     *
+     * ```javascript
+     * var md = require('markdown-it')();
+     *
+     * md.block.ruler.before('paragraph', 'my_rule', function replace(state) {
+     *   //...
+     * });
+     * ```
+     **/
+    Ruler.prototype.before = function (beforeName, ruleName, fn, options) {
+      var index = this.__find__(beforeName);
+      var opt = options || {};
+
+      if (index === -1) { throw new Error('Parser rule not found: ' + beforeName); }
+
+      this.__rules__.splice(index, 0, {
+        name: ruleName,
+        enabled: true,
+        fn: fn,
+        alt: opt.alt || []
+      });
+
+      this.__cache__ = null;
+    };
+
+
+    /**
+     * Ruler.after(afterName, ruleName, fn [, options])
+     * - afterName (String): new rule will be added after this one.
+     * - ruleName (String): name of added rule.
+     * - fn (Function): rule function.
+     * - options (Object): rule options (not mandatory).
+     *
+     * Add new rule to chain after one with given name. See also
+     * [[Ruler.before]], [[Ruler.push]].
+     *
+     * ##### Options:
+     *
+     * - __alt__ - array with names of "alternate" chains.
+     *
+     * ##### Example
+     *
+     * ```javascript
+     * var md = require('markdown-it')();
+     *
+     * md.inline.ruler.after('text', 'my_rule', function replace(state) {
+     *   //...
+     * });
+     * ```
+     **/
+    Ruler.prototype.after = function (afterName, ruleName, fn, options) {
+      var index = this.__find__(afterName);
+      var opt = options || {};
+
+      if (index === -1) { throw new Error('Parser rule not found: ' + afterName); }
+
+      this.__rules__.splice(index + 1, 0, {
+        name: ruleName,
+        enabled: true,
+        fn: fn,
+        alt: opt.alt || []
+      });
+
+      this.__cache__ = null;
+    };
+
+    /**
+     * Ruler.push(ruleName, fn [, options])
+     * - ruleName (String): name of added rule.
+     * - fn (Function): rule function.
+     * - options (Object): rule options (not mandatory).
+     *
+     * Push new rule to the end of chain. See also
+     * [[Ruler.before]], [[Ruler.after]].
+     *
+     * ##### Options:
+     *
+     * - __alt__ - array with names of "alternate" chains.
+     *
+     * ##### Example
+     *
+     * ```javascript
+     * var md = require('markdown-it')();
+     *
+     * md.core.ruler.push('my_rule', function replace(state) {
+     *   //...
+     * });
+     * ```
+     **/
+    Ruler.prototype.push = function (ruleName, fn, options) {
+      var opt = options || {};
+
+      this.__rules__.push({
+        name: ruleName,
+        enabled: true,
+        fn: fn,
+        alt: opt.alt || []
+      });
+
+      this.__cache__ = null;
+    };
+
+
+    /**
+     * Ruler.enable(list [, ignoreInvalid]) -> Array
+     * - list (String|Array): list of rule names to enable.
+     * - ignoreInvalid (Boolean): set `true` to ignore errors when rule not found.
+     *
+     * Enable rules with given names. If any rule name not found - throw Error.
+     * Errors can be disabled by second param.
+     *
+     * Returns list of found rule names (if no exception happened).
+     *
+     * See also [[Ruler.disable]], [[Ruler.enableOnly]].
+     **/
+    Ruler.prototype.enable = function (list, ignoreInvalid) {
+      if (!Array.isArray(list)) { list = [ list ]; }
+
+      var result = [];
+
+      // Search by name and enable
+      list.forEach(function (name) {
+        var idx = this.__find__(name);
+
+        if (idx < 0) {
+          if (ignoreInvalid) { return; }
+          throw new Error('Rules manager: invalid rule name ' + name);
+        }
+        this.__rules__[idx].enabled = true;
+        result.push(name);
+      }, this);
+
+      this.__cache__ = null;
+      return result;
+    };
+
+
+    /**
+     * Ruler.enableOnly(list [, ignoreInvalid])
+     * - list (String|Array): list of rule names to enable (whitelist).
+     * - ignoreInvalid (Boolean): set `true` to ignore errors when rule not found.
+     *
+     * Enable rules with given names, and disable everything else. If any rule name
+     * not found - throw Error. Errors can be disabled by second param.
+     *
+     * See also [[Ruler.disable]], [[Ruler.enable]].
+     **/
+    Ruler.prototype.enableOnly = function (list, ignoreInvalid) {
+      if (!Array.isArray(list)) { list = [ list ]; }
+
+      this.__rules__.forEach(function (rule) { rule.enabled = false; });
+
+      this.enable(list, ignoreInvalid);
+    };
+
+
+    /**
+     * Ruler.disable(list [, ignoreInvalid]) -> Array
+     * - list (String|Array): list of rule names to disable.
+     * - ignoreInvalid (Boolean): set `true` to ignore errors when rule not found.
+     *
+     * Disable rules with given names. If any rule name not found - throw Error.
+     * Errors can be disabled by second param.
+     *
+     * Returns list of found rule names (if no exception happened).
+     *
+     * See also [[Ruler.enable]], [[Ruler.enableOnly]].
+     **/
+    Ruler.prototype.disable = function (list, ignoreInvalid) {
+      if (!Array.isArray(list)) { list = [ list ]; }
+
+      var result = [];
+
+      // Search by name and disable
+      list.forEach(function (name) {
+        var idx = this.__find__(name);
+
+        if (idx < 0) {
+          if (ignoreInvalid) { return; }
+          throw new Error('Rules manager: invalid rule name ' + name);
+        }
+        this.__rules__[idx].enabled = false;
+        result.push(name);
+      }, this);
+
+      this.__cache__ = null;
+      return result;
+    };
+
+
+    /**
+     * Ruler.getRules(chainName) -> Array
+     *
+     * Return array of active functions (rules) for given chain name. It analyzes
+     * rules configuration, compiles caches if not exists and returns result.
+     *
+     * Default chain name is `''` (empty string). It can't be skipped. That's
+     * done intentionally, to keep signature monomorphic for high speed.
+     **/
+    Ruler.prototype.getRules = function (chainName) {
+      if (this.__cache__ === null) {
+        this.__compile__();
+      }
+
+      // Chain can be empty, if rules disabled. But we still have to return Array.
+      return this.__cache__[chainName] || [];
+    };
+
+    var ruler = Ruler;
+
+    // Normalize input string
+
+
+    // https://spec.commonmark.org/0.29/#line-ending
+    var NEWLINES_RE  = /\r\n?|\n/g;
+    var NULL_RE      = /\0/g;
+
+
+    var normalize = function normalize(state) {
+      var str;
+
+      // Normalize newlines
+      str = state.src.replace(NEWLINES_RE, '\n');
+
+      // Replace NULL characters
+      str = str.replace(NULL_RE, '\uFFFD');
+
+      state.src = str;
+    };
+
+    var block$1 = function block(state) {
+      var token;
+
+      if (state.inlineMode) {
+        token          = new state.Token('inline', '', 0);
+        token.content  = state.src;
+        token.map      = [ 0, 1 ];
+        token.children = [];
+        state.tokens.push(token);
+      } else {
+        state.md.block.parse(state.src, state.md, state.env, state.tokens);
+      }
+    };
+
+    var inline = function inline(state) {
+      var tokens = state.tokens, tok, i, l;
+
+      // Parse inlines
+      for (i = 0, l = tokens.length; i < l; i++) {
+        tok = tokens[i];
+        if (tok.type === 'inline') {
+          state.md.inline.parse(tok.content, state.md, state.env, tok.children);
+        }
+      }
+    };
+
+    var arrayReplaceAt = utils.arrayReplaceAt;
+
+
+    function isLinkOpen(str) {
+      return /^<a[>\s]/i.test(str);
+    }
+    function isLinkClose(str) {
+      return /^<\/a\s*>/i.test(str);
+    }
+
+
+    var linkify = function linkify(state) {
+      var i, j, l, tokens, token, currentToken, nodes, ln, text, pos, lastPos,
+          level, htmlLinkLevel, url, fullUrl, urlText,
+          blockTokens = state.tokens,
+          links;
+
+      if (!state.md.options.linkify) { return; }
+
+      for (j = 0, l = blockTokens.length; j < l; j++) {
+        if (blockTokens[j].type !== 'inline' ||
+            !state.md.linkify.pretest(blockTokens[j].content)) {
+          continue;
+        }
+
+        tokens = blockTokens[j].children;
+
+        htmlLinkLevel = 0;
+
+        // We scan from the end, to keep position when new tags added.
+        // Use reversed logic in links start/end match
+        for (i = tokens.length - 1; i >= 0; i--) {
+          currentToken = tokens[i];
+
+          // Skip content of markdown links
+          if (currentToken.type === 'link_close') {
+            i--;
+            while (tokens[i].level !== currentToken.level && tokens[i].type !== 'link_open') {
+              i--;
+            }
+            continue;
+          }
+
+          // Skip content of html tag links
+          if (currentToken.type === 'html_inline') {
+            if (isLinkOpen(currentToken.content) && htmlLinkLevel > 0) {
+              htmlLinkLevel--;
+            }
+            if (isLinkClose(currentToken.content)) {
+              htmlLinkLevel++;
+            }
+          }
+          if (htmlLinkLevel > 0) { continue; }
+
+          if (currentToken.type === 'text' && state.md.linkify.test(currentToken.content)) {
+
+            text = currentToken.content;
+            links = state.md.linkify.match(text);
+
+            // Now split string to nodes
+            nodes = [];
+            level = currentToken.level;
+            lastPos = 0;
+
+            for (ln = 0; ln < links.length; ln++) {
+
+              url = links[ln].url;
+              fullUrl = state.md.normalizeLink(url);
+              if (!state.md.validateLink(fullUrl)) { continue; }
+
+              urlText = links[ln].text;
+
+              // Linkifier might send raw hostnames like "example.com", where url
+              // starts with domain name. So we prepend http:// in those cases,
+              // and remove it afterwards.
+              //
+              if (!links[ln].schema) {
+                urlText = state.md.normalizeLinkText('http://' + urlText).replace(/^http:\/\//, '');
+              } else if (links[ln].schema === 'mailto:' && !/^mailto:/i.test(urlText)) {
+                urlText = state.md.normalizeLinkText('mailto:' + urlText).replace(/^mailto:/, '');
+              } else {
+                urlText = state.md.normalizeLinkText(urlText);
+              }
+
+              pos = links[ln].index;
+
+              if (pos > lastPos) {
+                token         = new state.Token('text', '', 0);
+                token.content = text.slice(lastPos, pos);
+                token.level   = level;
+                nodes.push(token);
+              }
+
+              token         = new state.Token('link_open', 'a', 1);
+              token.attrs   = [ [ 'href', fullUrl ] ];
+              token.level   = level++;
+              token.markup  = 'linkify';
+              token.info    = 'auto';
+              nodes.push(token);
+
+              token         = new state.Token('text', '', 0);
+              token.content = urlText;
+              token.level   = level;
+              nodes.push(token);
+
+              token         = new state.Token('link_close', 'a', -1);
+              token.level   = --level;
+              token.markup  = 'linkify';
+              token.info    = 'auto';
+              nodes.push(token);
+
+              lastPos = links[ln].lastIndex;
+            }
+            if (lastPos < text.length) {
+              token         = new state.Token('text', '', 0);
+              token.content = text.slice(lastPos);
+              token.level   = level;
+              nodes.push(token);
+            }
+
+            // replace current node
+            blockTokens[j].children = tokens = arrayReplaceAt(tokens, i, nodes);
+          }
+        }
+      }
+    };
+
+    // Simple typographic replacements
+
+    // TODO:
+    // - fractionals 1/2, 1/4, 3/4 -> ½, ¼, ¾
+    // - miltiplication 2 x 4 -> 2 × 4
+
+    var RARE_RE = /\+-|\.\.|\?\?\?\?|!!!!|,,|--/;
+
+    // Workaround for phantomjs - need regex without /g flag,
+    // or root check will fail every second time
+    var SCOPED_ABBR_TEST_RE = /\((c|tm|r|p)\)/i;
+
+    var SCOPED_ABBR_RE = /\((c|tm|r|p)\)/ig;
+    var SCOPED_ABBR = {
+      c: '©',
+      r: '®',
+      p: '§',
+      tm: '™'
+    };
+
+    function replaceFn(match, name) {
+      return SCOPED_ABBR[name.toLowerCase()];
+    }
+
+    function replace_scoped(inlineTokens) {
+      var i, token, inside_autolink = 0;
+
+      for (i = inlineTokens.length - 1; i >= 0; i--) {
+        token = inlineTokens[i];
+
+        if (token.type === 'text' && !inside_autolink) {
+          token.content = token.content.replace(SCOPED_ABBR_RE, replaceFn);
+        }
+
+        if (token.type === 'link_open' && token.info === 'auto') {
+          inside_autolink--;
+        }
+
+        if (token.type === 'link_close' && token.info === 'auto') {
+          inside_autolink++;
+        }
+      }
+    }
+
+    function replace_rare(inlineTokens) {
+      var i, token, inside_autolink = 0;
+
+      for (i = inlineTokens.length - 1; i >= 0; i--) {
+        token = inlineTokens[i];
+
+        if (token.type === 'text' && !inside_autolink) {
+          if (RARE_RE.test(token.content)) {
+            token.content = token.content
+              .replace(/\+-/g, '±')
+              // .., ..., ....... -> …
+              // but ?..... & !..... -> ?.. & !..
+              .replace(/\.{2,}/g, '…').replace(/([?!])…/g, '$1..')
+              .replace(/([?!]){4,}/g, '$1$1$1').replace(/,{2,}/g, ',')
+              // em-dash
+              .replace(/(^|[^-])---([^-]|$)/mg, '$1\u2014$2')
+              // en-dash
+              .replace(/(^|\s)--(\s|$)/mg, '$1\u2013$2')
+              .replace(/(^|[^-\s])--([^-\s]|$)/mg, '$1\u2013$2');
+          }
+        }
+
+        if (token.type === 'link_open' && token.info === 'auto') {
+          inside_autolink--;
+        }
+
+        if (token.type === 'link_close' && token.info === 'auto') {
+          inside_autolink++;
+        }
+      }
+    }
+
+
+    var replacements = function replace(state) {
+      var blkIdx;
+
+      if (!state.md.options.typographer) { return; }
+
+      for (blkIdx = state.tokens.length - 1; blkIdx >= 0; blkIdx--) {
+
+        if (state.tokens[blkIdx].type !== 'inline') { continue; }
+
+        if (SCOPED_ABBR_TEST_RE.test(state.tokens[blkIdx].content)) {
+          replace_scoped(state.tokens[blkIdx].children);
+        }
+
+        if (RARE_RE.test(state.tokens[blkIdx].content)) {
+          replace_rare(state.tokens[blkIdx].children);
+        }
+
+      }
+    };
+
+    var isWhiteSpace   = utils.isWhiteSpace;
+    var isPunctChar    = utils.isPunctChar;
+    var isMdAsciiPunct = utils.isMdAsciiPunct;
+
+    var QUOTE_TEST_RE = /['"]/;
+    var QUOTE_RE = /['"]/g;
+    var APOSTROPHE = '\u2019'; /* ’ */
+
+
+    function replaceAt(str, index, ch) {
+      return str.substr(0, index) + ch + str.substr(index + 1);
+    }
+
+    function process_inlines(tokens, state) {
+      var i, token, text, t, pos, max, thisLevel, item, lastChar, nextChar,
+          isLastPunctChar, isNextPunctChar, isLastWhiteSpace, isNextWhiteSpace,
+          canOpen, canClose, j, isSingle, stack, openQuote, closeQuote;
+
+      stack = [];
+
+      for (i = 0; i < tokens.length; i++) {
+        token = tokens[i];
+
+        thisLevel = tokens[i].level;
+
+        for (j = stack.length - 1; j >= 0; j--) {
+          if (stack[j].level <= thisLevel) { break; }
+        }
+        stack.length = j + 1;
+
+        if (token.type !== 'text') { continue; }
+
+        text = token.content;
+        pos = 0;
+        max = text.length;
+
+        /*eslint no-labels:0,block-scoped-var:0*/
+        OUTER:
+        while (pos < max) {
+          QUOTE_RE.lastIndex = pos;
+          t = QUOTE_RE.exec(text);
+          if (!t) { break; }
+
+          canOpen = canClose = true;
+          pos = t.index + 1;
+          isSingle = (t[0] === "'");
+
+          // Find previous character,
+          // default to space if it's the beginning of the line
+          //
+          lastChar = 0x20;
+
+          if (t.index - 1 >= 0) {
+            lastChar = text.charCodeAt(t.index - 1);
+          } else {
+            for (j = i - 1; j >= 0; j--) {
+              if (tokens[j].type === 'softbreak' || tokens[j].type === 'hardbreak') break; // lastChar defaults to 0x20
+              if (tokens[j].type !== 'text') continue;
+
+              lastChar = tokens[j].content.charCodeAt(tokens[j].content.length - 1);
+              break;
+            }
+          }
+
+          // Find next character,
+          // default to space if it's the end of the line
+          //
+          nextChar = 0x20;
+
+          if (pos < max) {
+            nextChar = text.charCodeAt(pos);
+          } else {
+            for (j = i + 1; j < tokens.length; j++) {
+              if (tokens[j].type === 'softbreak' || tokens[j].type === 'hardbreak') break; // nextChar defaults to 0x20
+              if (tokens[j].type !== 'text') continue;
+
+              nextChar = tokens[j].content.charCodeAt(0);
+              break;
+            }
+          }
+
+          isLastPunctChar = isMdAsciiPunct(lastChar) || isPunctChar(String.fromCharCode(lastChar));
+          isNextPunctChar = isMdAsciiPunct(nextChar) || isPunctChar(String.fromCharCode(nextChar));
+
+          isLastWhiteSpace = isWhiteSpace(lastChar);
+          isNextWhiteSpace = isWhiteSpace(nextChar);
+
+          if (isNextWhiteSpace) {
+            canOpen = false;
+          } else if (isNextPunctChar) {
+            if (!(isLastWhiteSpace || isLastPunctChar)) {
+              canOpen = false;
+            }
+          }
+
+          if (isLastWhiteSpace) {
+            canClose = false;
+          } else if (isLastPunctChar) {
+            if (!(isNextWhiteSpace || isNextPunctChar)) {
+              canClose = false;
+            }
+          }
+
+          if (nextChar === 0x22 /* " */ && t[0] === '"') {
+            if (lastChar >= 0x30 /* 0 */ && lastChar <= 0x39 /* 9 */) {
+              // special case: 1"" - count first quote as an inch
+              canClose = canOpen = false;
+            }
+          }
+
+          if (canOpen && canClose) {
+            // treat this as the middle of the word
+            canOpen = false;
+            canClose = isNextPunctChar;
+          }
+
+          if (!canOpen && !canClose) {
+            // middle of word
+            if (isSingle) {
+              token.content = replaceAt(token.content, t.index, APOSTROPHE);
+            }
+            continue;
+          }
+
+          if (canClose) {
+            // this could be a closing quote, rewind the stack to get a match
+            for (j = stack.length - 1; j >= 0; j--) {
+              item = stack[j];
+              if (stack[j].level < thisLevel) { break; }
+              if (item.single === isSingle && stack[j].level === thisLevel) {
+                item = stack[j];
+
+                if (isSingle) {
+                  openQuote = state.md.options.quotes[2];
+                  closeQuote = state.md.options.quotes[3];
+                } else {
+                  openQuote = state.md.options.quotes[0];
+                  closeQuote = state.md.options.quotes[1];
+                }
+
+                // replace token.content *before* tokens[item.token].content,
+                // because, if they are pointing at the same token, replaceAt
+                // could mess up indices when quote length != 1
+                token.content = replaceAt(token.content, t.index, closeQuote);
+                tokens[item.token].content = replaceAt(
+                  tokens[item.token].content, item.pos, openQuote);
+
+                pos += closeQuote.length - 1;
+                if (item.token === i) { pos += openQuote.length - 1; }
+
+                text = token.content;
+                max = text.length;
+
+                stack.length = j;
+                continue OUTER;
+              }
+            }
+          }
+
+          if (canOpen) {
+            stack.push({
+              token: i,
+              pos: t.index,
+              single: isSingle,
+              level: thisLevel
+            });
+          } else if (canClose && isSingle) {
+            token.content = replaceAt(token.content, t.index, APOSTROPHE);
+          }
+        }
+      }
+    }
+
+
+    var smartquotes = function smartquotes(state) {
+      /*eslint max-depth:0*/
+      var blkIdx;
+
+      if (!state.md.options.typographer) { return; }
+
+      for (blkIdx = state.tokens.length - 1; blkIdx >= 0; blkIdx--) {
+
+        if (state.tokens[blkIdx].type !== 'inline' ||
+            !QUOTE_TEST_RE.test(state.tokens[blkIdx].content)) {
+          continue;
+        }
+
+        process_inlines(state.tokens[blkIdx].children, state);
+      }
+    };
+
+    // Token class
+
+
+    /**
+     * class Token
+     **/
+
+    /**
+     * new Token(type, tag, nesting)
+     *
+     * Create new token and fill passed properties.
+     **/
+    function Token(type, tag, nesting) {
+      /**
+       * Token#type -> String
+       *
+       * Type of the token (string, e.g. "paragraph_open")
+       **/
+      this.type     = type;
+
+      /**
+       * Token#tag -> String
+       *
+       * html tag name, e.g. "p"
+       **/
+      this.tag      = tag;
+
+      /**
+       * Token#attrs -> Array
+       *
+       * Html attributes. Format: `[ [ name1, value1 ], [ name2, value2 ] ]`
+       **/
+      this.attrs    = null;
+
+      /**
+       * Token#map -> Array
+       *
+       * Source map info. Format: `[ line_begin, line_end ]`
+       **/
+      this.map      = null;
+
+      /**
+       * Token#nesting -> Number
+       *
+       * Level change (number in {-1, 0, 1} set), where:
+       *
+       * -  `1` means the tag is opening
+       * -  `0` means the tag is self-closing
+       * - `-1` means the tag is closing
+       **/
+      this.nesting  = nesting;
+
+      /**
+       * Token#level -> Number
+       *
+       * nesting level, the same as `state.level`
+       **/
+      this.level    = 0;
+
+      /**
+       * Token#children -> Array
+       *
+       * An array of child nodes (inline and img tokens)
+       **/
+      this.children = null;
+
+      /**
+       * Token#content -> String
+       *
+       * In a case of self-closing tag (code, html, fence, etc.),
+       * it has contents of this tag.
+       **/
+      this.content  = '';
+
+      /**
+       * Token#markup -> String
+       *
+       * '*' or '_' for emphasis, fence string for fence, etc.
+       **/
+      this.markup   = '';
+
+      /**
+       * Token#info -> String
+       *
+       * fence infostring
+       **/
+      this.info     = '';
+
+      /**
+       * Token#meta -> Object
+       *
+       * A place for plugins to store an arbitrary data
+       **/
+      this.meta     = null;
+
+      /**
+       * Token#block -> Boolean
+       *
+       * True for block-level tokens, false for inline tokens.
+       * Used in renderer to calculate line breaks
+       **/
+      this.block    = false;
+
+      /**
+       * Token#hidden -> Boolean
+       *
+       * If it's true, ignore this element when rendering. Used for tight lists
+       * to hide paragraphs.
+       **/
+      this.hidden   = false;
+    }
+
+
+    /**
+     * Token.attrIndex(name) -> Number
+     *
+     * Search attribute index by name.
+     **/
+    Token.prototype.attrIndex = function attrIndex(name) {
+      var attrs, i, len;
+
+      if (!this.attrs) { return -1; }
+
+      attrs = this.attrs;
+
+      for (i = 0, len = attrs.length; i < len; i++) {
+        if (attrs[i][0] === name) { return i; }
+      }
+      return -1;
+    };
+
+
+    /**
+     * Token.attrPush(attrData)
+     *
+     * Add `[ name, value ]` attribute to list. Init attrs if necessary
+     **/
+    Token.prototype.attrPush = function attrPush(attrData) {
+      if (this.attrs) {
+        this.attrs.push(attrData);
+      } else {
+        this.attrs = [ attrData ];
+      }
+    };
+
+
+    /**
+     * Token.attrSet(name, value)
+     *
+     * Set `name` attribute to `value`. Override old value if exists.
+     **/
+    Token.prototype.attrSet = function attrSet(name, value) {
+      var idx = this.attrIndex(name),
+          attrData = [ name, value ];
+
+      if (idx < 0) {
+        this.attrPush(attrData);
+      } else {
+        this.attrs[idx] = attrData;
+      }
+    };
+
+
+    /**
+     * Token.attrGet(name)
+     *
+     * Get the value of attribute `name`, or null if it does not exist.
+     **/
+    Token.prototype.attrGet = function attrGet(name) {
+      var idx = this.attrIndex(name), value = null;
+      if (idx >= 0) {
+        value = this.attrs[idx][1];
+      }
+      return value;
+    };
+
+
+    /**
+     * Token.attrJoin(name, value)
+     *
+     * Join value to existing attribute via space. Or create new attribute if not
+     * exists. Useful to operate with token classes.
+     **/
+    Token.prototype.attrJoin = function attrJoin(name, value) {
+      var idx = this.attrIndex(name);
+
+      if (idx < 0) {
+        this.attrPush([ name, value ]);
+      } else {
+        this.attrs[idx][1] = this.attrs[idx][1] + ' ' + value;
+      }
+    };
+
+
+    var token = Token;
+
+    function StateCore(src, md, env) {
+      this.src = src;
+      this.env = env;
+      this.tokens = [];
+      this.inlineMode = false;
+      this.md = md; // link to parser instance
+    }
+
+    // re-export Token class to use in core rules
+    StateCore.prototype.Token = token;
+
+
+    var state_core = StateCore;
+
+    var _rules = [
+      [ 'normalize',      normalize      ],
+      [ 'block',          block$1          ],
+      [ 'inline',         inline         ],
+      [ 'linkify',        linkify        ],
+      [ 'replacements',   replacements   ],
+      [ 'smartquotes',    smartquotes    ]
+    ];
+
+
+    /**
+     * new Core()
+     **/
+    function Core() {
+      /**
+       * Core#ruler -> Ruler
+       *
+       * [[Ruler]] instance. Keep configuration of core rules.
+       **/
+      this.ruler = new ruler();
+
+      for (var i = 0; i < _rules.length; i++) {
+        this.ruler.push(_rules[i][0], _rules[i][1]);
+      }
+    }
+
+
+    /**
+     * Core.process(state)
+     *
+     * Executes core chain rules.
+     **/
+    Core.prototype.process = function (state) {
+      var i, l, rules;
+
+      rules = this.ruler.getRules('');
+
+      for (i = 0, l = rules.length; i < l; i++) {
+        rules[i](state);
+      }
+    };
+
+    Core.prototype.State = state_core;
+
+
+    var parser_core = Core;
+
+    var isSpace = utils.isSpace;
+
+
+    function getLine(state, line) {
+      var pos = state.bMarks[line] + state.blkIndent,
+          max = state.eMarks[line];
+
+      return state.src.substr(pos, max - pos);
+    }
+
+    function escapedSplit(str) {
+      var result = [],
+          pos = 0,
+          max = str.length,
+          ch,
+          escapes = 0,
+          lastPos = 0,
+          backTicked = false,
+          lastBackTick = 0;
+
+      ch  = str.charCodeAt(pos);
+
+      while (pos < max) {
+        if (ch === 0x60/* ` */) {
+          if (backTicked) {
+            // make \` close code sequence, but not open it;
+            // the reason is: `\` is correct code block
+            backTicked = false;
+            lastBackTick = pos;
+          } else if (escapes % 2 === 0) {
+            backTicked = true;
+            lastBackTick = pos;
+          }
+        } else if (ch === 0x7c/* | */ && (escapes % 2 === 0) && !backTicked) {
+          result.push(str.substring(lastPos, pos));
+          lastPos = pos + 1;
+        }
+
+        if (ch === 0x5c/* \ */) {
+          escapes++;
+        } else {
+          escapes = 0;
+        }
+
+        pos++;
+
+        // If there was an un-closed backtick, go back to just after
+        // the last backtick, but as if it was a normal character
+        if (pos === max && backTicked) {
+          backTicked = false;
+          pos = lastBackTick + 1;
+        }
+
+        ch = str.charCodeAt(pos);
+      }
+
+      result.push(str.substring(lastPos));
+
+      return result;
+    }
+
+
+    var table = function table(state, startLine, endLine, silent) {
+      var ch, lineText, pos, i, nextLine, columns, columnCount, token,
+          aligns, t, tableLines, tbodyLines;
+
+      // should have at least two lines
+      if (startLine + 2 > endLine) { return false; }
+
+      nextLine = startLine + 1;
+
+      if (state.sCount[nextLine] < state.blkIndent) { return false; }
+
+      // if it's indented more than 3 spaces, it should be a code block
+      if (state.sCount[nextLine] - state.blkIndent >= 4) { return false; }
+
+      // first character of the second line should be '|', '-', ':',
+      // and no other characters are allowed but spaces;
+      // basically, this is the equivalent of /^[-:|][-:|\s]*$/ regexp
+
+      pos = state.bMarks[nextLine] + state.tShift[nextLine];
+      if (pos >= state.eMarks[nextLine]) { return false; }
+
+      ch = state.src.charCodeAt(pos++);
+      if (ch !== 0x7C/* | */ && ch !== 0x2D/* - */ && ch !== 0x3A/* : */) { return false; }
+
+      while (pos < state.eMarks[nextLine]) {
+        ch = state.src.charCodeAt(pos);
+
+        if (ch !== 0x7C/* | */ && ch !== 0x2D/* - */ && ch !== 0x3A/* : */ && !isSpace(ch)) { return false; }
+
+        pos++;
+      }
+
+      lineText = getLine(state, startLine + 1);
+
+      columns = lineText.split('|');
+      aligns = [];
+      for (i = 0; i < columns.length; i++) {
+        t = columns[i].trim();
+        if (!t) {
+          // allow empty columns before and after table, but not in between columns;
+          // e.g. allow ` |---| `, disallow ` ---||--- `
+          if (i === 0 || i === columns.length - 1) {
+            continue;
+          } else {
+            return false;
+          }
+        }
+
+        if (!/^:?-+:?$/.test(t)) { return false; }
+        if (t.charCodeAt(t.length - 1) === 0x3A/* : */) {
+          aligns.push(t.charCodeAt(0) === 0x3A/* : */ ? 'center' : 'right');
+        } else if (t.charCodeAt(0) === 0x3A/* : */) {
+          aligns.push('left');
+        } else {
+          aligns.push('');
+        }
+      }
+
+      lineText = getLine(state, startLine).trim();
+      if (lineText.indexOf('|') === -1) { return false; }
+      if (state.sCount[startLine] - state.blkIndent >= 4) { return false; }
+      columns = escapedSplit(lineText.replace(/^\||\|$/g, ''));
+
+      // header row will define an amount of columns in the entire table,
+      // and align row shouldn't be smaller than that (the rest of the rows can)
+      columnCount = columns.length;
+      if (columnCount > aligns.length) { return false; }
+
+      if (silent) { return true; }
+
+      token     = state.push('table_open', 'table', 1);
+      token.map = tableLines = [ startLine, 0 ];
+
+      token     = state.push('thead_open', 'thead', 1);
+      token.map = [ startLine, startLine + 1 ];
+
+      token     = state.push('tr_open', 'tr', 1);
+      token.map = [ startLine, startLine + 1 ];
+
+      for (i = 0; i < columns.length; i++) {
+        token          = state.push('th_open', 'th', 1);
+        token.map      = [ startLine, startLine + 1 ];
+        if (aligns[i]) {
+          token.attrs  = [ [ 'style', 'text-align:' + aligns[i] ] ];
+        }
+
+        token          = state.push('inline', '', 0);
+        token.content  = columns[i].trim();
+        token.map      = [ startLine, startLine + 1 ];
+        token.children = [];
+
+        token          = state.push('th_close', 'th', -1);
+      }
+
+      token     = state.push('tr_close', 'tr', -1);
+      token     = state.push('thead_close', 'thead', -1);
+
+      token     = state.push('tbody_open', 'tbody', 1);
+      token.map = tbodyLines = [ startLine + 2, 0 ];
+
+      for (nextLine = startLine + 2; nextLine < endLine; nextLine++) {
+        if (state.sCount[nextLine] < state.blkIndent) { break; }
+
+        lineText = getLine(state, nextLine).trim();
+        if (lineText.indexOf('|') === -1) { break; }
+        if (state.sCount[nextLine] - state.blkIndent >= 4) { break; }
+        columns = escapedSplit(lineText.replace(/^\||\|$/g, ''));
+
+        token = state.push('tr_open', 'tr', 1);
+        for (i = 0; i < columnCount; i++) {
+          token          = state.push('td_open', 'td', 1);
+          if (aligns[i]) {
+            token.attrs  = [ [ 'style', 'text-align:' + aligns[i] ] ];
+          }
+
+          token          = state.push('inline', '', 0);
+          token.content  = columns[i] ? columns[i].trim() : '';
+          token.children = [];
+
+          token          = state.push('td_close', 'td', -1);
+        }
+        token = state.push('tr_close', 'tr', -1);
+      }
+      token = state.push('tbody_close', 'tbody', -1);
+      token = state.push('table_close', 'table', -1);
+
+      tableLines[1] = tbodyLines[1] = nextLine;
+      state.line = nextLine;
+      return true;
+    };
+
+    // Code block (4 spaces padded)
+
+
+    var code = function code(state, startLine, endLine/*, silent*/) {
+      var nextLine, last, token;
+
+      if (state.sCount[startLine] - state.blkIndent < 4) { return false; }
+
+      last = nextLine = startLine + 1;
+
+      while (nextLine < endLine) {
+        if (state.isEmpty(nextLine)) {
+          nextLine++;
+          continue;
+        }
+
+        if (state.sCount[nextLine] - state.blkIndent >= 4) {
+          nextLine++;
+          last = nextLine;
+          continue;
+        }
+        break;
+      }
+
+      state.line = last;
+
+      token         = state.push('code_block', 'code', 0);
+      token.content = state.getLines(startLine, last, 4 + state.blkIndent, true);
+      token.map     = [ startLine, state.line ];
+
+      return true;
+    };
+
+    // fences (``` lang, ~~~ lang)
+
+
+    var fence = function fence(state, startLine, endLine, silent) {
+      var marker, len, params, nextLine, mem, token, markup,
+          haveEndMarker = false,
+          pos = state.bMarks[startLine] + state.tShift[startLine],
+          max = state.eMarks[startLine];
+
+      // if it's indented more than 3 spaces, it should be a code block
+      if (state.sCount[startLine] - state.blkIndent >= 4) { return false; }
+
+      if (pos + 3 > max) { return false; }
+
+      marker = state.src.charCodeAt(pos);
+
+      if (marker !== 0x7E/* ~ */ && marker !== 0x60 /* ` */) {
+        return false;
+      }
+
+      // scan marker length
+      mem = pos;
+      pos = state.skipChars(pos, marker);
+
+      len = pos - mem;
+
+      if (len < 3) { return false; }
+
+      markup = state.src.slice(mem, pos);
+      params = state.src.slice(pos, max);
+
+      if (marker === 0x60 /* ` */) {
+        if (params.indexOf(String.fromCharCode(marker)) >= 0) {
+          return false;
+        }
+      }
+
+      // Since start is found, we can report success here in validation mode
+      if (silent) { return true; }
+
+      // search end of block
+      nextLine = startLine;
+
+      for (;;) {
+        nextLine++;
+        if (nextLine >= endLine) {
+          // unclosed block should be autoclosed by end of document.
+          // also block seems to be autoclosed by end of parent
+          break;
+        }
+
+        pos = mem = state.bMarks[nextLine] + state.tShift[nextLine];
+        max = state.eMarks[nextLine];
+
+        if (pos < max && state.sCount[nextLine] < state.blkIndent) {
+          // non-empty line with negative indent should stop the list:
+          // - ```
+          //  test
+          break;
+        }
+
+        if (state.src.charCodeAt(pos) !== marker) { continue; }
+
+        if (state.sCount[nextLine] - state.blkIndent >= 4) {
+          // closing fence should be indented less than 4 spaces
+          continue;
+        }
+
+        pos = state.skipChars(pos, marker);
+
+        // closing code fence must be at least as long as the opening one
+        if (pos - mem < len) { continue; }
+
+        // make sure tail has spaces only
+        pos = state.skipSpaces(pos);
+
+        if (pos < max) { continue; }
+
+        haveEndMarker = true;
+        // found!
+        break;
+      }
+
+      // If a fence has heading spaces, they should be removed from its inner block
+      len = state.sCount[startLine];
+
+      state.line = nextLine + (haveEndMarker ? 1 : 0);
+
+      token         = state.push('fence', 'code', 0);
+      token.info    = params;
+      token.content = state.getLines(startLine + 1, nextLine, len, true);
+      token.markup  = markup;
+      token.map     = [ startLine, state.line ];
+
+      return true;
+    };
+
+    var isSpace$1 = utils.isSpace;
+
+
+    var blockquote = function blockquote(state, startLine, endLine, silent) {
+      var adjustTab,
+          ch,
+          i,
+          initial,
+          l,
+          lastLineEmpty,
+          lines,
+          nextLine,
+          offset,
+          oldBMarks,
+          oldBSCount,
+          oldIndent,
+          oldParentType,
+          oldSCount,
+          oldTShift,
+          spaceAfterMarker,
+          terminate,
+          terminatorRules,
+          token,
+          wasOutdented,
+          oldLineMax = state.lineMax,
+          pos = state.bMarks[startLine] + state.tShift[startLine],
+          max = state.eMarks[startLine];
+
+      // if it's indented more than 3 spaces, it should be a code block
+      if (state.sCount[startLine] - state.blkIndent >= 4) { return false; }
+
+      // check the block quote marker
+      if (state.src.charCodeAt(pos++) !== 0x3E/* > */) { return false; }
+
+      // we know that it's going to be a valid blockquote,
+      // so no point trying to find the end of it in silent mode
+      if (silent) { return true; }
+
+      // skip spaces after ">" and re-calculate offset
+      initial = offset = state.sCount[startLine] + pos - (state.bMarks[startLine] + state.tShift[startLine]);
+
+      // skip one optional space after '>'
+      if (state.src.charCodeAt(pos) === 0x20 /* space */) {
+        // ' >   test '
+        //     ^ -- position start of line here:
+        pos++;
+        initial++;
+        offset++;
+        adjustTab = false;
+        spaceAfterMarker = true;
+      } else if (state.src.charCodeAt(pos) === 0x09 /* tab */) {
+        spaceAfterMarker = true;
+
+        if ((state.bsCount[startLine] + offset) % 4 === 3) {
+          // '  >\t  test '
+          //       ^ -- position start of line here (tab has width===1)
+          pos++;
+          initial++;
+          offset++;
+          adjustTab = false;
+        } else {
+          // ' >\t  test '
+          //    ^ -- position start of line here + shift bsCount slightly
+          //         to make extra space appear
+          adjustTab = true;
+        }
+      } else {
+        spaceAfterMarker = false;
+      }
+
+      oldBMarks = [ state.bMarks[startLine] ];
+      state.bMarks[startLine] = pos;
+
+      while (pos < max) {
+        ch = state.src.charCodeAt(pos);
+
+        if (isSpace$1(ch)) {
+          if (ch === 0x09) {
+            offset += 4 - (offset + state.bsCount[startLine] + (adjustTab ? 1 : 0)) % 4;
+          } else {
+            offset++;
+          }
+        } else {
+          break;
+        }
+
+        pos++;
+      }
+
+      oldBSCount = [ state.bsCount[startLine] ];
+      state.bsCount[startLine] = state.sCount[startLine] + 1 + (spaceAfterMarker ? 1 : 0);
+
+      lastLineEmpty = pos >= max;
+
+      oldSCount = [ state.sCount[startLine] ];
+      state.sCount[startLine] = offset - initial;
+
+      oldTShift = [ state.tShift[startLine] ];
+      state.tShift[startLine] = pos - state.bMarks[startLine];
+
+      terminatorRules = state.md.block.ruler.getRules('blockquote');
+
+      oldParentType = state.parentType;
+      state.parentType = 'blockquote';
+      wasOutdented = false;
+
+      // Search the end of the block
+      //
+      // Block ends with either:
+      //  1. an empty line outside:
+      //     ```
+      //     > test
+      //
+      //     ```
+      //  2. an empty line inside:
+      //     ```
+      //     >
+      //     test
+      //     ```
+      //  3. another tag:
+      //     ```
+      //     > test
+      //      - - -
+      //     ```
+      for (nextLine = startLine + 1; nextLine < endLine; nextLine++) {
+        // check if it's outdented, i.e. it's inside list item and indented
+        // less than said list item:
+        //
+        // ```
+        // 1. anything
+        //    > current blockquote
+        // 2. checking this line
+        // ```
+        if (state.sCount[nextLine] < state.blkIndent) wasOutdented = true;
+
+        pos = state.bMarks[nextLine] + state.tShift[nextLine];
+        max = state.eMarks[nextLine];
+
+        if (pos >= max) {
+          // Case 1: line is not inside the blockquote, and this line is empty.
+          break;
+        }
+
+        if (state.src.charCodeAt(pos++) === 0x3E/* > */ && !wasOutdented) {
+          // This line is inside the blockquote.
+
+          // skip spaces after ">" and re-calculate offset
+          initial = offset = state.sCount[nextLine] + pos - (state.bMarks[nextLine] + state.tShift[nextLine]);
+
+          // skip one optional space after '>'
+          if (state.src.charCodeAt(pos) === 0x20 /* space */) {
+            // ' >   test '
+            //     ^ -- position start of line here:
+            pos++;
+            initial++;
+            offset++;
+            adjustTab = false;
+            spaceAfterMarker = true;
+          } else if (state.src.charCodeAt(pos) === 0x09 /* tab */) {
+            spaceAfterMarker = true;
+
+            if ((state.bsCount[nextLine] + offset) % 4 === 3) {
+              // '  >\t  test '
+              //       ^ -- position start of line here (tab has width===1)
+              pos++;
+              initial++;
+              offset++;
+              adjustTab = false;
+            } else {
+              // ' >\t  test '
+              //    ^ -- position start of line here + shift bsCount slightly
+              //         to make extra space appear
+              adjustTab = true;
+            }
+          } else {
+            spaceAfterMarker = false;
+          }
+
+          oldBMarks.push(state.bMarks[nextLine]);
+          state.bMarks[nextLine] = pos;
+
+          while (pos < max) {
+            ch = state.src.charCodeAt(pos);
+
+            if (isSpace$1(ch)) {
+              if (ch === 0x09) {
+                offset += 4 - (offset + state.bsCount[nextLine] + (adjustTab ? 1 : 0)) % 4;
+              } else {
+                offset++;
+              }
+            } else {
+              break;
+            }
+
+            pos++;
+          }
+
+          lastLineEmpty = pos >= max;
+
+          oldBSCount.push(state.bsCount[nextLine]);
+          state.bsCount[nextLine] = state.sCount[nextLine] + 1 + (spaceAfterMarker ? 1 : 0);
+
+          oldSCount.push(state.sCount[nextLine]);
+          state.sCount[nextLine] = offset - initial;
+
+          oldTShift.push(state.tShift[nextLine]);
+          state.tShift[nextLine] = pos - state.bMarks[nextLine];
+          continue;
+        }
+
+        // Case 2: line is not inside the blockquote, and the last line was empty.
+        if (lastLineEmpty) { break; }
+
+        // Case 3: another tag found.
+        terminate = false;
+        for (i = 0, l = terminatorRules.length; i < l; i++) {
+          if (terminatorRules[i](state, nextLine, endLine, true)) {
+            terminate = true;
+            break;
+          }
+        }
+
+        if (terminate) {
+          // Quirk to enforce "hard termination mode" for paragraphs;
+          // normally if you call `tokenize(state, startLine, nextLine)`,
+          // paragraphs will look below nextLine for paragraph continuation,
+          // but if blockquote is terminated by another tag, they shouldn't
+          state.lineMax = nextLine;
+
+          if (state.blkIndent !== 0) {
+            // state.blkIndent was non-zero, we now set it to zero,
+            // so we need to re-calculate all offsets to appear as
+            // if indent wasn't changed
+            oldBMarks.push(state.bMarks[nextLine]);
+            oldBSCount.push(state.bsCount[nextLine]);
+            oldTShift.push(state.tShift[nextLine]);
+            oldSCount.push(state.sCount[nextLine]);
+            state.sCount[nextLine] -= state.blkIndent;
+          }
+
+          break;
+        }
+
+        oldBMarks.push(state.bMarks[nextLine]);
+        oldBSCount.push(state.bsCount[nextLine]);
+        oldTShift.push(state.tShift[nextLine]);
+        oldSCount.push(state.sCount[nextLine]);
+
+        // A negative indentation means that this is a paragraph continuation
+        //
+        state.sCount[nextLine] = -1;
+      }
+
+      oldIndent = state.blkIndent;
+      state.blkIndent = 0;
+
+      token        = state.push('blockquote_open', 'blockquote', 1);
+      token.markup = '>';
+      token.map    = lines = [ startLine, 0 ];
+
+      state.md.block.tokenize(state, startLine, nextLine);
+
+      token        = state.push('blockquote_close', 'blockquote', -1);
+      token.markup = '>';
+
+      state.lineMax = oldLineMax;
+      state.parentType = oldParentType;
+      lines[1] = state.line;
+
+      // Restore original tShift; this might not be necessary since the parser
+      // has already been here, but just to make sure we can do that.
+      for (i = 0; i < oldTShift.length; i++) {
+        state.bMarks[i + startLine] = oldBMarks[i];
+        state.tShift[i + startLine] = oldTShift[i];
+        state.sCount[i + startLine] = oldSCount[i];
+        state.bsCount[i + startLine] = oldBSCount[i];
+      }
+      state.blkIndent = oldIndent;
+
+      return true;
+    };
+
+    var isSpace$2 = utils.isSpace;
+
+
+    var hr = function hr(state, startLine, endLine, silent) {
+      var marker, cnt, ch, token,
+          pos = state.bMarks[startLine] + state.tShift[startLine],
+          max = state.eMarks[startLine];
+
+      // if it's indented more than 3 spaces, it should be a code block
+      if (state.sCount[startLine] - state.blkIndent >= 4) { return false; }
+
+      marker = state.src.charCodeAt(pos++);
+
+      // Check hr marker
+      if (marker !== 0x2A/* * */ &&
+          marker !== 0x2D/* - */ &&
+          marker !== 0x5F/* _ */) {
+        return false;
+      }
+
+      // markers can be mixed with spaces, but there should be at least 3 of them
+
+      cnt = 1;
+      while (pos < max) {
+        ch = state.src.charCodeAt(pos++);
+        if (ch !== marker && !isSpace$2(ch)) { return false; }
+        if (ch === marker) { cnt++; }
+      }
+
+      if (cnt < 3) { return false; }
+
+      if (silent) { return true; }
+
+      state.line = startLine + 1;
+
+      token        = state.push('hr', 'hr', 0);
+      token.map    = [ startLine, state.line ];
+      token.markup = Array(cnt + 1).join(String.fromCharCode(marker));
+
+      return true;
+    };
+
+    var isSpace$3 = utils.isSpace;
+
+
+    // Search `[-+*][\n ]`, returns next pos after marker on success
+    // or -1 on fail.
+    function skipBulletListMarker(state, startLine) {
+      var marker, pos, max, ch;
+
+      pos = state.bMarks[startLine] + state.tShift[startLine];
+      max = state.eMarks[startLine];
+
+      marker = state.src.charCodeAt(pos++);
+      // Check bullet
+      if (marker !== 0x2A/* * */ &&
+          marker !== 0x2D/* - */ &&
+          marker !== 0x2B/* + */) {
+        return -1;
+      }
+
+      if (pos < max) {
+        ch = state.src.charCodeAt(pos);
+
+        if (!isSpace$3(ch)) {
+          // " -test " - is not a list item
+          return -1;
+        }
+      }
+
+      return pos;
+    }
+
+    // Search `\d+[.)][\n ]`, returns next pos after marker on success
+    // or -1 on fail.
+    function skipOrderedListMarker(state, startLine) {
+      var ch,
+          start = state.bMarks[startLine] + state.tShift[startLine],
+          pos = start,
+          max = state.eMarks[startLine];
+
+      // List marker should have at least 2 chars (digit + dot)
+      if (pos + 1 >= max) { return -1; }
+
+      ch = state.src.charCodeAt(pos++);
+
+      if (ch < 0x30/* 0 */ || ch > 0x39/* 9 */) { return -1; }
+
+      for (;;) {
+        // EOL -> fail
+        if (pos >= max) { return -1; }
+
+        ch = state.src.charCodeAt(pos++);
+
+        if (ch >= 0x30/* 0 */ && ch <= 0x39/* 9 */) {
+
+          // List marker should have no more than 9 digits
+          // (prevents integer overflow in browsers)
+          if (pos - start >= 10) { return -1; }
+
+          continue;
+        }
+
+        // found valid marker
+        if (ch === 0x29/* ) */ || ch === 0x2e/* . */) {
+          break;
+        }
+
+        return -1;
+      }
+
+
+      if (pos < max) {
+        ch = state.src.charCodeAt(pos);
+
+        if (!isSpace$3(ch)) {
+          // " 1.test " - is not a list item
+          return -1;
+        }
+      }
+      return pos;
+    }
+
+    function markTightParagraphs(state, idx) {
+      var i, l,
+          level = state.level + 2;
+
+      for (i = idx + 2, l = state.tokens.length - 2; i < l; i++) {
+        if (state.tokens[i].level === level && state.tokens[i].type === 'paragraph_open') {
+          state.tokens[i + 2].hidden = true;
+          state.tokens[i].hidden = true;
+          i += 2;
+        }
+      }
+    }
+
+
+    var list = function list(state, startLine, endLine, silent) {
+      var ch,
+          contentStart,
+          i,
+          indent,
+          indentAfterMarker,
+          initial,
+          isOrdered,
+          itemLines,
+          l,
+          listLines,
+          listTokIdx,
+          markerCharCode,
+          markerValue,
+          max,
+          nextLine,
+          offset,
+          oldListIndent,
+          oldParentType,
+          oldSCount,
+          oldTShift,
+          oldTight,
+          pos,
+          posAfterMarker,
+          prevEmptyEnd,
+          start,
+          terminate,
+          terminatorRules,
+          token,
+          isTerminatingParagraph = false,
+          tight = true;
+
+      // if it's indented more than 3 spaces, it should be a code block
+      if (state.sCount[startLine] - state.blkIndent >= 4) { return false; }
+
+      // Special case:
+      //  - item 1
+      //   - item 2
+      //    - item 3
+      //     - item 4
+      //      - this one is a paragraph continuation
+      if (state.listIndent >= 0 &&
+          state.sCount[startLine] - state.listIndent >= 4 &&
+          state.sCount[startLine] < state.blkIndent) {
+        return false;
+      }
+
+      // limit conditions when list can interrupt
+      // a paragraph (validation mode only)
+      if (silent && state.parentType === 'paragraph') {
+        // Next list item should still terminate previous list item;
+        //
+        // This code can fail if plugins use blkIndent as well as lists,
+        // but I hope the spec gets fixed long before that happens.
+        //
+        if (state.tShift[startLine] >= state.blkIndent) {
+          isTerminatingParagraph = true;
+        }
+      }
+
+      // Detect list type and position after marker
+      if ((posAfterMarker = skipOrderedListMarker(state, startLine)) >= 0) {
+        isOrdered = true;
+        start = state.bMarks[startLine] + state.tShift[startLine];
+        markerValue = Number(state.src.substr(start, posAfterMarker - start - 1));
+
+        // If we're starting a new ordered list right after
+        // a paragraph, it should start with 1.
+        if (isTerminatingParagraph && markerValue !== 1) return false;
+
+      } else if ((posAfterMarker = skipBulletListMarker(state, startLine)) >= 0) {
+        isOrdered = false;
+
+      } else {
+        return false;
+      }
+
+      // If we're starting a new unordered list right after
+      // a paragraph, first line should not be empty.
+      if (isTerminatingParagraph) {
+        if (state.skipSpaces(posAfterMarker) >= state.eMarks[startLine]) return false;
+      }
+
+      // We should terminate list on style change. Remember first one to compare.
+      markerCharCode = state.src.charCodeAt(posAfterMarker - 1);
+
+      // For validation mode we can terminate immediately
+      if (silent) { return true; }
+
+      // Start list
+      listTokIdx = state.tokens.length;
+
+      if (isOrdered) {
+        token       = state.push('ordered_list_open', 'ol', 1);
+        if (markerValue !== 1) {
+          token.attrs = [ [ 'start', markerValue ] ];
+        }
+
+      } else {
+        token       = state.push('bullet_list_open', 'ul', 1);
+      }
+
+      token.map    = listLines = [ startLine, 0 ];
+      token.markup = String.fromCharCode(markerCharCode);
+
+      //
+      // Iterate list items
+      //
+
+      nextLine = startLine;
+      prevEmptyEnd = false;
+      terminatorRules = state.md.block.ruler.getRules('list');
+
+      oldParentType = state.parentType;
+      state.parentType = 'list';
+
+      while (nextLine < endLine) {
+        pos = posAfterMarker;
+        max = state.eMarks[nextLine];
+
+        initial = offset = state.sCount[nextLine] + posAfterMarker - (state.bMarks[startLine] + state.tShift[startLine]);
+
+        while (pos < max) {
+          ch = state.src.charCodeAt(pos);
+
+          if (ch === 0x09) {
+            offset += 4 - (offset + state.bsCount[nextLine]) % 4;
+          } else if (ch === 0x20) {
+            offset++;
+          } else {
+            break;
+          }
+
+          pos++;
+        }
+
+        contentStart = pos;
+
+        if (contentStart >= max) {
+          // trimming space in "-    \n  3" case, indent is 1 here
+          indentAfterMarker = 1;
+        } else {
+          indentAfterMarker = offset - initial;
+        }
+
+        // If we have more than 4 spaces, the indent is 1
+        // (the rest is just indented code block)
+        if (indentAfterMarker > 4) { indentAfterMarker = 1; }
+
+        // "  -  test"
+        //  ^^^^^ - calculating total length of this thing
+        indent = initial + indentAfterMarker;
+
+        // Run subparser & write tokens
+        token        = state.push('list_item_open', 'li', 1);
+        token.markup = String.fromCharCode(markerCharCode);
+        token.map    = itemLines = [ startLine, 0 ];
+
+        // change current state, then restore it after parser subcall
+        oldTight = state.tight;
+        oldTShift = state.tShift[startLine];
+        oldSCount = state.sCount[startLine];
+
+        //  - example list
+        // ^ listIndent position will be here
+        //   ^ blkIndent position will be here
+        //
+        oldListIndent = state.listIndent;
+        state.listIndent = state.blkIndent;
+        state.blkIndent = indent;
+
+        state.tight = true;
+        state.tShift[startLine] = contentStart - state.bMarks[startLine];
+        state.sCount[startLine] = offset;
+
+        if (contentStart >= max && state.isEmpty(startLine + 1)) {
+          // workaround for this case
+          // (list item is empty, list terminates before "foo"):
+          // ~~~~~~~~
+          //   -
+          //
+          //     foo
+          // ~~~~~~~~
+          state.line = Math.min(state.line + 2, endLine);
+        } else {
+          state.md.block.tokenize(state, startLine, endLine, true);
+        }
+
+        // If any of list item is tight, mark list as tight
+        if (!state.tight || prevEmptyEnd) {
+          tight = false;
+        }
+        // Item become loose if finish with empty line,
+        // but we should filter last element, because it means list finish
+        prevEmptyEnd = (state.line - startLine) > 1 && state.isEmpty(state.line - 1);
+
+        state.blkIndent = state.listIndent;
+        state.listIndent = oldListIndent;
+        state.tShift[startLine] = oldTShift;
+        state.sCount[startLine] = oldSCount;
+        state.tight = oldTight;
+
+        token        = state.push('list_item_close', 'li', -1);
+        token.markup = String.fromCharCode(markerCharCode);
+
+        nextLine = startLine = state.line;
+        itemLines[1] = nextLine;
+        contentStart = state.bMarks[startLine];
+
+        if (nextLine >= endLine) { break; }
+
+        //
+        // Try to check if list is terminated or continued.
+        //
+        if (state.sCount[nextLine] < state.blkIndent) { break; }
+
+        // if it's indented more than 3 spaces, it should be a code block
+        if (state.sCount[startLine] - state.blkIndent >= 4) { break; }
+
+        // fail if terminating block found
+        terminate = false;
+        for (i = 0, l = terminatorRules.length; i < l; i++) {
+          if (terminatorRules[i](state, nextLine, endLine, true)) {
+            terminate = true;
+            break;
+          }
+        }
+        if (terminate) { break; }
+
+        // fail if list has another type
+        if (isOrdered) {
+          posAfterMarker = skipOrderedListMarker(state, nextLine);
+          if (posAfterMarker < 0) { break; }
+        } else {
+          posAfterMarker = skipBulletListMarker(state, nextLine);
+          if (posAfterMarker < 0) { break; }
+        }
+
+        if (markerCharCode !== state.src.charCodeAt(posAfterMarker - 1)) { break; }
+      }
+
+      // Finalize list
+      if (isOrdered) {
+        token = state.push('ordered_list_close', 'ol', -1);
+      } else {
+        token = state.push('bullet_list_close', 'ul', -1);
+      }
+      token.markup = String.fromCharCode(markerCharCode);
+
+      listLines[1] = nextLine;
+      state.line = nextLine;
+
+      state.parentType = oldParentType;
+
+      // mark paragraphs tight if needed
+      if (tight) {
+        markTightParagraphs(state, listTokIdx);
+      }
+
+      return true;
+    };
+
+    var normalizeReference   = utils.normalizeReference;
+    var isSpace$4              = utils.isSpace;
+
+
+    var reference = function reference(state, startLine, _endLine, silent) {
+      var ch,
+          destEndPos,
+          destEndLineNo,
+          endLine,
+          href,
+          i,
+          l,
+          label,
+          labelEnd,
+          oldParentType,
+          res,
+          start,
+          str,
+          terminate,
+          terminatorRules,
+          title,
+          lines = 0,
+          pos = state.bMarks[startLine] + state.tShift[startLine],
+          max = state.eMarks[startLine],
+          nextLine = startLine + 1;
+
+      // if it's indented more than 3 spaces, it should be a code block
+      if (state.sCount[startLine] - state.blkIndent >= 4) { return false; }
+
+      if (state.src.charCodeAt(pos) !== 0x5B/* [ */) { return false; }
+
+      // Simple check to quickly interrupt scan on [link](url) at the start of line.
+      // Can be useful on practice: https://github.com/markdown-it/markdown-it/issues/54
+      while (++pos < max) {
+        if (state.src.charCodeAt(pos) === 0x5D /* ] */ &&
+            state.src.charCodeAt(pos - 1) !== 0x5C/* \ */) {
+          if (pos + 1 === max) { return false; }
+          if (state.src.charCodeAt(pos + 1) !== 0x3A/* : */) { return false; }
+          break;
+        }
+      }
+
+      endLine = state.lineMax;
+
+      // jump line-by-line until empty one or EOF
+      terminatorRules = state.md.block.ruler.getRules('reference');
+
+      oldParentType = state.parentType;
+      state.parentType = 'reference';
+
+      for (; nextLine < endLine && !state.isEmpty(nextLine); nextLine++) {
+        // this would be a code block normally, but after paragraph
+        // it's considered a lazy continuation regardless of what's there
+        if (state.sCount[nextLine] - state.blkIndent > 3) { continue; }
+
+        // quirk for blockquotes, this line should already be checked by that rule
+        if (state.sCount[nextLine] < 0) { continue; }
+
+        // Some tags can terminate paragraph without empty line.
+        terminate = false;
+        for (i = 0, l = terminatorRules.length; i < l; i++) {
+          if (terminatorRules[i](state, nextLine, endLine, true)) {
+            terminate = true;
+            break;
+          }
+        }
+        if (terminate) { break; }
+      }
+
+      str = state.getLines(startLine, nextLine, state.blkIndent, false).trim();
+      max = str.length;
+
+      for (pos = 1; pos < max; pos++) {
+        ch = str.charCodeAt(pos);
+        if (ch === 0x5B /* [ */) {
+          return false;
+        } else if (ch === 0x5D /* ] */) {
+          labelEnd = pos;
+          break;
+        } else if (ch === 0x0A /* \n */) {
+          lines++;
+        } else if (ch === 0x5C /* \ */) {
+          pos++;
+          if (pos < max && str.charCodeAt(pos) === 0x0A) {
+            lines++;
+          }
+        }
+      }
+
+      if (labelEnd < 0 || str.charCodeAt(labelEnd + 1) !== 0x3A/* : */) { return false; }
+
+      // [label]:   destination   'title'
+      //         ^^^ skip optional whitespace here
+      for (pos = labelEnd + 2; pos < max; pos++) {
+        ch = str.charCodeAt(pos);
+        if (ch === 0x0A) {
+          lines++;
+        } else if (isSpace$4(ch)) ; else {
+          break;
+        }
+      }
+
+      // [label]:   destination   'title'
+      //            ^^^^^^^^^^^ parse this
+      res = state.md.helpers.parseLinkDestination(str, pos, max);
+      if (!res.ok) { return false; }
+
+      href = state.md.normalizeLink(res.str);
+      if (!state.md.validateLink(href)) { return false; }
+
+      pos = res.pos;
+      lines += res.lines;
+
+      // save cursor state, we could require to rollback later
+      destEndPos = pos;
+      destEndLineNo = lines;
+
+      // [label]:   destination   'title'
+      //                       ^^^ skipping those spaces
+      start = pos;
+      for (; pos < max; pos++) {
+        ch = str.charCodeAt(pos);
+        if (ch === 0x0A) {
+          lines++;
+        } else if (isSpace$4(ch)) ; else {
+          break;
+        }
+      }
+
+      // [label]:   destination   'title'
+      //                          ^^^^^^^ parse this
+      res = state.md.helpers.parseLinkTitle(str, pos, max);
+      if (pos < max && start !== pos && res.ok) {
+        title = res.str;
+        pos = res.pos;
+        lines += res.lines;
+      } else {
+        title = '';
+        pos = destEndPos;
+        lines = destEndLineNo;
+      }
+
+      // skip trailing spaces until the rest of the line
+      while (pos < max) {
+        ch = str.charCodeAt(pos);
+        if (!isSpace$4(ch)) { break; }
+        pos++;
+      }
+
+      if (pos < max && str.charCodeAt(pos) !== 0x0A) {
+        if (title) {
+          // garbage at the end of the line after title,
+          // but it could still be a valid reference if we roll back
+          title = '';
+          pos = destEndPos;
+          lines = destEndLineNo;
+          while (pos < max) {
+            ch = str.charCodeAt(pos);
+            if (!isSpace$4(ch)) { break; }
+            pos++;
+          }
+        }
+      }
+
+      if (pos < max && str.charCodeAt(pos) !== 0x0A) {
+        // garbage at the end of the line
+        return false;
+      }
+
+      label = normalizeReference(str.slice(1, labelEnd));
+      if (!label) {
+        // CommonMark 0.20 disallows empty labels
+        return false;
+      }
+
+      // Reference can not terminate anything. This check is for safety only.
+      /*istanbul ignore if*/
+      if (silent) { return true; }
+
+      if (typeof state.env.references === 'undefined') {
+        state.env.references = {};
+      }
+      if (typeof state.env.references[label] === 'undefined') {
+        state.env.references[label] = { title: title, href: href };
+      }
+
+      state.parentType = oldParentType;
+
+      state.line = startLine + lines + 1;
+      return true;
+    };
+
+    var isSpace$5 = utils.isSpace;
+
+
+    var heading = function heading(state, startLine, endLine, silent) {
+      var ch, level, tmp, token,
+          pos = state.bMarks[startLine] + state.tShift[startLine],
+          max = state.eMarks[startLine];
+
+      // if it's indented more than 3 spaces, it should be a code block
+      if (state.sCount[startLine] - state.blkIndent >= 4) { return false; }
+
+      ch  = state.src.charCodeAt(pos);
+
+      if (ch !== 0x23/* # */ || pos >= max) { return false; }
+
+      // count heading level
+      level = 1;
+      ch = state.src.charCodeAt(++pos);
+      while (ch === 0x23/* # */ && pos < max && level <= 6) {
+        level++;
+        ch = state.src.charCodeAt(++pos);
+      }
+
+      if (level > 6 || (pos < max && !isSpace$5(ch))) { return false; }
+
+      if (silent) { return true; }
+
+      // Let's cut tails like '    ###  ' from the end of string
+
+      max = state.skipSpacesBack(max, pos);
+      tmp = state.skipCharsBack(max, 0x23, pos); // #
+      if (tmp > pos && isSpace$5(state.src.charCodeAt(tmp - 1))) {
+        max = tmp;
+      }
+
+      state.line = startLine + 1;
+
+      token        = state.push('heading_open', 'h' + String(level), 1);
+      token.markup = '########'.slice(0, level);
+      token.map    = [ startLine, state.line ];
+
+      token          = state.push('inline', '', 0);
+      token.content  = state.src.slice(pos, max).trim();
+      token.map      = [ startLine, state.line ];
+      token.children = [];
+
+      token        = state.push('heading_close', 'h' + String(level), -1);
+      token.markup = '########'.slice(0, level);
+
+      return true;
+    };
+
+    // lheading (---, ===)
+
+
+    var lheading = function lheading(state, startLine, endLine/*, silent*/) {
+      var content, terminate, i, l, token, pos, max, level, marker,
+          nextLine = startLine + 1, oldParentType,
+          terminatorRules = state.md.block.ruler.getRules('paragraph');
+
+      // if it's indented more than 3 spaces, it should be a code block
+      if (state.sCount[startLine] - state.blkIndent >= 4) { return false; }
+
+      oldParentType = state.parentType;
+      state.parentType = 'paragraph'; // use paragraph to match terminatorRules
+
+      // jump line-by-line until empty one or EOF
+      for (; nextLine < endLine && !state.isEmpty(nextLine); nextLine++) {
+        // this would be a code block normally, but after paragraph
+        // it's considered a lazy continuation regardless of what's there
+        if (state.sCount[nextLine] - state.blkIndent > 3) { continue; }
+
+        //
+        // Check for underline in setext header
+        //
+        if (state.sCount[nextLine] >= state.blkIndent) {
+          pos = state.bMarks[nextLine] + state.tShift[nextLine];
+          max = state.eMarks[nextLine];
+
+          if (pos < max) {
+            marker = state.src.charCodeAt(pos);
+
+            if (marker === 0x2D/* - */ || marker === 0x3D/* = */) {
+              pos = state.skipChars(pos, marker);
+              pos = state.skipSpaces(pos);
+
+              if (pos >= max) {
+                level = (marker === 0x3D/* = */ ? 1 : 2);
+                break;
+              }
+            }
+          }
+        }
+
+        // quirk for blockquotes, this line should already be checked by that rule
+        if (state.sCount[nextLine] < 0) { continue; }
+
+        // Some tags can terminate paragraph without empty line.
+        terminate = false;
+        for (i = 0, l = terminatorRules.length; i < l; i++) {
+          if (terminatorRules[i](state, nextLine, endLine, true)) {
+            terminate = true;
+            break;
+          }
+        }
+        if (terminate) { break; }
+      }
+
+      if (!level) {
+        // Didn't find valid underline
+        return false;
+      }
+
+      content = state.getLines(startLine, nextLine, state.blkIndent, false).trim();
+
+      state.line = nextLine + 1;
+
+      token          = state.push('heading_open', 'h' + String(level), 1);
+      token.markup   = String.fromCharCode(marker);
+      token.map      = [ startLine, state.line ];
+
+      token          = state.push('inline', '', 0);
+      token.content  = content;
+      token.map      = [ startLine, state.line - 1 ];
+      token.children = [];
+
+      token          = state.push('heading_close', 'h' + String(level), -1);
+      token.markup   = String.fromCharCode(marker);
+
+      state.parentType = oldParentType;
+
+      return true;
+    };
+
+    // List of valid html blocks names, accorting to commonmark spec
+
+
+    var html_blocks = [
+      'address',
+      'article',
+      'aside',
+      'base',
+      'basefont',
+      'blockquote',
+      'body',
+      'caption',
+      'center',
+      'col',
+      'colgroup',
+      'dd',
+      'details',
+      'dialog',
+      'dir',
+      'div',
+      'dl',
+      'dt',
+      'fieldset',
+      'figcaption',
+      'figure',
+      'footer',
+      'form',
+      'frame',
+      'frameset',
+      'h1',
+      'h2',
+      'h3',
+      'h4',
+      'h5',
+      'h6',
+      'head',
+      'header',
+      'hr',
+      'html',
+      'iframe',
+      'legend',
+      'li',
+      'link',
+      'main',
+      'menu',
+      'menuitem',
+      'meta',
+      'nav',
+      'noframes',
+      'ol',
+      'optgroup',
+      'option',
+      'p',
+      'param',
+      'section',
+      'source',
+      'summary',
+      'table',
+      'tbody',
+      'td',
+      'tfoot',
+      'th',
+      'thead',
+      'title',
+      'tr',
+      'track',
+      'ul'
+    ];
+
+    // Regexps to match html elements
+
+    var attr_name     = '[a-zA-Z_:][a-zA-Z0-9:._-]*';
+
+    var unquoted      = '[^"\'=<>`\\x00-\\x20]+';
+    var single_quoted = "'[^']*'";
+    var double_quoted = '"[^"]*"';
+
+    var attr_value  = '(?:' + unquoted + '|' + single_quoted + '|' + double_quoted + ')';
+
+    var attribute   = '(?:\\s+' + attr_name + '(?:\\s*=\\s*' + attr_value + ')?)';
+
+    var open_tag    = '<[A-Za-z][A-Za-z0-9\\-]*' + attribute + '*\\s*\\/?>';
+
+    var close_tag   = '<\\/[A-Za-z][A-Za-z0-9\\-]*\\s*>';
+    var comment     = '<!---->|<!--(?:-?[^>-])(?:-?[^-])*-->';
+    var processing  = '<[?].*?[?]>';
+    var declaration = '<![A-Z]+\\s+[^>]*>';
+    var cdata       = '<!\\[CDATA\\[[\\s\\S]*?\\]\\]>';
+
+    var HTML_TAG_RE = new RegExp('^(?:' + open_tag + '|' + close_tag + '|' + comment +
+                            '|' + processing + '|' + declaration + '|' + cdata + ')');
+    var HTML_OPEN_CLOSE_TAG_RE = new RegExp('^(?:' + open_tag + '|' + close_tag + ')');
+
+    var HTML_TAG_RE_1 = HTML_TAG_RE;
+    var HTML_OPEN_CLOSE_TAG_RE_1 = HTML_OPEN_CLOSE_TAG_RE;
+
+    var html_re = {
+    	HTML_TAG_RE: HTML_TAG_RE_1,
+    	HTML_OPEN_CLOSE_TAG_RE: HTML_OPEN_CLOSE_TAG_RE_1
+    };
+
+    var HTML_OPEN_CLOSE_TAG_RE$1 = html_re.HTML_OPEN_CLOSE_TAG_RE;
+
+    // An array of opening and corresponding closing sequences for html tags,
+    // last argument defines whether it can terminate a paragraph or not
+    //
+    var HTML_SEQUENCES = [
+      [ /^<(script|pre|style)(?=(\s|>|$))/i, /<\/(script|pre|style)>/i, true ],
+      [ /^<!--/,        /-->/,   true ],
+      [ /^<\?/,         /\?>/,   true ],
+      [ /^<![A-Z]/,     />/,     true ],
+      [ /^<!\[CDATA\[/, /\]\]>/, true ],
+      [ new RegExp('^</?(' + html_blocks.join('|') + ')(?=(\\s|/?>|$))', 'i'), /^$/, true ],
+      [ new RegExp(HTML_OPEN_CLOSE_TAG_RE$1.source + '\\s*$'),  /^$/, false ]
+    ];
+
+
+    var html_block = function html_block(state, startLine, endLine, silent) {
+      var i, nextLine, token, lineText,
+          pos = state.bMarks[startLine] + state.tShift[startLine],
+          max = state.eMarks[startLine];
+
+      // if it's indented more than 3 spaces, it should be a code block
+      if (state.sCount[startLine] - state.blkIndent >= 4) { return false; }
+
+      if (!state.md.options.html) { return false; }
+
+      if (state.src.charCodeAt(pos) !== 0x3C/* < */) { return false; }
+
+      lineText = state.src.slice(pos, max);
+
+      for (i = 0; i < HTML_SEQUENCES.length; i++) {
+        if (HTML_SEQUENCES[i][0].test(lineText)) { break; }
+      }
+
+      if (i === HTML_SEQUENCES.length) { return false; }
+
+      if (silent) {
+        // true if this sequence can be a terminator, false otherwise
+        return HTML_SEQUENCES[i][2];
+      }
+
+      nextLine = startLine + 1;
+
+      // If we are here - we detected HTML block.
+      // Let's roll down till block end.
+      if (!HTML_SEQUENCES[i][1].test(lineText)) {
+        for (; nextLine < endLine; nextLine++) {
+          if (state.sCount[nextLine] < state.blkIndent) { break; }
+
+          pos = state.bMarks[nextLine] + state.tShift[nextLine];
+          max = state.eMarks[nextLine];
+          lineText = state.src.slice(pos, max);
+
+          if (HTML_SEQUENCES[i][1].test(lineText)) {
+            if (lineText.length !== 0) { nextLine++; }
+            break;
+          }
+        }
+      }
+
+      state.line = nextLine;
+
+      token         = state.push('html_block', '', 0);
+      token.map     = [ startLine, nextLine ];
+      token.content = state.getLines(startLine, nextLine, state.blkIndent, true);
+
+      return true;
+    };
+
+    // Paragraph
+
+
+    var paragraph = function paragraph(state, startLine/*, endLine*/) {
+      var content, terminate, i, l, token, oldParentType,
+          nextLine = startLine + 1,
+          terminatorRules = state.md.block.ruler.getRules('paragraph'),
+          endLine = state.lineMax;
+
+      oldParentType = state.parentType;
+      state.parentType = 'paragraph';
+
+      // jump line-by-line until empty one or EOF
+      for (; nextLine < endLine && !state.isEmpty(nextLine); nextLine++) {
+        // this would be a code block normally, but after paragraph
+        // it's considered a lazy continuation regardless of what's there
+        if (state.sCount[nextLine] - state.blkIndent > 3) { continue; }
+
+        // quirk for blockquotes, this line should already be checked by that rule
+        if (state.sCount[nextLine] < 0) { continue; }
+
+        // Some tags can terminate paragraph without empty line.
+        terminate = false;
+        for (i = 0, l = terminatorRules.length; i < l; i++) {
+          if (terminatorRules[i](state, nextLine, endLine, true)) {
+            terminate = true;
+            break;
+          }
+        }
+        if (terminate) { break; }
+      }
+
+      content = state.getLines(startLine, nextLine, state.blkIndent, false).trim();
+
+      state.line = nextLine;
+
+      token          = state.push('paragraph_open', 'p', 1);
+      token.map      = [ startLine, state.line ];
+
+      token          = state.push('inline', '', 0);
+      token.content  = content;
+      token.map      = [ startLine, state.line ];
+      token.children = [];
+
+      token          = state.push('paragraph_close', 'p', -1);
+
+      state.parentType = oldParentType;
+
+      return true;
+    };
+
+    var isSpace$6 = utils.isSpace;
+
+
+    function StateBlock(src, md, env, tokens) {
+      var ch, s, start, pos, len, indent, offset, indent_found;
+
+      this.src = src;
+
+      // link to parser instance
+      this.md     = md;
+
+      this.env = env;
+
+      //
+      // Internal state vartiables
+      //
+
+      this.tokens = tokens;
+
+      this.bMarks = [];  // line begin offsets for fast jumps
+      this.eMarks = [];  // line end offsets for fast jumps
+      this.tShift = [];  // offsets of the first non-space characters (tabs not expanded)
+      this.sCount = [];  // indents for each line (tabs expanded)
+
+      // An amount of virtual spaces (tabs expanded) between beginning
+      // of each line (bMarks) and real beginning of that line.
+      //
+      // It exists only as a hack because blockquotes override bMarks
+      // losing information in the process.
+      //
+      // It's used only when expanding tabs, you can think about it as
+      // an initial tab length, e.g. bsCount=21 applied to string `\t123`
+      // means first tab should be expanded to 4-21%4 === 3 spaces.
+      //
+      this.bsCount = [];
+
+      // block parser variables
+      this.blkIndent  = 0; // required block content indent (for example, if we are
+                           // inside a list, it would be positioned after list marker)
+      this.line       = 0; // line index in src
+      this.lineMax    = 0; // lines count
+      this.tight      = false;  // loose/tight mode for lists
+      this.ddIndent   = -1; // indent of the current dd block (-1 if there isn't any)
+      this.listIndent = -1; // indent of the current list block (-1 if there isn't any)
+
+      // can be 'blockquote', 'list', 'root', 'paragraph' or 'reference'
+      // used in lists to determine if they interrupt a paragraph
+      this.parentType = 'root';
+
+      this.level = 0;
+
+      // renderer
+      this.result = '';
+
+      // Create caches
+      // Generate markers.
+      s = this.src;
+      indent_found = false;
+
+      for (start = pos = indent = offset = 0, len = s.length; pos < len; pos++) {
+        ch = s.charCodeAt(pos);
+
+        if (!indent_found) {
+          if (isSpace$6(ch)) {
+            indent++;
+
+            if (ch === 0x09) {
+              offset += 4 - offset % 4;
+            } else {
+              offset++;
+            }
+            continue;
+          } else {
+            indent_found = true;
+          }
+        }
+
+        if (ch === 0x0A || pos === len - 1) {
+          if (ch !== 0x0A) { pos++; }
+          this.bMarks.push(start);
+          this.eMarks.push(pos);
+          this.tShift.push(indent);
+          this.sCount.push(offset);
+          this.bsCount.push(0);
+
+          indent_found = false;
+          indent = 0;
+          offset = 0;
+          start = pos + 1;
+        }
+      }
+
+      // Push fake entry to simplify cache bounds checks
+      this.bMarks.push(s.length);
+      this.eMarks.push(s.length);
+      this.tShift.push(0);
+      this.sCount.push(0);
+      this.bsCount.push(0);
+
+      this.lineMax = this.bMarks.length - 1; // don't count last fake line
+    }
+
+    // Push new token to "stream".
+    //
+    StateBlock.prototype.push = function (type, tag, nesting) {
+      var token$1 = new token(type, tag, nesting);
+      token$1.block = true;
+
+      if (nesting < 0) this.level--; // closing tag
+      token$1.level = this.level;
+      if (nesting > 0) this.level++; // opening tag
+
+      this.tokens.push(token$1);
+      return token$1;
+    };
+
+    StateBlock.prototype.isEmpty = function isEmpty(line) {
+      return this.bMarks[line] + this.tShift[line] >= this.eMarks[line];
+    };
+
+    StateBlock.prototype.skipEmptyLines = function skipEmptyLines(from) {
+      for (var max = this.lineMax; from < max; from++) {
+        if (this.bMarks[from] + this.tShift[from] < this.eMarks[from]) {
+          break;
+        }
+      }
+      return from;
+    };
+
+    // Skip spaces from given position.
+    StateBlock.prototype.skipSpaces = function skipSpaces(pos) {
+      var ch;
+
+      for (var max = this.src.length; pos < max; pos++) {
+        ch = this.src.charCodeAt(pos);
+        if (!isSpace$6(ch)) { break; }
+      }
+      return pos;
+    };
+
+    // Skip spaces from given position in reverse.
+    StateBlock.prototype.skipSpacesBack = function skipSpacesBack(pos, min) {
+      if (pos <= min) { return pos; }
+
+      while (pos > min) {
+        if (!isSpace$6(this.src.charCodeAt(--pos))) { return pos + 1; }
+      }
+      return pos;
+    };
+
+    // Skip char codes from given position
+    StateBlock.prototype.skipChars = function skipChars(pos, code) {
+      for (var max = this.src.length; pos < max; pos++) {
+        if (this.src.charCodeAt(pos) !== code) { break; }
+      }
+      return pos;
+    };
+
+    // Skip char codes reverse from given position - 1
+    StateBlock.prototype.skipCharsBack = function skipCharsBack(pos, code, min) {
+      if (pos <= min) { return pos; }
+
+      while (pos > min) {
+        if (code !== this.src.charCodeAt(--pos)) { return pos + 1; }
+      }
+      return pos;
+    };
+
+    // cut lines range from source.
+    StateBlock.prototype.getLines = function getLines(begin, end, indent, keepLastLF) {
+      var i, lineIndent, ch, first, last, queue, lineStart,
+          line = begin;
+
+      if (begin >= end) {
+        return '';
+      }
+
+      queue = new Array(end - begin);
+
+      for (i = 0; line < end; line++, i++) {
+        lineIndent = 0;
+        lineStart = first = this.bMarks[line];
+
+        if (line + 1 < end || keepLastLF) {
+          // No need for bounds check because we have fake entry on tail.
+          last = this.eMarks[line] + 1;
+        } else {
+          last = this.eMarks[line];
+        }
+
+        while (first < last && lineIndent < indent) {
+          ch = this.src.charCodeAt(first);
+
+          if (isSpace$6(ch)) {
+            if (ch === 0x09) {
+              lineIndent += 4 - (lineIndent + this.bsCount[line]) % 4;
+            } else {
+              lineIndent++;
+            }
+          } else if (first - lineStart < this.tShift[line]) {
+            // patched tShift masked characters to look like spaces (blockquotes, list markers)
+            lineIndent++;
+          } else {
+            break;
+          }
+
+          first++;
+        }
+
+        if (lineIndent > indent) {
+          // partially expanding tabs in code blocks, e.g '\t\tfoobar'
+          // with indent=2 becomes '  \tfoobar'
+          queue[i] = new Array(lineIndent - indent + 1).join(' ') + this.src.slice(first, last);
+        } else {
+          queue[i] = this.src.slice(first, last);
+        }
+      }
+
+      return queue.join('');
+    };
+
+    // re-export Token class to use in block rules
+    StateBlock.prototype.Token = token;
+
+
+    var state_block = StateBlock;
+
+    var _rules$1 = [
+      // First 2 params - rule name & source. Secondary array - list of rules,
+      // which can be terminated by this one.
+      [ 'table',      table,      [ 'paragraph', 'reference' ] ],
+      [ 'code',       code ],
+      [ 'fence',      fence,      [ 'paragraph', 'reference', 'blockquote', 'list' ] ],
+      [ 'blockquote', blockquote, [ 'paragraph', 'reference', 'blockquote', 'list' ] ],
+      [ 'hr',         hr,         [ 'paragraph', 'reference', 'blockquote', 'list' ] ],
+      [ 'list',       list,       [ 'paragraph', 'reference', 'blockquote' ] ],
+      [ 'reference',  reference ],
+      [ 'heading',    heading,    [ 'paragraph', 'reference', 'blockquote' ] ],
+      [ 'lheading',   lheading ],
+      [ 'html_block', html_block, [ 'paragraph', 'reference', 'blockquote' ] ],
+      [ 'paragraph',  paragraph ]
+    ];
+
+
+    /**
+     * new ParserBlock()
+     **/
+    function ParserBlock() {
+      /**
+       * ParserBlock#ruler -> Ruler
+       *
+       * [[Ruler]] instance. Keep configuration of block rules.
+       **/
+      this.ruler = new ruler();
+
+      for (var i = 0; i < _rules$1.length; i++) {
+        this.ruler.push(_rules$1[i][0], _rules$1[i][1], { alt: (_rules$1[i][2] || []).slice() });
+      }
+    }
+
+
+    // Generate tokens for input range
+    //
+    ParserBlock.prototype.tokenize = function (state, startLine, endLine) {
+      var ok, i,
+          rules = this.ruler.getRules(''),
+          len = rules.length,
+          line = startLine,
+          hasEmptyLines = false,
+          maxNesting = state.md.options.maxNesting;
+
+      while (line < endLine) {
+        state.line = line = state.skipEmptyLines(line);
+        if (line >= endLine) { break; }
+
+        // Termination condition for nested calls.
+        // Nested calls currently used for blockquotes & lists
+        if (state.sCount[line] < state.blkIndent) { break; }
+
+        // If nesting level exceeded - skip tail to the end. That's not ordinary
+        // situation and we should not care about content.
+        if (state.level >= maxNesting) {
+          state.line = endLine;
+          break;
+        }
+
+        // Try all possible rules.
+        // On success, rule should:
+        //
+        // - update `state.line`
+        // - update `state.tokens`
+        // - return true
+
+        for (i = 0; i < len; i++) {
+          ok = rules[i](state, line, endLine, false);
+          if (ok) { break; }
+        }
+
+        // set state.tight if we had an empty line before current tag
+        // i.e. latest empty line should not count
+        state.tight = !hasEmptyLines;
+
+        // paragraph might "eat" one newline after it in nested lists
+        if (state.isEmpty(state.line - 1)) {
+          hasEmptyLines = true;
+        }
+
+        line = state.line;
+
+        if (line < endLine && state.isEmpty(line)) {
+          hasEmptyLines = true;
+          line++;
+          state.line = line;
+        }
+      }
+    };
+
+
+    /**
+     * ParserBlock.parse(str, md, env, outTokens)
+     *
+     * Process input string and push block tokens into `outTokens`
+     **/
+    ParserBlock.prototype.parse = function (src, md, env, outTokens) {
+      var state;
+
+      if (!src) { return; }
+
+      state = new this.State(src, md, env, outTokens);
+
+      this.tokenize(state, state.line, state.lineMax);
+    };
+
+
+    ParserBlock.prototype.State = state_block;
+
+
+    var parser_block = ParserBlock;
+
+    // Skip text characters for text token, place those to pending buffer
+
+
+    // Rule to skip pure text
+    // '{}$%@~+=:' reserved for extentions
+
+    // !, ", #, $, %, &, ', (, ), *, +, ,, -, ., /, :, ;, <, =, >, ?, @, [, \, ], ^, _, `, {, |, }, or ~
+
+    // !!!! Don't confuse with "Markdown ASCII Punctuation" chars
+    // http://spec.commonmark.org/0.15/#ascii-punctuation-character
+    function isTerminatorChar(ch) {
+      switch (ch) {
+        case 0x0A/* \n */:
+        case 0x21/* ! */:
+        case 0x23/* # */:
+        case 0x24/* $ */:
+        case 0x25/* % */:
+        case 0x26/* & */:
+        case 0x2A/* * */:
+        case 0x2B/* + */:
+        case 0x2D/* - */:
+        case 0x3A/* : */:
+        case 0x3C/* < */:
+        case 0x3D/* = */:
+        case 0x3E/* > */:
+        case 0x40/* @ */:
+        case 0x5B/* [ */:
+        case 0x5C/* \ */:
+        case 0x5D/* ] */:
+        case 0x5E/* ^ */:
+        case 0x5F/* _ */:
+        case 0x60/* ` */:
+        case 0x7B/* { */:
+        case 0x7D/* } */:
+        case 0x7E/* ~ */:
+          return true;
+        default:
+          return false;
+      }
+    }
+
+    var text$1 = function text(state, silent) {
+      var pos = state.pos;
+
+      while (pos < state.posMax && !isTerminatorChar(state.src.charCodeAt(pos))) {
+        pos++;
+      }
+
+      if (pos === state.pos) { return false; }
+
+      if (!silent) { state.pending += state.src.slice(state.pos, pos); }
+
+      state.pos = pos;
+
+      return true;
+    };
+
+    var isSpace$7 = utils.isSpace;
+
+
+    var newline = function newline(state, silent) {
+      var pmax, max, pos = state.pos;
+
+      if (state.src.charCodeAt(pos) !== 0x0A/* \n */) { return false; }
+
+      pmax = state.pending.length - 1;
+      max = state.posMax;
+
+      // '  \n' -> hardbreak
+      // Lookup in pending chars is bad practice! Don't copy to other rules!
+      // Pending string is stored in concat mode, indexed lookups will cause
+      // convertion to flat mode.
+      if (!silent) {
+        if (pmax >= 0 && state.pending.charCodeAt(pmax) === 0x20) {
+          if (pmax >= 1 && state.pending.charCodeAt(pmax - 1) === 0x20) {
+            state.pending = state.pending.replace(/ +$/, '');
+            state.push('hardbreak', 'br', 0);
+          } else {
+            state.pending = state.pending.slice(0, -1);
+            state.push('softbreak', 'br', 0);
+          }
+
+        } else {
+          state.push('softbreak', 'br', 0);
+        }
+      }
+
+      pos++;
+
+      // skip heading spaces for next line
+      while (pos < max && isSpace$7(state.src.charCodeAt(pos))) { pos++; }
+
+      state.pos = pos;
+      return true;
+    };
+
+    var isSpace$8 = utils.isSpace;
+
+    var ESCAPED = [];
+
+    for (var i = 0; i < 256; i++) { ESCAPED.push(0); }
+
+    '\\!"#$%&\'()*+,./:;<=>?@[]^_`{|}~-'
+      .split('').forEach(function (ch) { ESCAPED[ch.charCodeAt(0)] = 1; });
+
+
+    var _escape = function escape(state, silent) {
+      var ch, pos = state.pos, max = state.posMax;
+
+      if (state.src.charCodeAt(pos) !== 0x5C/* \ */) { return false; }
+
+      pos++;
+
+      if (pos < max) {
+        ch = state.src.charCodeAt(pos);
+
+        if (ch < 256 && ESCAPED[ch] !== 0) {
+          if (!silent) { state.pending += state.src[pos]; }
+          state.pos += 2;
+          return true;
+        }
+
+        if (ch === 0x0A) {
+          if (!silent) {
+            state.push('hardbreak', 'br', 0);
+          }
+
+          pos++;
+          // skip leading whitespaces from next line
+          while (pos < max) {
+            ch = state.src.charCodeAt(pos);
+            if (!isSpace$8(ch)) { break; }
+            pos++;
+          }
+
+          state.pos = pos;
+          return true;
+        }
+      }
+
+      if (!silent) { state.pending += '\\'; }
+      state.pos++;
+      return true;
+    };
+
+    // Parse backticks
+
+    var backticks = function backtick(state, silent) {
+      var start, max, marker, matchStart, matchEnd, token,
+          pos = state.pos,
+          ch = state.src.charCodeAt(pos);
+
+      if (ch !== 0x60/* ` */) { return false; }
+
+      start = pos;
+      pos++;
+      max = state.posMax;
+
+      while (pos < max && state.src.charCodeAt(pos) === 0x60/* ` */) { pos++; }
+
+      marker = state.src.slice(start, pos);
+
+      matchStart = matchEnd = pos;
+
+      while ((matchStart = state.src.indexOf('`', matchEnd)) !== -1) {
+        matchEnd = matchStart + 1;
+
+        while (matchEnd < max && state.src.charCodeAt(matchEnd) === 0x60/* ` */) { matchEnd++; }
+
+        if (matchEnd - matchStart === marker.length) {
+          if (!silent) {
+            token         = state.push('code_inline', 'code', 0);
+            token.markup  = marker;
+            token.content = state.src.slice(pos, matchStart)
+              .replace(/\n/g, ' ')
+              .replace(/^ (.+) $/, '$1');
+          }
+          state.pos = matchEnd;
+          return true;
+        }
+      }
+
+      if (!silent) { state.pending += marker; }
+      state.pos += marker.length;
+      return true;
+    };
+
+    // ~~strike through~~
+
+
+    // Insert each marker as a separate text token, and add it to delimiter list
+    //
+    var tokenize = function strikethrough(state, silent) {
+      var i, scanned, token, len, ch,
+          start = state.pos,
+          marker = state.src.charCodeAt(start);
+
+      if (silent) { return false; }
+
+      if (marker !== 0x7E/* ~ */) { return false; }
+
+      scanned = state.scanDelims(state.pos, true);
+      len = scanned.length;
+      ch = String.fromCharCode(marker);
+
+      if (len < 2) { return false; }
+
+      if (len % 2) {
+        token         = state.push('text', '', 0);
+        token.content = ch;
+        len--;
+      }
+
+      for (i = 0; i < len; i += 2) {
+        token         = state.push('text', '', 0);
+        token.content = ch + ch;
+
+        state.delimiters.push({
+          marker: marker,
+          length: 0, // disable "rule of 3" length checks meant for emphasis
+          jump:   i,
+          token:  state.tokens.length - 1,
+          end:    -1,
+          open:   scanned.can_open,
+          close:  scanned.can_close
+        });
+      }
+
+      state.pos += scanned.length;
+
+      return true;
+    };
+
+
+    function postProcess(state, delimiters) {
+      var i, j,
+          startDelim,
+          endDelim,
+          token,
+          loneMarkers = [],
+          max = delimiters.length;
+
+      for (i = 0; i < max; i++) {
+        startDelim = delimiters[i];
+
+        if (startDelim.marker !== 0x7E/* ~ */) {
+          continue;
+        }
+
+        if (startDelim.end === -1) {
+          continue;
+        }
+
+        endDelim = delimiters[startDelim.end];
+
+        token         = state.tokens[startDelim.token];
+        token.type    = 's_open';
+        token.tag     = 's';
+        token.nesting = 1;
+        token.markup  = '~~';
+        token.content = '';
+
+        token         = state.tokens[endDelim.token];
+        token.type    = 's_close';
+        token.tag     = 's';
+        token.nesting = -1;
+        token.markup  = '~~';
+        token.content = '';
+
+        if (state.tokens[endDelim.token - 1].type === 'text' &&
+            state.tokens[endDelim.token - 1].content === '~') {
+
+          loneMarkers.push(endDelim.token - 1);
+        }
+      }
+
+      // If a marker sequence has an odd number of characters, it's splitted
+      // like this: `~~~~~` -> `~` + `~~` + `~~`, leaving one marker at the
+      // start of the sequence.
+      //
+      // So, we have to move all those markers after subsequent s_close tags.
+      //
+      while (loneMarkers.length) {
+        i = loneMarkers.pop();
+        j = i + 1;
+
+        while (j < state.tokens.length && state.tokens[j].type === 's_close') {
+          j++;
+        }
+
+        j--;
+
+        if (i !== j) {
+          token = state.tokens[j];
+          state.tokens[j] = state.tokens[i];
+          state.tokens[i] = token;
+        }
+      }
+    }
+
+
+    // Walk through delimiter list and replace text tokens with tags
+    //
+    var postProcess_1 = function strikethrough(state) {
+      var curr,
+          tokens_meta = state.tokens_meta,
+          max = state.tokens_meta.length;
+
+      postProcess(state, state.delimiters);
+
+      for (curr = 0; curr < max; curr++) {
+        if (tokens_meta[curr] && tokens_meta[curr].delimiters) {
+          postProcess(state, tokens_meta[curr].delimiters);
+        }
+      }
+    };
+
+    var strikethrough = {
+    	tokenize: tokenize,
+    	postProcess: postProcess_1
+    };
+
+    // Process *this* and _that_
+
+
+    // Insert each marker as a separate text token, and add it to delimiter list
+    //
+    var tokenize$1 = function emphasis(state, silent) {
+      var i, scanned, token,
+          start = state.pos,
+          marker = state.src.charCodeAt(start);
+
+      if (silent) { return false; }
+
+      if (marker !== 0x5F /* _ */ && marker !== 0x2A /* * */) { return false; }
+
+      scanned = state.scanDelims(state.pos, marker === 0x2A);
+
+      for (i = 0; i < scanned.length; i++) {
+        token         = state.push('text', '', 0);
+        token.content = String.fromCharCode(marker);
+
+        state.delimiters.push({
+          // Char code of the starting marker (number).
+          //
+          marker: marker,
+
+          // Total length of these series of delimiters.
+          //
+          length: scanned.length,
+
+          // An amount of characters before this one that's equivalent to
+          // current one. In plain English: if this delimiter does not open
+          // an emphasis, neither do previous `jump` characters.
+          //
+          // Used to skip sequences like "*****" in one step, for 1st asterisk
+          // value will be 0, for 2nd it's 1 and so on.
+          //
+          jump:   i,
+
+          // A position of the token this delimiter corresponds to.
+          //
+          token:  state.tokens.length - 1,
+
+          // If this delimiter is matched as a valid opener, `end` will be
+          // equal to its position, otherwise it's `-1`.
+          //
+          end:    -1,
+
+          // Boolean flags that determine if this delimiter could open or close
+          // an emphasis.
+          //
+          open:   scanned.can_open,
+          close:  scanned.can_close
+        });
+      }
+
+      state.pos += scanned.length;
+
+      return true;
+    };
+
+
+    function postProcess$1(state, delimiters) {
+      var i,
+          startDelim,
+          endDelim,
+          token,
+          ch,
+          isStrong,
+          max = delimiters.length;
+
+      for (i = max - 1; i >= 0; i--) {
+        startDelim = delimiters[i];
+
+        if (startDelim.marker !== 0x5F/* _ */ && startDelim.marker !== 0x2A/* * */) {
+          continue;
+        }
+
+        // Process only opening markers
+        if (startDelim.end === -1) {
+          continue;
+        }
+
+        endDelim = delimiters[startDelim.end];
+
+        // If the previous delimiter has the same marker and is adjacent to this one,
+        // merge those into one strong delimiter.
+        //
+        // `<em><em>whatever</em></em>` -> `<strong>whatever</strong>`
+        //
+        isStrong = i > 0 &&
+                   delimiters[i - 1].end === startDelim.end + 1 &&
+                   delimiters[i - 1].token === startDelim.token - 1 &&
+                   delimiters[startDelim.end + 1].token === endDelim.token + 1 &&
+                   delimiters[i - 1].marker === startDelim.marker;
+
+        ch = String.fromCharCode(startDelim.marker);
+
+        token         = state.tokens[startDelim.token];
+        token.type    = isStrong ? 'strong_open' : 'em_open';
+        token.tag     = isStrong ? 'strong' : 'em';
+        token.nesting = 1;
+        token.markup  = isStrong ? ch + ch : ch;
+        token.content = '';
+
+        token         = state.tokens[endDelim.token];
+        token.type    = isStrong ? 'strong_close' : 'em_close';
+        token.tag     = isStrong ? 'strong' : 'em';
+        token.nesting = -1;
+        token.markup  = isStrong ? ch + ch : ch;
+        token.content = '';
+
+        if (isStrong) {
+          state.tokens[delimiters[i - 1].token].content = '';
+          state.tokens[delimiters[startDelim.end + 1].token].content = '';
+          i--;
+        }
+      }
+    }
+
+
+    // Walk through delimiter list and replace text tokens with tags
+    //
+    var postProcess_1$1 = function emphasis(state) {
+      var curr,
+          tokens_meta = state.tokens_meta,
+          max = state.tokens_meta.length;
+
+      postProcess$1(state, state.delimiters);
+
+      for (curr = 0; curr < max; curr++) {
+        if (tokens_meta[curr] && tokens_meta[curr].delimiters) {
+          postProcess$1(state, tokens_meta[curr].delimiters);
+        }
+      }
+    };
+
+    var emphasis = {
+    	tokenize: tokenize$1,
+    	postProcess: postProcess_1$1
+    };
+
+    var normalizeReference$1   = utils.normalizeReference;
+    var isSpace$9              = utils.isSpace;
+
+
+    var link = function link(state, silent) {
+      var attrs,
+          code,
+          label,
+          labelEnd,
+          labelStart,
+          pos,
+          res,
+          ref,
+          title,
+          token,
+          href = '',
+          oldPos = state.pos,
+          max = state.posMax,
+          start = state.pos,
+          parseReference = true;
+
+      if (state.src.charCodeAt(state.pos) !== 0x5B/* [ */) { return false; }
+
+      labelStart = state.pos + 1;
+      labelEnd = state.md.helpers.parseLinkLabel(state, state.pos, true);
+
+      // parser failed to find ']', so it's not a valid link
+      if (labelEnd < 0) { return false; }
+
+      pos = labelEnd + 1;
+      if (pos < max && state.src.charCodeAt(pos) === 0x28/* ( */) {
+        //
+        // Inline link
+        //
+
+        // might have found a valid shortcut link, disable reference parsing
+        parseReference = false;
+
+        // [link](  <href>  "title"  )
+        //        ^^ skipping these spaces
+        pos++;
+        for (; pos < max; pos++) {
+          code = state.src.charCodeAt(pos);
+          if (!isSpace$9(code) && code !== 0x0A) { break; }
+        }
+        if (pos >= max) { return false; }
+
+        // [link](  <href>  "title"  )
+        //          ^^^^^^ parsing link destination
+        start = pos;
+        res = state.md.helpers.parseLinkDestination(state.src, pos, state.posMax);
+        if (res.ok) {
+          href = state.md.normalizeLink(res.str);
+          if (state.md.validateLink(href)) {
+            pos = res.pos;
+          } else {
+            href = '';
+          }
+        }
+
+        // [link](  <href>  "title"  )
+        //                ^^ skipping these spaces
+        start = pos;
+        for (; pos < max; pos++) {
+          code = state.src.charCodeAt(pos);
+          if (!isSpace$9(code) && code !== 0x0A) { break; }
+        }
+
+        // [link](  <href>  "title"  )
+        //                  ^^^^^^^ parsing link title
+        res = state.md.helpers.parseLinkTitle(state.src, pos, state.posMax);
+        if (pos < max && start !== pos && res.ok) {
+          title = res.str;
+          pos = res.pos;
+
+          // [link](  <href>  "title"  )
+          //                         ^^ skipping these spaces
+          for (; pos < max; pos++) {
+            code = state.src.charCodeAt(pos);
+            if (!isSpace$9(code) && code !== 0x0A) { break; }
+          }
+        } else {
+          title = '';
+        }
+
+        if (pos >= max || state.src.charCodeAt(pos) !== 0x29/* ) */) {
+          // parsing a valid shortcut link failed, fallback to reference
+          parseReference = true;
+        }
+        pos++;
+      }
+
+      if (parseReference) {
+        //
+        // Link reference
+        //
+        if (typeof state.env.references === 'undefined') { return false; }
+
+        if (pos < max && state.src.charCodeAt(pos) === 0x5B/* [ */) {
+          start = pos + 1;
+          pos = state.md.helpers.parseLinkLabel(state, pos);
+          if (pos >= 0) {
+            label = state.src.slice(start, pos++);
+          } else {
+            pos = labelEnd + 1;
+          }
+        } else {
+          pos = labelEnd + 1;
+        }
+
+        // covers label === '' and label === undefined
+        // (collapsed reference link and shortcut reference link respectively)
+        if (!label) { label = state.src.slice(labelStart, labelEnd); }
+
+        ref = state.env.references[normalizeReference$1(label)];
+        if (!ref) {
+          state.pos = oldPos;
+          return false;
+        }
+        href = ref.href;
+        title = ref.title;
+      }
+
+      //
+      // We found the end of the link, and know for a fact it's a valid link;
+      // so all that's left to do is to call tokenizer.
+      //
+      if (!silent) {
+        state.pos = labelStart;
+        state.posMax = labelEnd;
+
+        token        = state.push('link_open', 'a', 1);
+        token.attrs  = attrs = [ [ 'href', href ] ];
+        if (title) {
+          attrs.push([ 'title', title ]);
+        }
+
+        state.md.inline.tokenize(state);
+
+        token        = state.push('link_close', 'a', -1);
+      }
+
+      state.pos = pos;
+      state.posMax = max;
+      return true;
+    };
+
+    var normalizeReference$2   = utils.normalizeReference;
+    var isSpace$a              = utils.isSpace;
+
+
+    var image$1 = function image(state, silent) {
+      var attrs,
+          code,
+          content,
+          label,
+          labelEnd,
+          labelStart,
+          pos,
+          ref,
+          res,
+          title,
+          token,
+          tokens,
+          start,
+          href = '',
+          oldPos = state.pos,
+          max = state.posMax;
+
+      if (state.src.charCodeAt(state.pos) !== 0x21/* ! */) { return false; }
+      if (state.src.charCodeAt(state.pos + 1) !== 0x5B/* [ */) { return false; }
+
+      labelStart = state.pos + 2;
+      labelEnd = state.md.helpers.parseLinkLabel(state, state.pos + 1, false);
+
+      // parser failed to find ']', so it's not a valid link
+      if (labelEnd < 0) { return false; }
+
+      pos = labelEnd + 1;
+      if (pos < max && state.src.charCodeAt(pos) === 0x28/* ( */) {
+        //
+        // Inline link
+        //
+
+        // [link](  <href>  "title"  )
+        //        ^^ skipping these spaces
+        pos++;
+        for (; pos < max; pos++) {
+          code = state.src.charCodeAt(pos);
+          if (!isSpace$a(code) && code !== 0x0A) { break; }
+        }
+        if (pos >= max) { return false; }
+
+        // [link](  <href>  "title"  )
+        //          ^^^^^^ parsing link destination
+        start = pos;
+        res = state.md.helpers.parseLinkDestination(state.src, pos, state.posMax);
+        if (res.ok) {
+          href = state.md.normalizeLink(res.str);
+          if (state.md.validateLink(href)) {
+            pos = res.pos;
+          } else {
+            href = '';
+          }
+        }
+
+        // [link](  <href>  "title"  )
+        //                ^^ skipping these spaces
+        start = pos;
+        for (; pos < max; pos++) {
+          code = state.src.charCodeAt(pos);
+          if (!isSpace$a(code) && code !== 0x0A) { break; }
+        }
+
+        // [link](  <href>  "title"  )
+        //                  ^^^^^^^ parsing link title
+        res = state.md.helpers.parseLinkTitle(state.src, pos, state.posMax);
+        if (pos < max && start !== pos && res.ok) {
+          title = res.str;
+          pos = res.pos;
+
+          // [link](  <href>  "title"  )
+          //                         ^^ skipping these spaces
+          for (; pos < max; pos++) {
+            code = state.src.charCodeAt(pos);
+            if (!isSpace$a(code) && code !== 0x0A) { break; }
+          }
+        } else {
+          title = '';
+        }
+
+        if (pos >= max || state.src.charCodeAt(pos) !== 0x29/* ) */) {
+          state.pos = oldPos;
+          return false;
+        }
+        pos++;
+      } else {
+        //
+        // Link reference
+        //
+        if (typeof state.env.references === 'undefined') { return false; }
+
+        if (pos < max && state.src.charCodeAt(pos) === 0x5B/* [ */) {
+          start = pos + 1;
+          pos = state.md.helpers.parseLinkLabel(state, pos);
+          if (pos >= 0) {
+            label = state.src.slice(start, pos++);
+          } else {
+            pos = labelEnd + 1;
+          }
+        } else {
+          pos = labelEnd + 1;
+        }
+
+        // covers label === '' and label === undefined
+        // (collapsed reference link and shortcut reference link respectively)
+        if (!label) { label = state.src.slice(labelStart, labelEnd); }
+
+        ref = state.env.references[normalizeReference$2(label)];
+        if (!ref) {
+          state.pos = oldPos;
+          return false;
+        }
+        href = ref.href;
+        title = ref.title;
+      }
+
+      //
+      // We found the end of the link, and know for a fact it's a valid link;
+      // so all that's left to do is to call tokenizer.
+      //
+      if (!silent) {
+        content = state.src.slice(labelStart, labelEnd);
+
+        state.md.inline.parse(
+          content,
+          state.md,
+          state.env,
+          tokens = []
+        );
+
+        token          = state.push('image', 'img', 0);
+        token.attrs    = attrs = [ [ 'src', href ], [ 'alt', '' ] ];
+        token.children = tokens;
+        token.content  = content;
+
+        if (title) {
+          attrs.push([ 'title', title ]);
+        }
+      }
+
+      state.pos = pos;
+      state.posMax = max;
+      return true;
+    };
+
+    // Process autolinks '<protocol:...>'
+
+
+    /*eslint max-len:0*/
+    var EMAIL_RE    = /^<([a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*)>/;
+    var AUTOLINK_RE = /^<([a-zA-Z][a-zA-Z0-9+.\-]{1,31}):([^<>\x00-\x20]*)>/;
+
+
+    var autolink = function autolink(state, silent) {
+      var tail, linkMatch, emailMatch, url, fullUrl, token,
+          pos = state.pos;
+
+      if (state.src.charCodeAt(pos) !== 0x3C/* < */) { return false; }
+
+      tail = state.src.slice(pos);
+
+      if (tail.indexOf('>') < 0) { return false; }
+
+      if (AUTOLINK_RE.test(tail)) {
+        linkMatch = tail.match(AUTOLINK_RE);
+
+        url = linkMatch[0].slice(1, -1);
+        fullUrl = state.md.normalizeLink(url);
+        if (!state.md.validateLink(fullUrl)) { return false; }
+
+        if (!silent) {
+          token         = state.push('link_open', 'a', 1);
+          token.attrs   = [ [ 'href', fullUrl ] ];
+          token.markup  = 'autolink';
+          token.info    = 'auto';
+
+          token         = state.push('text', '', 0);
+          token.content = state.md.normalizeLinkText(url);
+
+          token         = state.push('link_close', 'a', -1);
+          token.markup  = 'autolink';
+          token.info    = 'auto';
+        }
+
+        state.pos += linkMatch[0].length;
+        return true;
+      }
+
+      if (EMAIL_RE.test(tail)) {
+        emailMatch = tail.match(EMAIL_RE);
+
+        url = emailMatch[0].slice(1, -1);
+        fullUrl = state.md.normalizeLink('mailto:' + url);
+        if (!state.md.validateLink(fullUrl)) { return false; }
+
+        if (!silent) {
+          token         = state.push('link_open', 'a', 1);
+          token.attrs   = [ [ 'href', fullUrl ] ];
+          token.markup  = 'autolink';
+          token.info    = 'auto';
+
+          token         = state.push('text', '', 0);
+          token.content = state.md.normalizeLinkText(url);
+
+          token         = state.push('link_close', 'a', -1);
+          token.markup  = 'autolink';
+          token.info    = 'auto';
+        }
+
+        state.pos += emailMatch[0].length;
+        return true;
+      }
+
+      return false;
+    };
+
+    var HTML_TAG_RE$1 = html_re.HTML_TAG_RE;
+
+
+    function isLetter(ch) {
+      /*eslint no-bitwise:0*/
+      var lc = ch | 0x20; // to lower case
+      return (lc >= 0x61/* a */) && (lc <= 0x7a/* z */);
+    }
+
+
+    var html_inline = function html_inline(state, silent) {
+      var ch, match, max, token,
+          pos = state.pos;
+
+      if (!state.md.options.html) { return false; }
+
+      // Check start
+      max = state.posMax;
+      if (state.src.charCodeAt(pos) !== 0x3C/* < */ ||
+          pos + 2 >= max) {
+        return false;
+      }
+
+      // Quick fail on second char
+      ch = state.src.charCodeAt(pos + 1);
+      if (ch !== 0x21/* ! */ &&
+          ch !== 0x3F/* ? */ &&
+          ch !== 0x2F/* / */ &&
+          !isLetter(ch)) {
+        return false;
+      }
+
+      match = state.src.slice(pos).match(HTML_TAG_RE$1);
+      if (!match) { return false; }
+
+      if (!silent) {
+        token         = state.push('html_inline', '', 0);
+        token.content = state.src.slice(pos, pos + match[0].length);
+      }
+      state.pos += match[0].length;
+      return true;
+    };
+
+    var has               = utils.has;
+    var isValidEntityCode = utils.isValidEntityCode;
+    var fromCodePoint     = utils.fromCodePoint;
+
+
+    var DIGITAL_RE = /^&#((?:x[a-f0-9]{1,6}|[0-9]{1,7}));/i;
+    var NAMED_RE   = /^&([a-z][a-z0-9]{1,31});/i;
+
+
+    var entity = function entity(state, silent) {
+      var ch, code, match, pos = state.pos, max = state.posMax;
+
+      if (state.src.charCodeAt(pos) !== 0x26/* & */) { return false; }
+
+      if (pos + 1 < max) {
+        ch = state.src.charCodeAt(pos + 1);
+
+        if (ch === 0x23 /* # */) {
+          match = state.src.slice(pos).match(DIGITAL_RE);
+          if (match) {
+            if (!silent) {
+              code = match[1][0].toLowerCase() === 'x' ? parseInt(match[1].slice(1), 16) : parseInt(match[1], 10);
+              state.pending += isValidEntityCode(code) ? fromCodePoint(code) : fromCodePoint(0xFFFD);
+            }
+            state.pos += match[0].length;
+            return true;
+          }
+        } else {
+          match = state.src.slice(pos).match(NAMED_RE);
+          if (match) {
+            if (has(entities$2, match[1])) {
+              if (!silent) { state.pending += entities$2[match[1]]; }
+              state.pos += match[0].length;
+              return true;
+            }
+          }
+        }
+      }
+
+      if (!silent) { state.pending += '&'; }
+      state.pos++;
+      return true;
+    };
+
+    // For each opening emphasis-like marker find a matching closing one
+
+
+    function processDelimiters(state, delimiters) {
+      var closerIdx, openerIdx, closer, opener, minOpenerIdx, newMinOpenerIdx,
+          isOddMatch, lastJump,
+          openersBottom = {},
+          max = delimiters.length;
+
+      for (closerIdx = 0; closerIdx < max; closerIdx++) {
+        closer = delimiters[closerIdx];
+
+        // Length is only used for emphasis-specific "rule of 3",
+        // if it's not defined (in strikethrough or 3rd party plugins),
+        // we can default it to 0 to disable those checks.
+        //
+        closer.length = closer.length || 0;
+
+        if (!closer.close) continue;
+
+        // Previously calculated lower bounds (previous fails)
+        // for each marker and each delimiter length modulo 3.
+        if (!openersBottom.hasOwnProperty(closer.marker)) {
+          openersBottom[closer.marker] = [ -1, -1, -1 ];
+        }
+
+        minOpenerIdx = openersBottom[closer.marker][closer.length % 3];
+        newMinOpenerIdx = -1;
+
+        openerIdx = closerIdx - closer.jump - 1;
+
+        for (; openerIdx > minOpenerIdx; openerIdx -= opener.jump + 1) {
+          opener = delimiters[openerIdx];
+
+          if (opener.marker !== closer.marker) continue;
+
+          if (newMinOpenerIdx === -1) newMinOpenerIdx = openerIdx;
+
+          if (opener.open &&
+              opener.end < 0 &&
+              opener.level === closer.level) {
+
+            isOddMatch = false;
+
+            // from spec:
+            //
+            // If one of the delimiters can both open and close emphasis, then the
+            // sum of the lengths of the delimiter runs containing the opening and
+            // closing delimiters must not be a multiple of 3 unless both lengths
+            // are multiples of 3.
+            //
+            if (opener.close || closer.open) {
+              if ((opener.length + closer.length) % 3 === 0) {
+                if (opener.length % 3 !== 0 || closer.length % 3 !== 0) {
+                  isOddMatch = true;
+                }
+              }
+            }
+
+            if (!isOddMatch) {
+              // If previous delimiter cannot be an opener, we can safely skip
+              // the entire sequence in future checks. This is required to make
+              // sure algorithm has linear complexity (see *_*_*_*_*_... case).
+              //
+              lastJump = openerIdx > 0 && !delimiters[openerIdx - 1].open ?
+                delimiters[openerIdx - 1].jump + 1 :
+                0;
+
+              closer.jump  = closerIdx - openerIdx + lastJump;
+              closer.open  = false;
+              opener.end   = closerIdx;
+              opener.jump  = lastJump;
+              opener.close = false;
+              newMinOpenerIdx = -1;
+              break;
+            }
+          }
+        }
+
+        if (newMinOpenerIdx !== -1) {
+          // If match for this delimiter run failed, we want to set lower bound for
+          // future lookups. This is required to make sure algorithm has linear
+          // complexity.
+          //
+          // See details here:
+          // https://github.com/commonmark/cmark/issues/178#issuecomment-270417442
+          //
+          openersBottom[closer.marker][(closer.length || 0) % 3] = newMinOpenerIdx;
+        }
+      }
+    }
+
+
+    var balance_pairs = function link_pairs(state) {
+      var curr,
+          tokens_meta = state.tokens_meta,
+          max = state.tokens_meta.length;
+
+      processDelimiters(state, state.delimiters);
+
+      for (curr = 0; curr < max; curr++) {
+        if (tokens_meta[curr] && tokens_meta[curr].delimiters) {
+          processDelimiters(state, tokens_meta[curr].delimiters);
+        }
+      }
+    };
+
+    // Clean up tokens after emphasis and strikethrough postprocessing:
+
+
+    var text_collapse = function text_collapse(state) {
+      var curr, last,
+          level = 0,
+          tokens = state.tokens,
+          max = state.tokens.length;
+
+      for (curr = last = 0; curr < max; curr++) {
+        // re-calculate levels after emphasis/strikethrough turns some text nodes
+        // into opening/closing tags
+        if (tokens[curr].nesting < 0) level--; // closing tag
+        tokens[curr].level = level;
+        if (tokens[curr].nesting > 0) level++; // opening tag
+
+        if (tokens[curr].type === 'text' &&
+            curr + 1 < max &&
+            tokens[curr + 1].type === 'text') {
+
+          // collapse two adjacent text nodes
+          tokens[curr + 1].content = tokens[curr].content + tokens[curr + 1].content;
+        } else {
+          if (curr !== last) { tokens[last] = tokens[curr]; }
+
+          last++;
+        }
+      }
+
+      if (curr !== last) {
+        tokens.length = last;
+      }
+    };
+
+    var isWhiteSpace$1   = utils.isWhiteSpace;
+    var isPunctChar$1    = utils.isPunctChar;
+    var isMdAsciiPunct$1 = utils.isMdAsciiPunct;
+
+
+    function StateInline(src, md, env, outTokens) {
+      this.src = src;
+      this.env = env;
+      this.md = md;
+      this.tokens = outTokens;
+      this.tokens_meta = Array(outTokens.length);
+
+      this.pos = 0;
+      this.posMax = this.src.length;
+      this.level = 0;
+      this.pending = '';
+      this.pendingLevel = 0;
+
+      // Stores { start: end } pairs. Useful for backtrack
+      // optimization of pairs parse (emphasis, strikes).
+      this.cache = {};
+
+      // List of emphasis-like delimiters for current tag
+      this.delimiters = [];
+
+      // Stack of delimiter lists for upper level tags
+      this._prev_delimiters = [];
+    }
+
+
+    // Flush pending text
+    //
+    StateInline.prototype.pushPending = function () {
+      var token$1 = new token('text', '', 0);
+      token$1.content = this.pending;
+      token$1.level = this.pendingLevel;
+      this.tokens.push(token$1);
+      this.pending = '';
+      return token$1;
+    };
+
+
+    // Push new token to "stream".
+    // If pending text exists - flush it as text token
+    //
+    StateInline.prototype.push = function (type, tag, nesting) {
+      if (this.pending) {
+        this.pushPending();
+      }
+
+      var token$1 = new token(type, tag, nesting);
+      var token_meta = null;
+
+      if (nesting < 0) {
+        // closing tag
+        this.level--;
+        this.delimiters = this._prev_delimiters.pop();
+      }
+
+      token$1.level = this.level;
+
+      if (nesting > 0) {
+        // opening tag
+        this.level++;
+        this._prev_delimiters.push(this.delimiters);
+        this.delimiters = [];
+        token_meta = { delimiters: this.delimiters };
+      }
+
+      this.pendingLevel = this.level;
+      this.tokens.push(token$1);
+      this.tokens_meta.push(token_meta);
+      return token$1;
+    };
+
+
+    // Scan a sequence of emphasis-like markers, and determine whether
+    // it can start an emphasis sequence or end an emphasis sequence.
+    //
+    //  - start - position to scan from (it should point at a valid marker);
+    //  - canSplitWord - determine if these markers can be found inside a word
+    //
+    StateInline.prototype.scanDelims = function (start, canSplitWord) {
+      var pos = start, lastChar, nextChar, count, can_open, can_close,
+          isLastWhiteSpace, isLastPunctChar,
+          isNextWhiteSpace, isNextPunctChar,
+          left_flanking = true,
+          right_flanking = true,
+          max = this.posMax,
+          marker = this.src.charCodeAt(start);
+
+      // treat beginning of the line as a whitespace
+      lastChar = start > 0 ? this.src.charCodeAt(start - 1) : 0x20;
+
+      while (pos < max && this.src.charCodeAt(pos) === marker) { pos++; }
+
+      count = pos - start;
+
+      // treat end of the line as a whitespace
+      nextChar = pos < max ? this.src.charCodeAt(pos) : 0x20;
+
+      isLastPunctChar = isMdAsciiPunct$1(lastChar) || isPunctChar$1(String.fromCharCode(lastChar));
+      isNextPunctChar = isMdAsciiPunct$1(nextChar) || isPunctChar$1(String.fromCharCode(nextChar));
+
+      isLastWhiteSpace = isWhiteSpace$1(lastChar);
+      isNextWhiteSpace = isWhiteSpace$1(nextChar);
+
+      if (isNextWhiteSpace) {
+        left_flanking = false;
+      } else if (isNextPunctChar) {
+        if (!(isLastWhiteSpace || isLastPunctChar)) {
+          left_flanking = false;
+        }
+      }
+
+      if (isLastWhiteSpace) {
+        right_flanking = false;
+      } else if (isLastPunctChar) {
+        if (!(isNextWhiteSpace || isNextPunctChar)) {
+          right_flanking = false;
+        }
+      }
+
+      if (!canSplitWord) {
+        can_open  = left_flanking  && (!right_flanking || isLastPunctChar);
+        can_close = right_flanking && (!left_flanking  || isNextPunctChar);
+      } else {
+        can_open  = left_flanking;
+        can_close = right_flanking;
+      }
+
+      return {
+        can_open:  can_open,
+        can_close: can_close,
+        length:    count
+      };
+    };
+
+
+    // re-export Token class to use in block rules
+    StateInline.prototype.Token = token;
+
+
+    var state_inline = StateInline;
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // Parser rules
+
+    var _rules$2 = [
+      [ 'text',            text$1 ],
+      [ 'newline',         newline ],
+      [ 'escape',          _escape ],
+      [ 'backticks',       backticks ],
+      [ 'strikethrough',   strikethrough.tokenize ],
+      [ 'emphasis',        emphasis.tokenize ],
+      [ 'link',            link ],
+      [ 'image',           image$1 ],
+      [ 'autolink',        autolink ],
+      [ 'html_inline',     html_inline ],
+      [ 'entity',          entity ]
+    ];
+
+    var _rules2 = [
+      [ 'balance_pairs',   balance_pairs ],
+      [ 'strikethrough',   strikethrough.postProcess ],
+      [ 'emphasis',        emphasis.postProcess ],
+      [ 'text_collapse',   text_collapse ]
+    ];
+
+
+    /**
+     * new ParserInline()
+     **/
+    function ParserInline() {
+      var i;
+
+      /**
+       * ParserInline#ruler -> Ruler
+       *
+       * [[Ruler]] instance. Keep configuration of inline rules.
+       **/
+      this.ruler = new ruler();
+
+      for (i = 0; i < _rules$2.length; i++) {
+        this.ruler.push(_rules$2[i][0], _rules$2[i][1]);
+      }
+
+      /**
+       * ParserInline#ruler2 -> Ruler
+       *
+       * [[Ruler]] instance. Second ruler used for post-processing
+       * (e.g. in emphasis-like rules).
+       **/
+      this.ruler2 = new ruler();
+
+      for (i = 0; i < _rules2.length; i++) {
+        this.ruler2.push(_rules2[i][0], _rules2[i][1]);
+      }
+    }
+
+
+    // Skip single token by running all rules in validation mode;
+    // returns `true` if any rule reported success
+    //
+    ParserInline.prototype.skipToken = function (state) {
+      var ok, i, pos = state.pos,
+          rules = this.ruler.getRules(''),
+          len = rules.length,
+          maxNesting = state.md.options.maxNesting,
+          cache = state.cache;
+
+
+      if (typeof cache[pos] !== 'undefined') {
+        state.pos = cache[pos];
+        return;
+      }
+
+      if (state.level < maxNesting) {
+        for (i = 0; i < len; i++) {
+          // Increment state.level and decrement it later to limit recursion.
+          // It's harmless to do here, because no tokens are created. But ideally,
+          // we'd need a separate private state variable for this purpose.
+          //
+          state.level++;
+          ok = rules[i](state, true);
+          state.level--;
+
+          if (ok) { break; }
+        }
+      } else {
+        // Too much nesting, just skip until the end of the paragraph.
+        //
+        // NOTE: this will cause links to behave incorrectly in the following case,
+        //       when an amount of `[` is exactly equal to `maxNesting + 1`:
+        //
+        //       [[[[[[[[[[[[[[[[[[[[[foo]()
+        //
+        // TODO: remove this workaround when CM standard will allow nested links
+        //       (we can replace it by preventing links from being parsed in
+        //       validation mode)
+        //
+        state.pos = state.posMax;
+      }
+
+      if (!ok) { state.pos++; }
+      cache[pos] = state.pos;
+    };
+
+
+    // Generate tokens for input range
+    //
+    ParserInline.prototype.tokenize = function (state) {
+      var ok, i,
+          rules = this.ruler.getRules(''),
+          len = rules.length,
+          end = state.posMax,
+          maxNesting = state.md.options.maxNesting;
+
+      while (state.pos < end) {
+        // Try all possible rules.
+        // On success, rule should:
+        //
+        // - update `state.pos`
+        // - update `state.tokens`
+        // - return true
+
+        if (state.level < maxNesting) {
+          for (i = 0; i < len; i++) {
+            ok = rules[i](state, false);
+            if (ok) { break; }
+          }
+        }
+
+        if (ok) {
+          if (state.pos >= end) { break; }
+          continue;
+        }
+
+        state.pending += state.src[state.pos++];
+      }
+
+      if (state.pending) {
+        state.pushPending();
+      }
+    };
+
+
+    /**
+     * ParserInline.parse(str, md, env, outTokens)
+     *
+     * Process input string and push inline tokens into `outTokens`
+     **/
+    ParserInline.prototype.parse = function (str, md, env, outTokens) {
+      var i, rules, len;
+      var state = new this.State(str, md, env, outTokens);
+
+      this.tokenize(state);
+
+      rules = this.ruler2.getRules('');
+      len = rules.length;
+
+      for (i = 0; i < len; i++) {
+        rules[i](state);
+      }
+    };
+
+
+    ParserInline.prototype.State = state_inline;
+
+
+    var parser_inline = ParserInline;
+
+    var re = function (opts) {
+      var re = {};
+
+      // Use direct extract instead of `regenerate` to reduse browserified size
+      re.src_Any = regex$1.source;
+      re.src_Cc  = regex$2.source;
+      re.src_Z   = regex$4.source;
+      re.src_P   = regex.source;
+
+      // \p{\Z\P\Cc\CF} (white spaces + control + format + punctuation)
+      re.src_ZPCc = [ re.src_Z, re.src_P, re.src_Cc ].join('|');
+
+      // \p{\Z\Cc} (white spaces + control)
+      re.src_ZCc = [ re.src_Z, re.src_Cc ].join('|');
+
+      // Experimental. List of chars, completely prohibited in links
+      // because can separate it from other part of text
+      var text_separators = '[><\uff5c]';
+
+      // All possible word characters (everything without punctuation, spaces & controls)
+      // Defined via punctuation & spaces to save space
+      // Should be something like \p{\L\N\S\M} (\w but without `_`)
+      re.src_pseudo_letter       = '(?:(?!' + text_separators + '|' + re.src_ZPCc + ')' + re.src_Any + ')';
+      // The same as abothe but without [0-9]
+      // var src_pseudo_letter_non_d = '(?:(?![0-9]|' + src_ZPCc + ')' + src_Any + ')';
+
+      ////////////////////////////////////////////////////////////////////////////////
+
+      re.src_ip4 =
+
+        '(?:(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)';
+
+      // Prohibit any of "@/[]()" in user/pass to avoid wrong domain fetch.
+      re.src_auth    = '(?:(?:(?!' + re.src_ZCc + '|[@/\\[\\]()]).)+@)?';
+
+      re.src_port =
+
+        '(?::(?:6(?:[0-4]\\d{3}|5(?:[0-4]\\d{2}|5(?:[0-2]\\d|3[0-5])))|[1-5]?\\d{1,4}))?';
+
+      re.src_host_terminator =
+
+        '(?=$|' + text_separators + '|' + re.src_ZPCc + ')(?!-|_|:\\d|\\.-|\\.(?!$|' + re.src_ZPCc + '))';
+
+      re.src_path =
+
+        '(?:' +
+          '[/?#]' +
+            '(?:' +
+              '(?!' + re.src_ZCc + '|' + text_separators + '|[()[\\]{}.,"\'?!\\-]).|' +
+              '\\[(?:(?!' + re.src_ZCc + '|\\]).)*\\]|' +
+              '\\((?:(?!' + re.src_ZCc + '|[)]).)*\\)|' +
+              '\\{(?:(?!' + re.src_ZCc + '|[}]).)*\\}|' +
+              '\\"(?:(?!' + re.src_ZCc + '|["]).)+\\"|' +
+              "\\'(?:(?!" + re.src_ZCc + "|[']).)+\\'|" +
+              "\\'(?=" + re.src_pseudo_letter + '|[-]).|' +  // allow `I'm_king` if no pair found
+              '\\.{2,4}[a-zA-Z0-9%/]|' + // github has ... in commit range links,
+                                         // google has .... in links (issue #66)
+                                         // Restrict to
+                                         // - english
+                                         // - percent-encoded
+                                         // - parts of file path
+                                         // until more examples found.
+              '\\.(?!' + re.src_ZCc + '|[.]).|' +
+              (opts && opts['---'] ?
+                '\\-(?!--(?:[^-]|$))(?:-*)|' // `---` => long dash, terminate
+                :
+                '\\-+|'
+              ) +
+              '\\,(?!' + re.src_ZCc + ').|' +      // allow `,,,` in paths
+              '\\!(?!' + re.src_ZCc + '|[!]).|' +
+              '\\?(?!' + re.src_ZCc + '|[?]).' +
+            ')+' +
+          '|\\/' +
+        ')?';
+
+      // Allow anything in markdown spec, forbid quote (") at the first position
+      // because emails enclosed in quotes are far more common
+      re.src_email_name =
+
+        '[\\-;:&=\\+\\$,\\.a-zA-Z0-9_][\\-;:&=\\+\\$,\\"\\.a-zA-Z0-9_]*';
+
+      re.src_xn =
+
+        'xn--[a-z0-9\\-]{1,59}';
+
+      // More to read about domain names
+      // http://serverfault.com/questions/638260/
+
+      re.src_domain_root =
+
+        // Allow letters & digits (http://test1)
+        '(?:' +
+          re.src_xn +
+          '|' +
+          re.src_pseudo_letter + '{1,63}' +
+        ')';
+
+      re.src_domain =
+
+        '(?:' +
+          re.src_xn +
+          '|' +
+          '(?:' + re.src_pseudo_letter + ')' +
+          '|' +
+          '(?:' + re.src_pseudo_letter + '(?:-|' + re.src_pseudo_letter + '){0,61}' + re.src_pseudo_letter + ')' +
+        ')';
+
+      re.src_host =
+
+        '(?:' +
+        // Don't need IP check, because digits are already allowed in normal domain names
+        //   src_ip4 +
+        // '|' +
+          '(?:(?:(?:' + re.src_domain + ')\\.)*' + re.src_domain/*_root*/ + ')' +
+        ')';
+
+      re.tpl_host_fuzzy =
+
+        '(?:' +
+          re.src_ip4 +
+        '|' +
+          '(?:(?:(?:' + re.src_domain + ')\\.)+(?:%TLDS%))' +
+        ')';
+
+      re.tpl_host_no_ip_fuzzy =
+
+        '(?:(?:(?:' + re.src_domain + ')\\.)+(?:%TLDS%))';
+
+      re.src_host_strict =
+
+        re.src_host + re.src_host_terminator;
+
+      re.tpl_host_fuzzy_strict =
+
+        re.tpl_host_fuzzy + re.src_host_terminator;
+
+      re.src_host_port_strict =
+
+        re.src_host + re.src_port + re.src_host_terminator;
+
+      re.tpl_host_port_fuzzy_strict =
+
+        re.tpl_host_fuzzy + re.src_port + re.src_host_terminator;
+
+      re.tpl_host_port_no_ip_fuzzy_strict =
+
+        re.tpl_host_no_ip_fuzzy + re.src_port + re.src_host_terminator;
+
+
+      ////////////////////////////////////////////////////////////////////////////////
+      // Main rules
+
+      // Rude test fuzzy links by host, for quick deny
+      re.tpl_host_fuzzy_test =
+
+        'localhost|www\\.|\\.\\d{1,3}\\.|(?:\\.(?:%TLDS%)(?:' + re.src_ZPCc + '|>|$))';
+
+      re.tpl_email_fuzzy =
+
+          '(^|' + text_separators + '|"|\\(|' + re.src_ZCc + ')' +
+          '(' + re.src_email_name + '@' + re.tpl_host_fuzzy_strict + ')';
+
+      re.tpl_link_fuzzy =
+          // Fuzzy link can't be prepended with .:/\- and non punctuation.
+          // but can start with > (markdown blockquote)
+          '(^|(?![.:/\\-_@])(?:[$+<=>^`|\uff5c]|' + re.src_ZPCc + '))' +
+          '((?![$+<=>^`|\uff5c])' + re.tpl_host_port_fuzzy_strict + re.src_path + ')';
+
+      re.tpl_link_no_ip_fuzzy =
+          // Fuzzy link can't be prepended with .:/\- and non punctuation.
+          // but can start with > (markdown blockquote)
+          '(^|(?![.:/\\-_@])(?:[$+<=>^`|\uff5c]|' + re.src_ZPCc + '))' +
+          '((?![$+<=>^`|\uff5c])' + re.tpl_host_port_no_ip_fuzzy_strict + re.src_path + ')';
+
+      return re;
+    };
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // Helpers
+
+    // Merge objects
+    //
+    function assign$1(obj /*from1, from2, from3, ...*/) {
+      var sources = Array.prototype.slice.call(arguments, 1);
+
+      sources.forEach(function (source) {
+        if (!source) { return; }
+
+        Object.keys(source).forEach(function (key) {
+          obj[key] = source[key];
+        });
+      });
+
+      return obj;
+    }
+
+    function _class(obj) { return Object.prototype.toString.call(obj); }
+    function isString(obj) { return _class(obj) === '[object String]'; }
+    function isObject(obj) { return _class(obj) === '[object Object]'; }
+    function isRegExp(obj) { return _class(obj) === '[object RegExp]'; }
+    function isFunction(obj) { return _class(obj) === '[object Function]'; }
+
+
+    function escapeRE(str) { return str.replace(/[.?*+^$[\]\\(){}|-]/g, '\\$&'); }
+
+    ////////////////////////////////////////////////////////////////////////////////
+
+
+    var defaultOptions = {
+      fuzzyLink: true,
+      fuzzyEmail: true,
+      fuzzyIP: false
+    };
+
+
+    function isOptionsObj(obj) {
+      return Object.keys(obj || {}).reduce(function (acc, k) {
+        return acc || defaultOptions.hasOwnProperty(k);
+      }, false);
+    }
+
+
+    var defaultSchemas = {
+      'http:': {
+        validate: function (text, pos, self) {
+          var tail = text.slice(pos);
+
+          if (!self.re.http) {
+            // compile lazily, because "host"-containing variables can change on tlds update.
+            self.re.http =  new RegExp(
+              '^\\/\\/' + self.re.src_auth + self.re.src_host_port_strict + self.re.src_path, 'i'
+            );
+          }
+          if (self.re.http.test(tail)) {
+            return tail.match(self.re.http)[0].length;
+          }
+          return 0;
+        }
+      },
+      'https:':  'http:',
+      'ftp:':    'http:',
+      '//':      {
+        validate: function (text, pos, self) {
+          var tail = text.slice(pos);
+
+          if (!self.re.no_http) {
+          // compile lazily, because "host"-containing variables can change on tlds update.
+            self.re.no_http =  new RegExp(
+              '^' +
+              self.re.src_auth +
+              // Don't allow single-level domains, because of false positives like '//test'
+              // with code comments
+              '(?:localhost|(?:(?:' + self.re.src_domain + ')\\.)+' + self.re.src_domain_root + ')' +
+              self.re.src_port +
+              self.re.src_host_terminator +
+              self.re.src_path,
+
+              'i'
+            );
+          }
+
+          if (self.re.no_http.test(tail)) {
+            // should not be `://` & `///`, that protects from errors in protocol name
+            if (pos >= 3 && text[pos - 3] === ':') { return 0; }
+            if (pos >= 3 && text[pos - 3] === '/') { return 0; }
+            return tail.match(self.re.no_http)[0].length;
+          }
+          return 0;
+        }
+      },
+      'mailto:': {
+        validate: function (text, pos, self) {
+          var tail = text.slice(pos);
+
+          if (!self.re.mailto) {
+            self.re.mailto =  new RegExp(
+              '^' + self.re.src_email_name + '@' + self.re.src_host_strict, 'i'
+            );
+          }
+          if (self.re.mailto.test(tail)) {
+            return tail.match(self.re.mailto)[0].length;
+          }
+          return 0;
+        }
+      }
+    };
+
+    /*eslint-disable max-len*/
+
+    // RE pattern for 2-character tlds (autogenerated by ./support/tlds_2char_gen.js)
+    var tlds_2ch_src_re = 'a[cdefgilmnoqrstuwxz]|b[abdefghijmnorstvwyz]|c[acdfghiklmnoruvwxyz]|d[ejkmoz]|e[cegrstu]|f[ijkmor]|g[abdefghilmnpqrstuwy]|h[kmnrtu]|i[delmnoqrst]|j[emop]|k[eghimnprwyz]|l[abcikrstuvy]|m[acdeghklmnopqrstuvwxyz]|n[acefgilopruz]|om|p[aefghklmnrstwy]|qa|r[eosuw]|s[abcdeghijklmnortuvxyz]|t[cdfghjklmnortvwz]|u[agksyz]|v[aceginu]|w[fs]|y[et]|z[amw]';
+
+    // DON'T try to make PRs with changes. Extend TLDs with LinkifyIt.tlds() instead
+    var tlds_default = 'biz|com|edu|gov|net|org|pro|web|xxx|aero|asia|coop|info|museum|name|shop|рф'.split('|');
+
+    /*eslint-enable max-len*/
+
+    ////////////////////////////////////////////////////////////////////////////////
+
+    function resetScanCache(self) {
+      self.__index__ = -1;
+      self.__text_cache__   = '';
+    }
+
+    function createValidator(re) {
+      return function (text, pos) {
+        var tail = text.slice(pos);
+
+        if (re.test(tail)) {
+          return tail.match(re)[0].length;
+        }
+        return 0;
+      };
+    }
+
+    function createNormalizer() {
+      return function (match, self) {
+        self.normalize(match);
+      };
+    }
+
+    // Schemas compiler. Build regexps.
+    //
+    function compile(self) {
+
+      // Load & clone RE patterns.
+      var re$1 = self.re = re(self.__opts__);
+
+      // Define dynamic patterns
+      var tlds = self.__tlds__.slice();
+
+      self.onCompile();
+
+      if (!self.__tlds_replaced__) {
+        tlds.push(tlds_2ch_src_re);
+      }
+      tlds.push(re$1.src_xn);
+
+      re$1.src_tlds = tlds.join('|');
+
+      function untpl(tpl) { return tpl.replace('%TLDS%', re$1.src_tlds); }
+
+      re$1.email_fuzzy      = RegExp(untpl(re$1.tpl_email_fuzzy), 'i');
+      re$1.link_fuzzy       = RegExp(untpl(re$1.tpl_link_fuzzy), 'i');
+      re$1.link_no_ip_fuzzy = RegExp(untpl(re$1.tpl_link_no_ip_fuzzy), 'i');
+      re$1.host_fuzzy_test  = RegExp(untpl(re$1.tpl_host_fuzzy_test), 'i');
+
+      //
+      // Compile each schema
+      //
+
+      var aliases = [];
+
+      self.__compiled__ = {}; // Reset compiled data
+
+      function schemaError(name, val) {
+        throw new Error('(LinkifyIt) Invalid schema "' + name + '": ' + val);
+      }
+
+      Object.keys(self.__schemas__).forEach(function (name) {
+        var val = self.__schemas__[name];
+
+        // skip disabled methods
+        if (val === null) { return; }
+
+        var compiled = { validate: null, link: null };
+
+        self.__compiled__[name] = compiled;
+
+        if (isObject(val)) {
+          if (isRegExp(val.validate)) {
+            compiled.validate = createValidator(val.validate);
+          } else if (isFunction(val.validate)) {
+            compiled.validate = val.validate;
+          } else {
+            schemaError(name, val);
+          }
+
+          if (isFunction(val.normalize)) {
+            compiled.normalize = val.normalize;
+          } else if (!val.normalize) {
+            compiled.normalize = createNormalizer();
+          } else {
+            schemaError(name, val);
+          }
+
+          return;
+        }
+
+        if (isString(val)) {
+          aliases.push(name);
+          return;
+        }
+
+        schemaError(name, val);
+      });
+
+      //
+      // Compile postponed aliases
+      //
+
+      aliases.forEach(function (alias) {
+        if (!self.__compiled__[self.__schemas__[alias]]) {
+          // Silently fail on missed schemas to avoid errons on disable.
+          // schemaError(alias, self.__schemas__[alias]);
+          return;
+        }
+
+        self.__compiled__[alias].validate =
+          self.__compiled__[self.__schemas__[alias]].validate;
+        self.__compiled__[alias].normalize =
+          self.__compiled__[self.__schemas__[alias]].normalize;
+      });
+
+      //
+      // Fake record for guessed links
+      //
+      self.__compiled__[''] = { validate: null, normalize: createNormalizer() };
+
+      //
+      // Build schema condition
+      //
+      var slist = Object.keys(self.__compiled__)
+                          .filter(function (name) {
+                            // Filter disabled & fake schemas
+                            return name.length > 0 && self.__compiled__[name];
+                          })
+                          .map(escapeRE)
+                          .join('|');
+      // (?!_) cause 1.5x slowdown
+      self.re.schema_test   = RegExp('(^|(?!_)(?:[><\uff5c]|' + re$1.src_ZPCc + '))(' + slist + ')', 'i');
+      self.re.schema_search = RegExp('(^|(?!_)(?:[><\uff5c]|' + re$1.src_ZPCc + '))(' + slist + ')', 'ig');
+
+      self.re.pretest = RegExp(
+        '(' + self.re.schema_test.source + ')|(' + self.re.host_fuzzy_test.source + ')|@',
+        'i'
+      );
+
+      //
+      // Cleanup
+      //
+
+      resetScanCache(self);
+    }
+
+    /**
+     * class Match
+     *
+     * Match result. Single element of array, returned by [[LinkifyIt#match]]
+     **/
+    function Match(self, shift) {
+      var start = self.__index__,
+          end   = self.__last_index__,
+          text  = self.__text_cache__.slice(start, end);
+
+      /**
+       * Match#schema -> String
+       *
+       * Prefix (protocol) for matched string.
+       **/
+      this.schema    = self.__schema__.toLowerCase();
+      /**
+       * Match#index -> Number
+       *
+       * First position of matched string.
+       **/
+      this.index     = start + shift;
+      /**
+       * Match#lastIndex -> Number
+       *
+       * Next position after matched string.
+       **/
+      this.lastIndex = end + shift;
+      /**
+       * Match#raw -> String
+       *
+       * Matched string.
+       **/
+      this.raw       = text;
+      /**
+       * Match#text -> String
+       *
+       * Notmalized text of matched string.
+       **/
+      this.text      = text;
+      /**
+       * Match#url -> String
+       *
+       * Normalized url of matched string.
+       **/
+      this.url       = text;
+    }
+
+    function createMatch(self, shift) {
+      var match = new Match(self, shift);
+
+      self.__compiled__[match.schema].normalize(match, self);
+
+      return match;
+    }
+
+
+    /**
+     * class LinkifyIt
+     **/
+
+    /**
+     * new LinkifyIt(schemas, options)
+     * - schemas (Object): Optional. Additional schemas to validate (prefix/validator)
+     * - options (Object): { fuzzyLink|fuzzyEmail|fuzzyIP: true|false }
+     *
+     * Creates new linkifier instance with optional additional schemas.
+     * Can be called without `new` keyword for convenience.
+     *
+     * By default understands:
+     *
+     * - `http(s)://...` , `ftp://...`, `mailto:...` & `//...` links
+     * - "fuzzy" links and emails (example.com, foo@bar.com).
+     *
+     * `schemas` is an object, where each key/value describes protocol/rule:
+     *
+     * - __key__ - link prefix (usually, protocol name with `:` at the end, `skype:`
+     *   for example). `linkify-it` makes shure that prefix is not preceeded with
+     *   alphanumeric char and symbols. Only whitespaces and punctuation allowed.
+     * - __value__ - rule to check tail after link prefix
+     *   - _String_ - just alias to existing rule
+     *   - _Object_
+     *     - _validate_ - validator function (should return matched length on success),
+     *       or `RegExp`.
+     *     - _normalize_ - optional function to normalize text & url of matched result
+     *       (for example, for @twitter mentions).
+     *
+     * `options`:
+     *
+     * - __fuzzyLink__ - recognige URL-s without `http(s):` prefix. Default `true`.
+     * - __fuzzyIP__ - allow IPs in fuzzy links above. Can conflict with some texts
+     *   like version numbers. Default `false`.
+     * - __fuzzyEmail__ - recognize emails without `mailto:` prefix.
+     *
+     **/
+    function LinkifyIt(schemas, options) {
+      if (!(this instanceof LinkifyIt)) {
+        return new LinkifyIt(schemas, options);
+      }
+
+      if (!options) {
+        if (isOptionsObj(schemas)) {
+          options = schemas;
+          schemas = {};
+        }
+      }
+
+      this.__opts__           = assign$1({}, defaultOptions, options);
+
+      // Cache last tested result. Used to skip repeating steps on next `match` call.
+      this.__index__          = -1;
+      this.__last_index__     = -1; // Next scan position
+      this.__schema__         = '';
+      this.__text_cache__     = '';
+
+      this.__schemas__        = assign$1({}, defaultSchemas, schemas);
+      this.__compiled__       = {};
+
+      this.__tlds__           = tlds_default;
+      this.__tlds_replaced__  = false;
+
+      this.re = {};
+
+      compile(this);
+    }
+
+
+    /** chainable
+     * LinkifyIt#add(schema, definition)
+     * - schema (String): rule name (fixed pattern prefix)
+     * - definition (String|RegExp|Object): schema definition
+     *
+     * Add new rule definition. See constructor description for details.
+     **/
+    LinkifyIt.prototype.add = function add(schema, definition) {
+      this.__schemas__[schema] = definition;
+      compile(this);
+      return this;
+    };
+
+
+    /** chainable
+     * LinkifyIt#set(options)
+     * - options (Object): { fuzzyLink|fuzzyEmail|fuzzyIP: true|false }
+     *
+     * Set recognition options for links without schema.
+     **/
+    LinkifyIt.prototype.set = function set(options) {
+      this.__opts__ = assign$1(this.__opts__, options);
+      return this;
+    };
+
+
+    /**
+     * LinkifyIt#test(text) -> Boolean
+     *
+     * Searches linkifiable pattern and returns `true` on success or `false` on fail.
+     **/
+    LinkifyIt.prototype.test = function test(text) {
+      // Reset scan cache
+      this.__text_cache__ = text;
+      this.__index__      = -1;
+
+      if (!text.length) { return false; }
+
+      var m, ml, me, len, shift, next, re, tld_pos, at_pos;
+
+      // try to scan for link with schema - that's the most simple rule
+      if (this.re.schema_test.test(text)) {
+        re = this.re.schema_search;
+        re.lastIndex = 0;
+        while ((m = re.exec(text)) !== null) {
+          len = this.testSchemaAt(text, m[2], re.lastIndex);
+          if (len) {
+            this.__schema__     = m[2];
+            this.__index__      = m.index + m[1].length;
+            this.__last_index__ = m.index + m[0].length + len;
+            break;
+          }
+        }
+      }
+
+      if (this.__opts__.fuzzyLink && this.__compiled__['http:']) {
+        // guess schemaless links
+        tld_pos = text.search(this.re.host_fuzzy_test);
+        if (tld_pos >= 0) {
+          // if tld is located after found link - no need to check fuzzy pattern
+          if (this.__index__ < 0 || tld_pos < this.__index__) {
+            if ((ml = text.match(this.__opts__.fuzzyIP ? this.re.link_fuzzy : this.re.link_no_ip_fuzzy)) !== null) {
+
+              shift = ml.index + ml[1].length;
+
+              if (this.__index__ < 0 || shift < this.__index__) {
+                this.__schema__     = '';
+                this.__index__      = shift;
+                this.__last_index__ = ml.index + ml[0].length;
+              }
+            }
+          }
+        }
+      }
+
+      if (this.__opts__.fuzzyEmail && this.__compiled__['mailto:']) {
+        // guess schemaless emails
+        at_pos = text.indexOf('@');
+        if (at_pos >= 0) {
+          // We can't skip this check, because this cases are possible:
+          // 192.168.1.1@gmail.com, my.in@example.com
+          if ((me = text.match(this.re.email_fuzzy)) !== null) {
+
+            shift = me.index + me[1].length;
+            next  = me.index + me[0].length;
+
+            if (this.__index__ < 0 || shift < this.__index__ ||
+                (shift === this.__index__ && next > this.__last_index__)) {
+              this.__schema__     = 'mailto:';
+              this.__index__      = shift;
+              this.__last_index__ = next;
+            }
+          }
+        }
+      }
+
+      return this.__index__ >= 0;
+    };
+
+
+    /**
+     * LinkifyIt#pretest(text) -> Boolean
+     *
+     * Very quick check, that can give false positives. Returns true if link MAY BE
+     * can exists. Can be used for speed optimization, when you need to check that
+     * link NOT exists.
+     **/
+    LinkifyIt.prototype.pretest = function pretest(text) {
+      return this.re.pretest.test(text);
+    };
+
+
+    /**
+     * LinkifyIt#testSchemaAt(text, name, position) -> Number
+     * - text (String): text to scan
+     * - name (String): rule (schema) name
+     * - position (Number): text offset to check from
+     *
+     * Similar to [[LinkifyIt#test]] but checks only specific protocol tail exactly
+     * at given position. Returns length of found pattern (0 on fail).
+     **/
+    LinkifyIt.prototype.testSchemaAt = function testSchemaAt(text, schema, pos) {
+      // If not supported schema check requested - terminate
+      if (!this.__compiled__[schema.toLowerCase()]) {
+        return 0;
+      }
+      return this.__compiled__[schema.toLowerCase()].validate(text, pos, this);
+    };
+
+
+    /**
+     * LinkifyIt#match(text) -> Array|null
+     *
+     * Returns array of found link descriptions or `null` on fail. We strongly
+     * recommend to use [[LinkifyIt#test]] first, for best speed.
+     *
+     * ##### Result match description
+     *
+     * - __schema__ - link schema, can be empty for fuzzy links, or `//` for
+     *   protocol-neutral  links.
+     * - __index__ - offset of matched text
+     * - __lastIndex__ - index of next char after mathch end
+     * - __raw__ - matched text
+     * - __text__ - normalized text
+     * - __url__ - link, generated from matched text
+     **/
+    LinkifyIt.prototype.match = function match(text) {
+      var shift = 0, result = [];
+
+      // Try to take previous element from cache, if .test() called before
+      if (this.__index__ >= 0 && this.__text_cache__ === text) {
+        result.push(createMatch(this, shift));
+        shift = this.__last_index__;
+      }
+
+      // Cut head if cache was used
+      var tail = shift ? text.slice(shift) : text;
+
+      // Scan string until end reached
+      while (this.test(tail)) {
+        result.push(createMatch(this, shift));
+
+        tail = tail.slice(this.__last_index__);
+        shift += this.__last_index__;
+      }
+
+      if (result.length) {
+        return result;
+      }
+
+      return null;
+    };
+
+
+    /** chainable
+     * LinkifyIt#tlds(list [, keepOld]) -> this
+     * - list (Array): list of tlds
+     * - keepOld (Boolean): merge with current list if `true` (`false` by default)
+     *
+     * Load (or merge) new tlds list. Those are user for fuzzy links (without prefix)
+     * to avoid false positives. By default this algorythm used:
+     *
+     * - hostname with any 2-letter root zones are ok.
+     * - biz|com|edu|gov|net|org|pro|web|xxx|aero|asia|coop|info|museum|name|shop|рф
+     *   are ok.
+     * - encoded (`xn--...`) root zones are ok.
+     *
+     * If list is replaced, then exact match for 2-chars root zones will be checked.
+     **/
+    LinkifyIt.prototype.tlds = function tlds(list, keepOld) {
+      list = Array.isArray(list) ? list : [ list ];
+
+      if (!keepOld) {
+        this.__tlds__ = list.slice();
+        this.__tlds_replaced__ = true;
+        compile(this);
+        return this;
+      }
+
+      this.__tlds__ = this.__tlds__.concat(list)
+                                      .sort()
+                                      .filter(function (el, idx, arr) {
+                                        return el !== arr[idx - 1];
+                                      })
+                                      .reverse();
+
+      compile(this);
+      return this;
+    };
+
+    /**
+     * LinkifyIt#normalize(match)
+     *
+     * Default normalizer (if schema does not define it's own).
+     **/
+    LinkifyIt.prototype.normalize = function normalize(match) {
+
+      // Do minimal possible changes by default. Need to collect feedback prior
+      // to move forward https://github.com/markdown-it/linkify-it/issues/1
+
+      if (!match.schema) { match.url = 'http://' + match.url; }
+
+      if (match.schema === 'mailto:' && !/^mailto:/i.test(match.url)) {
+        match.url = 'mailto:' + match.url;
+      }
+    };
+
+
+    /**
+     * LinkifyIt#onCompile()
+     *
+     * Override to modify basic RegExp-s.
+     **/
+    LinkifyIt.prototype.onCompile = function onCompile() {
+    };
+
+
+    var linkifyIt = LinkifyIt;
+
+    /** Highest positive signed 32-bit float value */
+    const maxInt = 2147483647; // aka. 0x7FFFFFFF or 2^31-1
+
+    /** Bootstring parameters */
+    const base = 36;
+    const tMin = 1;
+    const tMax = 26;
+    const skew = 38;
+    const damp = 700;
+    const initialBias = 72;
+    const initialN = 128; // 0x80
+    const delimiter = '-'; // '\x2D'
+
+    /** Regular expressions */
+    const regexPunycode = /^xn--/;
+    const regexNonASCII = /[^\0-\x7E]/; // non-ASCII chars
+    const regexSeparators = /[\x2E\u3002\uFF0E\uFF61]/g; // RFC 3490 separators
+
+    /** Error messages */
+    const errors = {
+    	'overflow': 'Overflow: input needs wider integers to process',
+    	'not-basic': 'Illegal input >= 0x80 (not a basic code point)',
+    	'invalid-input': 'Invalid input'
+    };
+
+    /** Convenience shortcuts */
+    const baseMinusTMin = base - tMin;
+    const floor = Math.floor;
+    const stringFromCharCode = String.fromCharCode;
+
+    /*--------------------------------------------------------------------------*/
+
+    /**
+     * A generic error utility function.
+     * @private
+     * @param {String} type The error type.
+     * @returns {Error} Throws a `RangeError` with the applicable error message.
+     */
+    function error(type) {
+    	throw new RangeError(errors[type]);
+    }
+
+    /**
+     * A generic `Array#map` utility function.
+     * @private
+     * @param {Array} array The array to iterate over.
+     * @param {Function} callback The function that gets called for every array
+     * item.
+     * @returns {Array} A new array of values returned by the callback function.
+     */
+    function map$1(array, fn) {
+    	const result = [];
+    	let length = array.length;
+    	while (length--) {
+    		result[length] = fn(array[length]);
+    	}
+    	return result;
+    }
+
+    /**
+     * A simple `Array#map`-like wrapper to work with domain name strings or email
+     * addresses.
+     * @private
+     * @param {String} domain The domain name or email address.
+     * @param {Function} callback The function that gets called for every
+     * character.
+     * @returns {Array} A new string of characters returned by the callback
+     * function.
+     */
+    function mapDomain(string, fn) {
+    	const parts = string.split('@');
+    	let result = '';
+    	if (parts.length > 1) {
+    		// In email addresses, only the domain name should be punycoded. Leave
+    		// the local part (i.e. everything up to `@`) intact.
+    		result = parts[0] + '@';
+    		string = parts[1];
+    	}
+    	// Avoid `split(regex)` for IE8 compatibility. See #17.
+    	string = string.replace(regexSeparators, '\x2E');
+    	const labels = string.split('.');
+    	const encoded = map$1(labels, fn).join('.');
+    	return result + encoded;
+    }
+
+    /**
+     * Creates an array containing the numeric code points of each Unicode
+     * character in the string. While JavaScript uses UCS-2 internally,
+     * this function will convert a pair of surrogate halves (each of which
+     * UCS-2 exposes as separate characters) into a single code point,
+     * matching UTF-16.
+     * @see `punycode.ucs2.encode`
+     * @see <https://mathiasbynens.be/notes/javascript-encoding>
+     * @memberOf punycode.ucs2
+     * @name decode
+     * @param {String} string The Unicode input string (UCS-2).
+     * @returns {Array} The new array of code points.
+     */
+    function ucs2decode(string) {
+    	const output = [];
+    	let counter = 0;
+    	const length = string.length;
+    	while (counter < length) {
+    		const value = string.charCodeAt(counter++);
+    		if (value >= 0xD800 && value <= 0xDBFF && counter < length) {
+    			// It's a high surrogate, and there is a next character.
+    			const extra = string.charCodeAt(counter++);
+    			if ((extra & 0xFC00) == 0xDC00) { // Low surrogate.
+    				output.push(((value & 0x3FF) << 10) + (extra & 0x3FF) + 0x10000);
+    			} else {
+    				// It's an unmatched surrogate; only append this code unit, in case the
+    				// next code unit is the high surrogate of a surrogate pair.
+    				output.push(value);
+    				counter--;
+    			}
+    		} else {
+    			output.push(value);
+    		}
+    	}
+    	return output;
+    }
+
+    /**
+     * Creates a string based on an array of numeric code points.
+     * @see `punycode.ucs2.decode`
+     * @memberOf punycode.ucs2
+     * @name encode
+     * @param {Array} codePoints The array of numeric code points.
+     * @returns {String} The new Unicode string (UCS-2).
+     */
+    const ucs2encode = array => String.fromCodePoint(...array);
+
+    /**
+     * Converts a basic code point into a digit/integer.
+     * @see `digitToBasic()`
+     * @private
+     * @param {Number} codePoint The basic numeric code point value.
+     * @returns {Number} The numeric value of a basic code point (for use in
+     * representing integers) in the range `0` to `base - 1`, or `base` if
+     * the code point does not represent a value.
+     */
+    const basicToDigit = function(codePoint) {
+    	if (codePoint - 0x30 < 0x0A) {
+    		return codePoint - 0x16;
+    	}
+    	if (codePoint - 0x41 < 0x1A) {
+    		return codePoint - 0x41;
+    	}
+    	if (codePoint - 0x61 < 0x1A) {
+    		return codePoint - 0x61;
+    	}
+    	return base;
+    };
+
+    /**
+     * Converts a digit/integer into a basic code point.
+     * @see `basicToDigit()`
+     * @private
+     * @param {Number} digit The numeric value of a basic code point.
+     * @returns {Number} The basic code point whose value (when used for
+     * representing integers) is `digit`, which needs to be in the range
+     * `0` to `base - 1`. If `flag` is non-zero, the uppercase form is
+     * used; else, the lowercase form is used. The behavior is undefined
+     * if `flag` is non-zero and `digit` has no uppercase form.
+     */
+    const digitToBasic = function(digit, flag) {
+    	//  0..25 map to ASCII a..z or A..Z
+    	// 26..35 map to ASCII 0..9
+    	return digit + 22 + 75 * (digit < 26) - ((flag != 0) << 5);
+    };
+
+    /**
+     * Bias adaptation function as per section 3.4 of RFC 3492.
+     * https://tools.ietf.org/html/rfc3492#section-3.4
+     * @private
+     */
+    const adapt = function(delta, numPoints, firstTime) {
+    	let k = 0;
+    	delta = firstTime ? floor(delta / damp) : delta >> 1;
+    	delta += floor(delta / numPoints);
+    	for (/* no initialization */; delta > baseMinusTMin * tMax >> 1; k += base) {
+    		delta = floor(delta / baseMinusTMin);
+    	}
+    	return floor(k + (baseMinusTMin + 1) * delta / (delta + skew));
+    };
+
+    /**
+     * Converts a Punycode string of ASCII-only symbols to a string of Unicode
+     * symbols.
+     * @memberOf punycode
+     * @param {String} input The Punycode string of ASCII-only symbols.
+     * @returns {String} The resulting string of Unicode symbols.
+     */
+    const decode$2 = function(input) {
+    	// Don't use UCS-2.
+    	const output = [];
+    	const inputLength = input.length;
+    	let i = 0;
+    	let n = initialN;
+    	let bias = initialBias;
+
+    	// Handle the basic code points: let `basic` be the number of input code
+    	// points before the last delimiter, or `0` if there is none, then copy
+    	// the first basic code points to the output.
+
+    	let basic = input.lastIndexOf(delimiter);
+    	if (basic < 0) {
+    		basic = 0;
+    	}
+
+    	for (let j = 0; j < basic; ++j) {
+    		// if it's not a basic code point
+    		if (input.charCodeAt(j) >= 0x80) {
+    			error('not-basic');
+    		}
+    		output.push(input.charCodeAt(j));
+    	}
+
+    	// Main decoding loop: start just after the last delimiter if any basic code
+    	// points were copied; start at the beginning otherwise.
+
+    	for (let index = basic > 0 ? basic + 1 : 0; index < inputLength; /* no final expression */) {
+
+    		// `index` is the index of the next character to be consumed.
+    		// Decode a generalized variable-length integer into `delta`,
+    		// which gets added to `i`. The overflow checking is easier
+    		// if we increase `i` as we go, then subtract off its starting
+    		// value at the end to obtain `delta`.
+    		let oldi = i;
+    		for (let w = 1, k = base; /* no condition */; k += base) {
+
+    			if (index >= inputLength) {
+    				error('invalid-input');
+    			}
+
+    			const digit = basicToDigit(input.charCodeAt(index++));
+
+    			if (digit >= base || digit > floor((maxInt - i) / w)) {
+    				error('overflow');
+    			}
+
+    			i += digit * w;
+    			const t = k <= bias ? tMin : (k >= bias + tMax ? tMax : k - bias);
+
+    			if (digit < t) {
+    				break;
+    			}
+
+    			const baseMinusT = base - t;
+    			if (w > floor(maxInt / baseMinusT)) {
+    				error('overflow');
+    			}
+
+    			w *= baseMinusT;
+
+    		}
+
+    		const out = output.length + 1;
+    		bias = adapt(i - oldi, out, oldi == 0);
+
+    		// `i` was supposed to wrap around from `out` to `0`,
+    		// incrementing `n` each time, so we'll fix that now:
+    		if (floor(i / out) > maxInt - n) {
+    			error('overflow');
+    		}
+
+    		n += floor(i / out);
+    		i %= out;
+
+    		// Insert `n` at position `i` of the output.
+    		output.splice(i++, 0, n);
+
+    	}
+
+    	return String.fromCodePoint(...output);
+    };
+
+    /**
+     * Converts a string of Unicode symbols (e.g. a domain name label) to a
+     * Punycode string of ASCII-only symbols.
+     * @memberOf punycode
+     * @param {String} input The string of Unicode symbols.
+     * @returns {String} The resulting Punycode string of ASCII-only symbols.
+     */
+    const encode$2 = function(input) {
+    	const output = [];
+
+    	// Convert the input in UCS-2 to an array of Unicode code points.
+    	input = ucs2decode(input);
+
+    	// Cache the length.
+    	let inputLength = input.length;
+
+    	// Initialize the state.
+    	let n = initialN;
+    	let delta = 0;
+    	let bias = initialBias;
+
+    	// Handle the basic code points.
+    	for (const currentValue of input) {
+    		if (currentValue < 0x80) {
+    			output.push(stringFromCharCode(currentValue));
+    		}
+    	}
+
+    	let basicLength = output.length;
+    	let handledCPCount = basicLength;
+
+    	// `handledCPCount` is the number of code points that have been handled;
+    	// `basicLength` is the number of basic code points.
+
+    	// Finish the basic string with a delimiter unless it's empty.
+    	if (basicLength) {
+    		output.push(delimiter);
+    	}
+
+    	// Main encoding loop:
+    	while (handledCPCount < inputLength) {
+
+    		// All non-basic code points < n have been handled already. Find the next
+    		// larger one:
+    		let m = maxInt;
+    		for (const currentValue of input) {
+    			if (currentValue >= n && currentValue < m) {
+    				m = currentValue;
+    			}
+    		}
+
+    		// Increase `delta` enough to advance the decoder's <n,i> state to <m,0>,
+    		// but guard against overflow.
+    		const handledCPCountPlusOne = handledCPCount + 1;
+    		if (m - n > floor((maxInt - delta) / handledCPCountPlusOne)) {
+    			error('overflow');
+    		}
+
+    		delta += (m - n) * handledCPCountPlusOne;
+    		n = m;
+
+    		for (const currentValue of input) {
+    			if (currentValue < n && ++delta > maxInt) {
+    				error('overflow');
+    			}
+    			if (currentValue == n) {
+    				// Represent delta as a generalized variable-length integer.
+    				let q = delta;
+    				for (let k = base; /* no condition */; k += base) {
+    					const t = k <= bias ? tMin : (k >= bias + tMax ? tMax : k - bias);
+    					if (q < t) {
+    						break;
+    					}
+    					const qMinusT = q - t;
+    					const baseMinusT = base - t;
+    					output.push(
+    						stringFromCharCode(digitToBasic(t + qMinusT % baseMinusT, 0))
+    					);
+    					q = floor(qMinusT / baseMinusT);
+    				}
+
+    				output.push(stringFromCharCode(digitToBasic(q, 0)));
+    				bias = adapt(delta, handledCPCountPlusOne, handledCPCount == basicLength);
+    				delta = 0;
+    				++handledCPCount;
+    			}
+    		}
+
+    		++delta;
+    		++n;
+
+    	}
+    	return output.join('');
+    };
+
+    /**
+     * Converts a Punycode string representing a domain name or an email address
+     * to Unicode. Only the Punycoded parts of the input will be converted, i.e.
+     * it doesn't matter if you call it on a string that has already been
+     * converted to Unicode.
+     * @memberOf punycode
+     * @param {String} input The Punycoded domain name or email address to
+     * convert to Unicode.
+     * @returns {String} The Unicode representation of the given Punycode
+     * string.
+     */
+    const toUnicode = function(input) {
+    	return mapDomain(input, function(string) {
+    		return regexPunycode.test(string)
+    			? decode$2(string.slice(4).toLowerCase())
+    			: string;
+    	});
+    };
+
+    /**
+     * Converts a Unicode string representing a domain name or an email address to
+     * Punycode. Only the non-ASCII parts of the domain name will be converted,
+     * i.e. it doesn't matter if you call it with a domain that's already in
+     * ASCII.
+     * @memberOf punycode
+     * @param {String} input The domain name or email address to convert, as a
+     * Unicode string.
+     * @returns {String} The Punycode representation of the given domain name or
+     * email address.
+     */
+    const toASCII = function(input) {
+    	return mapDomain(input, function(string) {
+    		return regexNonASCII.test(string)
+    			? 'xn--' + encode$2(string)
+    			: string;
+    	});
+    };
+
+    /*--------------------------------------------------------------------------*/
+
+    /** Define the public API */
+    const punycode = {
+    	/**
+    	 * A string representing the current Punycode.js version number.
+    	 * @memberOf punycode
+    	 * @type String
+    	 */
+    	'version': '2.1.0',
+    	/**
+    	 * An object of methods to convert from JavaScript's internal character
+    	 * representation (UCS-2) to Unicode code points, and back.
+    	 * @see <https://mathiasbynens.be/notes/javascript-encoding>
+    	 * @memberOf punycode
+    	 * @type Object
+    	 */
+    	'ucs2': {
+    		'decode': ucs2decode,
+    		'encode': ucs2encode
+    	},
+    	'decode': decode$2,
+    	'encode': encode$2,
+    	'toASCII': toASCII,
+    	'toUnicode': toUnicode
+    };
+
+    // markdown-it default options
+
+
+    var _default = {
+      options: {
+        html:         false,        // Enable HTML tags in source
+        xhtmlOut:     false,        // Use '/' to close single tags (<br />)
+        breaks:       false,        // Convert '\n' in paragraphs into <br>
+        langPrefix:   'language-',  // CSS language prefix for fenced blocks
+        linkify:      false,        // autoconvert URL-like texts to links
+
+        // Enable some language-neutral replacements + quotes beautification
+        typographer:  false,
+
+        // Double + single quotes replacement pairs, when typographer enabled,
+        // and smartquotes on. Could be either a String or an Array.
+        //
+        // For example, you can use '«»„“' for Russian, '„“‚‘' for German,
+        // and ['«\xA0', '\xA0»', '‹\xA0', '\xA0›'] for French (including nbsp).
+        quotes: '\u201c\u201d\u2018\u2019', /* “”‘’ */
+
+        // Highlighter function. Should return escaped HTML,
+        // or '' if the source string is not changed and should be escaped externaly.
+        // If result starts with <pre... internal wrapper is skipped.
+        //
+        // function (/*str, lang*/) { return ''; }
+        //
+        highlight: null,
+
+        maxNesting:   100            // Internal protection, recursion limit
+      },
+
+      components: {
+
+        core: {},
+        block: {},
+        inline: {}
+      }
+    };
+
+    // "Zero" preset, with nothing enabled. Useful for manual configuring of simple
+
+
+    var zero = {
+      options: {
+        html:         false,        // Enable HTML tags in source
+        xhtmlOut:     false,        // Use '/' to close single tags (<br />)
+        breaks:       false,        // Convert '\n' in paragraphs into <br>
+        langPrefix:   'language-',  // CSS language prefix for fenced blocks
+        linkify:      false,        // autoconvert URL-like texts to links
+
+        // Enable some language-neutral replacements + quotes beautification
+        typographer:  false,
+
+        // Double + single quotes replacement pairs, when typographer enabled,
+        // and smartquotes on. Could be either a String or an Array.
+        //
+        // For example, you can use '«»„“' for Russian, '„“‚‘' for German,
+        // and ['«\xA0', '\xA0»', '‹\xA0', '\xA0›'] for French (including nbsp).
+        quotes: '\u201c\u201d\u2018\u2019', /* “”‘’ */
+
+        // Highlighter function. Should return escaped HTML,
+        // or '' if the source string is not changed and should be escaped externaly.
+        // If result starts with <pre... internal wrapper is skipped.
+        //
+        // function (/*str, lang*/) { return ''; }
+        //
+        highlight: null,
+
+        maxNesting:   20            // Internal protection, recursion limit
+      },
+
+      components: {
+
+        core: {
+          rules: [
+            'normalize',
+            'block',
+            'inline'
+          ]
+        },
+
+        block: {
+          rules: [
+            'paragraph'
+          ]
+        },
+
+        inline: {
+          rules: [
+            'text'
+          ],
+          rules2: [
+            'balance_pairs',
+            'text_collapse'
+          ]
+        }
+      }
+    };
+
+    // Commonmark default options
+
+
+    var commonmark = {
+      options: {
+        html:         true,         // Enable HTML tags in source
+        xhtmlOut:     true,         // Use '/' to close single tags (<br />)
+        breaks:       false,        // Convert '\n' in paragraphs into <br>
+        langPrefix:   'language-',  // CSS language prefix for fenced blocks
+        linkify:      false,        // autoconvert URL-like texts to links
+
+        // Enable some language-neutral replacements + quotes beautification
+        typographer:  false,
+
+        // Double + single quotes replacement pairs, when typographer enabled,
+        // and smartquotes on. Could be either a String or an Array.
+        //
+        // For example, you can use '«»„“' for Russian, '„“‚‘' for German,
+        // and ['«\xA0', '\xA0»', '‹\xA0', '\xA0›'] for French (including nbsp).
+        quotes: '\u201c\u201d\u2018\u2019', /* “”‘’ */
+
+        // Highlighter function. Should return escaped HTML,
+        // or '' if the source string is not changed and should be escaped externaly.
+        // If result starts with <pre... internal wrapper is skipped.
+        //
+        // function (/*str, lang*/) { return ''; }
+        //
+        highlight: null,
+
+        maxNesting:   20            // Internal protection, recursion limit
+      },
+
+      components: {
+
+        core: {
+          rules: [
+            'normalize',
+            'block',
+            'inline'
+          ]
+        },
+
+        block: {
+          rules: [
+            'blockquote',
+            'code',
+            'fence',
+            'heading',
+            'hr',
+            'html_block',
+            'lheading',
+            'list',
+            'reference',
+            'paragraph'
+          ]
+        },
+
+        inline: {
+          rules: [
+            'autolink',
+            'backticks',
+            'emphasis',
+            'entity',
+            'escape',
+            'html_inline',
+            'image',
+            'link',
+            'newline',
+            'text'
+          ],
+          rules2: [
+            'balance_pairs',
+            'emphasis',
+            'text_collapse'
+          ]
+        }
+      }
+    };
+
+    var config = {
+      'default': _default,
+      zero: zero,
+      commonmark: commonmark
+    };
+
+    ////////////////////////////////////////////////////////////////////////////////
+    //
+    // This validator can prohibit more than really needed to prevent XSS. It's a
+    // tradeoff to keep code simple and to be secure by default.
+    //
+    // If you need different setup - override validator method as you wish. Or
+    // replace it with dummy function and use external sanitizer.
+    //
+
+    var BAD_PROTO_RE = /^(vbscript|javascript|file|data):/;
+    var GOOD_DATA_RE = /^data:image\/(gif|png|jpeg|webp);/;
+
+    function validateLink(url) {
+      // url should be normalized at this point, and existing entities are decoded
+      var str = url.trim().toLowerCase();
+
+      return BAD_PROTO_RE.test(str) ? (GOOD_DATA_RE.test(str) ? true : false) : true;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////
+
+
+    var RECODE_HOSTNAME_FOR = [ 'http:', 'https:', 'mailto:' ];
+
+    function normalizeLink(url) {
+      var parsed = mdurl.parse(url, true);
+
+      if (parsed.hostname) {
+        // Encode hostnames in urls like:
+        // `http://host/`, `https://host/`, `mailto:user@host`, `//host/`
+        //
+        // We don't encode unknown schemas, because it's likely that we encode
+        // something we shouldn't (e.g. `skype:name` treated as `skype:host`)
+        //
+        if (!parsed.protocol || RECODE_HOSTNAME_FOR.indexOf(parsed.protocol) >= 0) {
+          try {
+            parsed.hostname = punycode.toASCII(parsed.hostname);
+          } catch (er) { /**/ }
+        }
+      }
+
+      return mdurl.encode(mdurl.format(parsed));
+    }
+
+    function normalizeLinkText(url) {
+      var parsed = mdurl.parse(url, true);
+
+      if (parsed.hostname) {
+        // Encode hostnames in urls like:
+        // `http://host/`, `https://host/`, `mailto:user@host`, `//host/`
+        //
+        // We don't encode unknown schemas, because it's likely that we encode
+        // something we shouldn't (e.g. `skype:name` treated as `skype:host`)
+        //
+        if (!parsed.protocol || RECODE_HOSTNAME_FOR.indexOf(parsed.protocol) >= 0) {
+          try {
+            parsed.hostname = punycode.toUnicode(parsed.hostname);
+          } catch (er) { /**/ }
+        }
+      }
+
+      return mdurl.decode(mdurl.format(parsed));
+    }
+
+
+    /**
+     * class MarkdownIt
+     *
+     * Main parser/renderer class.
+     *
+     * ##### Usage
+     *
+     * ```javascript
+     * // node.js, "classic" way:
+     * var MarkdownIt = require('markdown-it'),
+     *     md = new MarkdownIt();
+     * var result = md.render('# markdown-it rulezz!');
+     *
+     * // node.js, the same, but with sugar:
+     * var md = require('markdown-it')();
+     * var result = md.render('# markdown-it rulezz!');
+     *
+     * // browser without AMD, added to "window" on script load
+     * // Note, there are no dash.
+     * var md = window.markdownit();
+     * var result = md.render('# markdown-it rulezz!');
+     * ```
+     *
+     * Single line rendering, without paragraph wrap:
+     *
+     * ```javascript
+     * var md = require('markdown-it')();
+     * var result = md.renderInline('__markdown-it__ rulezz!');
+     * ```
+     **/
+
+    /**
+     * new MarkdownIt([presetName, options])
+     * - presetName (String): optional, `commonmark` / `zero`
+     * - options (Object)
+     *
+     * Creates parser instanse with given config. Can be called without `new`.
+     *
+     * ##### presetName
+     *
+     * MarkdownIt provides named presets as a convenience to quickly
+     * enable/disable active syntax rules and options for common use cases.
+     *
+     * - ["commonmark"](https://github.com/markdown-it/markdown-it/blob/master/lib/presets/commonmark.js) -
+     *   configures parser to strict [CommonMark](http://commonmark.org/) mode.
+     * - [default](https://github.com/markdown-it/markdown-it/blob/master/lib/presets/default.js) -
+     *   similar to GFM, used when no preset name given. Enables all available rules,
+     *   but still without html, typographer & autolinker.
+     * - ["zero"](https://github.com/markdown-it/markdown-it/blob/master/lib/presets/zero.js) -
+     *   all rules disabled. Useful to quickly setup your config via `.enable()`.
+     *   For example, when you need only `bold` and `italic` markup and nothing else.
+     *
+     * ##### options:
+     *
+     * - __html__ - `false`. Set `true` to enable HTML tags in source. Be careful!
+     *   That's not safe! You may need external sanitizer to protect output from XSS.
+     *   It's better to extend features via plugins, instead of enabling HTML.
+     * - __xhtmlOut__ - `false`. Set `true` to add '/' when closing single tags
+     *   (`<br />`). This is needed only for full CommonMark compatibility. In real
+     *   world you will need HTML output.
+     * - __breaks__ - `false`. Set `true` to convert `\n` in paragraphs into `<br>`.
+     * - __langPrefix__ - `language-`. CSS language class prefix for fenced blocks.
+     *   Can be useful for external highlighters.
+     * - __linkify__ - `false`. Set `true` to autoconvert URL-like text to links.
+     * - __typographer__  - `false`. Set `true` to enable [some language-neutral
+     *   replacement](https://github.com/markdown-it/markdown-it/blob/master/lib/rules_core/replacements.js) +
+     *   quotes beautification (smartquotes).
+     * - __quotes__ - `“”‘’`, String or Array. Double + single quotes replacement
+     *   pairs, when typographer enabled and smartquotes on. For example, you can
+     *   use `'«»„“'` for Russian, `'„“‚‘'` for German, and
+     *   `['«\xA0', '\xA0»', '‹\xA0', '\xA0›']` for French (including nbsp).
+     * - __highlight__ - `null`. Highlighter function for fenced code blocks.
+     *   Highlighter `function (str, lang)` should return escaped HTML. It can also
+     *   return empty string if the source was not changed and should be escaped
+     *   externaly. If result starts with <pre... internal wrapper is skipped.
+     *
+     * ##### Example
+     *
+     * ```javascript
+     * // commonmark mode
+     * var md = require('markdown-it')('commonmark');
+     *
+     * // default mode
+     * var md = require('markdown-it')();
+     *
+     * // enable everything
+     * var md = require('markdown-it')({
+     *   html: true,
+     *   linkify: true,
+     *   typographer: true
+     * });
+     * ```
+     *
+     * ##### Syntax highlighting
+     *
+     * ```js
+     * var hljs = require('highlight.js') // https://highlightjs.org/
+     *
+     * var md = require('markdown-it')({
+     *   highlight: function (str, lang) {
+     *     if (lang && hljs.getLanguage(lang)) {
+     *       try {
+     *         return hljs.highlight(lang, str, true).value;
+     *       } catch (__) {}
+     *     }
+     *
+     *     return ''; // use external default escaping
+     *   }
+     * });
+     * ```
+     *
+     * Or with full wrapper override (if you need assign class to `<pre>`):
+     *
+     * ```javascript
+     * var hljs = require('highlight.js') // https://highlightjs.org/
+     *
+     * // Actual default values
+     * var md = require('markdown-it')({
+     *   highlight: function (str, lang) {
+     *     if (lang && hljs.getLanguage(lang)) {
+     *       try {
+     *         return '<pre class="hljs"><code>' +
+     *                hljs.highlight(lang, str, true).value +
+     *                '</code></pre>';
+     *       } catch (__) {}
+     *     }
+     *
+     *     return '<pre class="hljs"><code>' + md.utils.escapeHtml(str) + '</code></pre>';
+     *   }
+     * });
+     * ```
+     *
+     **/
+    function MarkdownIt(presetName, options) {
+      if (!(this instanceof MarkdownIt)) {
+        return new MarkdownIt(presetName, options);
+      }
+
+      if (!options) {
+        if (!utils.isString(presetName)) {
+          options = presetName || {};
+          presetName = 'default';
+        }
+      }
+
+      /**
+       * MarkdownIt#inline -> ParserInline
+       *
+       * Instance of [[ParserInline]]. You may need it to add new rules when
+       * writing plugins. For simple rules control use [[MarkdownIt.disable]] and
+       * [[MarkdownIt.enable]].
+       **/
+      this.inline = new parser_inline();
+
+      /**
+       * MarkdownIt#block -> ParserBlock
+       *
+       * Instance of [[ParserBlock]]. You may need it to add new rules when
+       * writing plugins. For simple rules control use [[MarkdownIt.disable]] and
+       * [[MarkdownIt.enable]].
+       **/
+      this.block = new parser_block();
+
+      /**
+       * MarkdownIt#core -> Core
+       *
+       * Instance of [[Core]] chain executor. You may need it to add new rules when
+       * writing plugins. For simple rules control use [[MarkdownIt.disable]] and
+       * [[MarkdownIt.enable]].
+       **/
+      this.core = new parser_core();
+
+      /**
+       * MarkdownIt#renderer -> Renderer
+       *
+       * Instance of [[Renderer]]. Use it to modify output look. Or to add rendering
+       * rules for new token types, generated by plugins.
+       *
+       * ##### Example
+       *
+       * ```javascript
+       * var md = require('markdown-it')();
+       *
+       * function myToken(tokens, idx, options, env, self) {
+       *   //...
+       *   return result;
+       * };
+       *
+       * md.renderer.rules['my_token'] = myToken
+       * ```
+       *
+       * See [[Renderer]] docs and [source code](https://github.com/markdown-it/markdown-it/blob/master/lib/renderer.js).
+       **/
+      this.renderer = new renderer();
+
+      /**
+       * MarkdownIt#linkify -> LinkifyIt
+       *
+       * [linkify-it](https://github.com/markdown-it/linkify-it) instance.
+       * Used by [linkify](https://github.com/markdown-it/markdown-it/blob/master/lib/rules_core/linkify.js)
+       * rule.
+       **/
+      this.linkify = new linkifyIt();
+
+      /**
+       * MarkdownIt#validateLink(url) -> Boolean
+       *
+       * Link validation function. CommonMark allows too much in links. By default
+       * we disable `javascript:`, `vbscript:`, `file:` schemas, and almost all `data:...` schemas
+       * except some embedded image types.
+       *
+       * You can change this behaviour:
+       *
+       * ```javascript
+       * var md = require('markdown-it')();
+       * // enable everything
+       * md.validateLink = function () { return true; }
+       * ```
+       **/
+      this.validateLink = validateLink;
+
+      /**
+       * MarkdownIt#normalizeLink(url) -> String
+       *
+       * Function used to encode link url to a machine-readable format,
+       * which includes url-encoding, punycode, etc.
+       **/
+      this.normalizeLink = normalizeLink;
+
+      /**
+       * MarkdownIt#normalizeLinkText(url) -> String
+       *
+       * Function used to decode link url to a human-readable format`
+       **/
+      this.normalizeLinkText = normalizeLinkText;
+
+
+      // Expose utils & helpers for easy acces from plugins
+
+      /**
+       * MarkdownIt#utils -> utils
+       *
+       * Assorted utility functions, useful to write plugins. See details
+       * [here](https://github.com/markdown-it/markdown-it/blob/master/lib/common/utils.js).
+       **/
+      this.utils = utils;
+
+      /**
+       * MarkdownIt#helpers -> helpers
+       *
+       * Link components parser functions, useful to write plugins. See details
+       * [here](https://github.com/markdown-it/markdown-it/blob/master/lib/helpers).
+       **/
+      this.helpers = utils.assign({}, helpers);
+
+
+      this.options = {};
+      this.configure(presetName);
+
+      if (options) { this.set(options); }
+    }
+
+
+    /** chainable
+     * MarkdownIt.set(options)
+     *
+     * Set parser options (in the same format as in constructor). Probably, you
+     * will never need it, but you can change options after constructor call.
+     *
+     * ##### Example
+     *
+     * ```javascript
+     * var md = require('markdown-it')()
+     *             .set({ html: true, breaks: true })
+     *             .set({ typographer, true });
+     * ```
+     *
+     * __Note:__ To achieve the best possible performance, don't modify a
+     * `markdown-it` instance options on the fly. If you need multiple configurations
+     * it's best to create multiple instances and initialize each with separate
+     * config.
+     **/
+    MarkdownIt.prototype.set = function (options) {
+      utils.assign(this.options, options);
+      return this;
+    };
+
+
+    /** chainable, internal
+     * MarkdownIt.configure(presets)
+     *
+     * Batch load of all options and compenent settings. This is internal method,
+     * and you probably will not need it. But if you with - see available presets
+     * and data structure [here](https://github.com/markdown-it/markdown-it/tree/master/lib/presets)
+     *
+     * We strongly recommend to use presets instead of direct config loads. That
+     * will give better compatibility with next versions.
+     **/
+    MarkdownIt.prototype.configure = function (presets) {
+      var self = this, presetName;
+
+      if (utils.isString(presets)) {
+        presetName = presets;
+        presets = config[presetName];
+        if (!presets) { throw new Error('Wrong `markdown-it` preset "' + presetName + '", check name'); }
+      }
+
+      if (!presets) { throw new Error('Wrong `markdown-it` preset, can\'t be empty'); }
+
+      if (presets.options) { self.set(presets.options); }
+
+      if (presets.components) {
+        Object.keys(presets.components).forEach(function (name) {
+          if (presets.components[name].rules) {
+            self[name].ruler.enableOnly(presets.components[name].rules);
+          }
+          if (presets.components[name].rules2) {
+            self[name].ruler2.enableOnly(presets.components[name].rules2);
+          }
+        });
+      }
+      return this;
+    };
+
+
+    /** chainable
+     * MarkdownIt.enable(list, ignoreInvalid)
+     * - list (String|Array): rule name or list of rule names to enable
+     * - ignoreInvalid (Boolean): set `true` to ignore errors when rule not found.
+     *
+     * Enable list or rules. It will automatically find appropriate components,
+     * containing rules with given names. If rule not found, and `ignoreInvalid`
+     * not set - throws exception.
+     *
+     * ##### Example
+     *
+     * ```javascript
+     * var md = require('markdown-it')()
+     *             .enable(['sub', 'sup'])
+     *             .disable('smartquotes');
+     * ```
+     **/
+    MarkdownIt.prototype.enable = function (list, ignoreInvalid) {
+      var result = [];
+
+      if (!Array.isArray(list)) { list = [ list ]; }
+
+      [ 'core', 'block', 'inline' ].forEach(function (chain) {
+        result = result.concat(this[chain].ruler.enable(list, true));
+      }, this);
+
+      result = result.concat(this.inline.ruler2.enable(list, true));
+
+      var missed = list.filter(function (name) { return result.indexOf(name) < 0; });
+
+      if (missed.length && !ignoreInvalid) {
+        throw new Error('MarkdownIt. Failed to enable unknown rule(s): ' + missed);
+      }
+
+      return this;
+    };
+
+
+    /** chainable
+     * MarkdownIt.disable(list, ignoreInvalid)
+     * - list (String|Array): rule name or list of rule names to disable.
+     * - ignoreInvalid (Boolean): set `true` to ignore errors when rule not found.
+     *
+     * The same as [[MarkdownIt.enable]], but turn specified rules off.
+     **/
+    MarkdownIt.prototype.disable = function (list, ignoreInvalid) {
+      var result = [];
+
+      if (!Array.isArray(list)) { list = [ list ]; }
+
+      [ 'core', 'block', 'inline' ].forEach(function (chain) {
+        result = result.concat(this[chain].ruler.disable(list, true));
+      }, this);
+
+      result = result.concat(this.inline.ruler2.disable(list, true));
+
+      var missed = list.filter(function (name) { return result.indexOf(name) < 0; });
+
+      if (missed.length && !ignoreInvalid) {
+        throw new Error('MarkdownIt. Failed to disable unknown rule(s): ' + missed);
+      }
+      return this;
+    };
+
+
+    /** chainable
+     * MarkdownIt.use(plugin, params)
+     *
+     * Load specified plugin with given params into current parser instance.
+     * It's just a sugar to call `plugin(md, params)` with curring.
+     *
+     * ##### Example
+     *
+     * ```javascript
+     * var iterator = require('markdown-it-for-inline');
+     * var md = require('markdown-it')()
+     *             .use(iterator, 'foo_replace', 'text', function (tokens, idx) {
+     *               tokens[idx].content = tokens[idx].content.replace(/foo/g, 'bar');
+     *             });
+     * ```
+     **/
+    MarkdownIt.prototype.use = function (plugin /*, params, ... */) {
+      var args = [ this ].concat(Array.prototype.slice.call(arguments, 1));
+      plugin.apply(plugin, args);
+      return this;
+    };
+
+
+    /** internal
+     * MarkdownIt.parse(src, env) -> Array
+     * - src (String): source string
+     * - env (Object): environment sandbox
+     *
+     * Parse input string and returns list of block tokens (special token type
+     * "inline" will contain list of inline tokens). You should not call this
+     * method directly, until you write custom renderer (for example, to produce
+     * AST).
+     *
+     * `env` is used to pass data between "distributed" rules and return additional
+     * metadata like reference info, needed for the renderer. It also can be used to
+     * inject data in specific cases. Usually, you will be ok to pass `{}`,
+     * and then pass updated object to renderer.
+     **/
+    MarkdownIt.prototype.parse = function (src, env) {
+      if (typeof src !== 'string') {
+        throw new Error('Input data should be a String');
+      }
+
+      var state = new this.core.State(src, this, env);
+
+      this.core.process(state);
+
+      return state.tokens;
+    };
+
+
+    /**
+     * MarkdownIt.render(src [, env]) -> String
+     * - src (String): source string
+     * - env (Object): environment sandbox
+     *
+     * Render markdown string into html. It does all magic for you :).
+     *
+     * `env` can be used to inject additional metadata (`{}` by default).
+     * But you will not need it with high probability. See also comment
+     * in [[MarkdownIt.parse]].
+     **/
+    MarkdownIt.prototype.render = function (src, env) {
+      env = env || {};
+
+      return this.renderer.render(this.parse(src, env), this.options, env);
+    };
+
+
+    /** internal
+     * MarkdownIt.parseInline(src, env) -> Array
+     * - src (String): source string
+     * - env (Object): environment sandbox
+     *
+     * The same as [[MarkdownIt.parse]] but skip all block rules. It returns the
+     * block tokens list with the single `inline` element, containing parsed inline
+     * tokens in `children` property. Also updates `env` object.
+     **/
+    MarkdownIt.prototype.parseInline = function (src, env) {
+      var state = new this.core.State(src, this, env);
+
+      state.inlineMode = true;
+      this.core.process(state);
+
+      return state.tokens;
+    };
+
+
+    /**
+     * MarkdownIt.renderInline(src [, env]) -> String
+     * - src (String): source string
+     * - env (Object): environment sandbox
+     *
+     * Similar to [[MarkdownIt.render]] but for single paragraph content. Result
+     * will NOT be wrapped into `<p>` tags.
+     **/
+    MarkdownIt.prototype.renderInline = function (src, env) {
+      env = env || {};
+
+      return this.renderer.render(this.parseInline(src, env), this.options, env);
+    };
+
+
+    var lib = MarkdownIt;
+
+    var markdownIt = lib;
+
+    function cubicOut(t) {
+        const f = t - 1.0;
+        return f * f * f + 1.0;
+    }
+
+    function fade(node, { delay = 0, duration = 400 }) {
+        const o = +getComputedStyle(node).opacity;
+        return {
+            delay,
+            duration,
+            css: t => `opacity: ${t * o}`
+        };
+    }
+    function fly(node, { delay = 0, duration = 400, easing = cubicOut, x = 0, y = 0, opacity = 0 }) {
+        const style = getComputedStyle(node);
+        const target_opacity = +style.opacity;
+        const transform = style.transform === 'none' ? '' : style.transform;
+        const od = target_opacity * (1 - opacity);
+        return {
+            delay,
+            duration,
+            easing,
+            css: (t, u) => `
+			transform: ${transform} translate(${(1 - t) * x}px, ${(1 - t) * y}px);
+			opacity: ${target_opacity - (od * u)}`
+        };
+    }
+
+    var helpText = `
+# Credits (scroll down for help)
+
+---
+
+I'm just gonna put this front and center so that there isn't any doubt as to which parties various stuffs belongs to:
+
+- Credit for the sound effects goes to "[rafael langoni smith](http://rafaelsmith.com/home)" 
+  & "[flashygoodness](https://flashygoodness.bandcamp.com/album/rivals-of-aether-original-soundtrack)"
+- Mechanics/Physics based upon those found within [Rivals of Aether](https://www.rivalsofaether.com/)
+
+This webapp was created by me, [fudgepop01](https://twitter.com/fudgepop01), to assist development Steam Workshop characters for the game, Rivals of Aether.
+
+If you would like to support me in my future endeavors, consider [subscribing to me on patreon](https://www.patreon.com/fudgepop01) or [buying me a ko-fi](https://ko-fi.com/fudgepop01). Every cent will be used to further
+my ability to create and enhance useful tools, games, videos, and applications (such as this one)! Thank you for reading, and enjoy the app!
+
+---
+
+# Help
+
+---
+
+## Overview
+
+Moves in Rivals of Aether are structured in an interesting way. Every move is split into different parts. Each part is called a "window."
+Each of these "windows" is able to modify the character in various ways. Each window can also create "hitboxes" that are activated on particular frames.
+These "hitboxes" can be circles, rectangles, or rounded rectangles and have various properties. The attack itself also can have certian propreties, as well
+as the overall character. All of these things can be adjusted, and should hopefully be explained sufficiently in the coming paragraphs.
+
+### Getting Started
+
+Click the "upload spritesheet" button in the top-left corner. From here, choose a horizontal spritesheet that you have on your machine.
+After everything loads, set the number of frames that the spritesheet has. What you do from this point is basically up to you.
+
+### Parts of the App
+
+Each part of the app serves a particular purpose:
+
+- **left toolbar** (where you upload the spritesheet and see this message)
+  - various ways of importing and exporting data.
+- **top**
+  - the individual sprites in the spritesheet.
+  - shows the current frame
+  - a sprite can be selected to set the first sprite frame of the selected window
+- below that, the **timeline**
+  - tools on the top can modify the playback of the attack
+  - the timeline itself can be clicked to select the attack window you wish to edit
+- below that, the **metadata** (the dark bar below the timeline)
+  - can be used to give the current window a name and color
+  - can be used to give the selected hitbox a name and color
+- below that, the **main stage**
+  - a visual preview of how the move will look in-game
+  - can be zoomed in and out of with the zoom dropdown
+  - is pixel-perfect
+- **right toolbar**
+  - parameters for the selected window or hitbox
+  - hover over a parameter to see a description of what it does
+
+### Editing
+
+hitboxes can be created by clicking and dragging in the main stage when the respective tool is selected.
+The bounding box of the sprite is shown as a black border. The sprite itself can be repositioned by click + dragging if the "lock position" box is unchecked.
+
+etc etc.
+
+click 
+
+### Exporting
+
+
+---
+
+# Tips
+
+---
+
+there are keyboard shortcuts!
+
+- \`,\` and \`.\` go back and forward by 1 frame
+- \`[\` and \`]\` go back and forward by 1 window
+- \`v\` will enter "pan" mode
+- \`o\` will enter circle mode
+- \`r\` will enter rounded rectangle mode
+- \`b\` will enter rectangle mode
+- \`backspace\` will enter erase mode
+
+---
+
+# Changelog
+
+---
+
+### 10/8/2019
+
+- (+) added support for sound playback
+- (+) added this help message
+- (+) allowed the ability to import and export WIP moves as a small file
+- (-) removed filename display
+  - seemed unnecessary and took up space
+- fixed bug where exporting didn't use the attack index names properly
+- fixed bug where sound exports didn't export with "asset_get()"
+
+Upcoming features:
+
+- an in-browser filesystem
+- a more flexible way of exporitng code
+- built-in presets
+- sound effect uploading
+
+---
+
+# FAQs
+
+---
+`;
+
+    /* src\atoms\modal.svelte generated by Svelte v3.12.1 */
+
+    const file$2 = "src\\atoms\\modal.svelte";
+
+    // (46:0) {#if visible}
+    function create_if_block$2(ctx) {
+    	var div1, div0, raw_value = ctx.md.render(ctx.text) + "", div1_intro, div1_outro, current, dispose;
+
+    	const block = {
+    		c: function create() {
+    			div1 = element("div");
+    			div0 = element("div");
+    			attr_dev(div0, "id", "content");
+    			attr_dev(div0, "class", "svelte-1q8b98q");
+    			add_location(div0, file$2, 47, 8, 1092);
+    			attr_dev(div1, "id", "container");
+    			attr_dev(div1, "class", "svelte-1q8b98q");
+    			add_location(div1, file$2, 46, 4, 980);
+
+    			dispose = [
+    				listen_dev(div0, "click", stop_propagation(ctx.click_handler), false, false, true),
+    				listen_dev(div1, "click", ctx.click_handler_1)
+    			];
+    		},
+
+    		m: function mount(target, anchor) {
+    			insert_dev(target, div1, anchor);
+    			append_dev(div1, div0);
+    			div0.innerHTML = raw_value;
+    			current = true;
+    		},
+
+    		p: function update(changed, ctx) {
+    			if ((!current || changed.text) && raw_value !== (raw_value = ctx.md.render(ctx.text) + "")) {
+    				div0.innerHTML = raw_value;
+    			}
+    		},
+
+    		i: function intro(local) {
+    			if (current) return;
+    			add_render_callback(() => {
+    				if (div1_outro) div1_outro.end(1);
+    				if (!div1_intro) div1_intro = create_in_transition(div1, fly, {y: -2000, duration: 1000});
+    				div1_intro.start();
+    			});
+
+    			current = true;
+    		},
+
+    		o: function outro(local) {
+    			if (div1_intro) div1_intro.invalidate();
+
+    			div1_outro = create_out_transition(div1, fade, {});
+
+    			current = false;
+    		},
+
+    		d: function destroy(detaching) {
+    			if (detaching) {
+    				detach_dev(div1);
+    				if (div1_outro) div1_outro.end();
+    			}
+
+    			run_all(dispose);
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block$2.name, type: "if", source: "(46:0) {#if visible}", ctx });
+    	return block;
+    }
+
+    function create_fragment$3(ctx) {
+    	var if_block_anchor, current;
+
+    	var if_block = (ctx.visible) && create_if_block$2(ctx);
+
+    	const block = {
+    		c: function create() {
+    			if (if_block) if_block.c();
+    			if_block_anchor = empty();
+    		},
+
+    		l: function claim(nodes) {
+    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
+    		},
+
+    		m: function mount(target, anchor) {
+    			if (if_block) if_block.m(target, anchor);
+    			insert_dev(target, if_block_anchor, anchor);
+    			current = true;
+    		},
+
+    		p: function update(changed, ctx) {
+    			if (ctx.visible) {
+    				if (if_block) {
+    					if_block.p(changed, ctx);
+    					transition_in(if_block, 1);
+    				} else {
+    					if_block = create_if_block$2(ctx);
+    					if_block.c();
+    					transition_in(if_block, 1);
+    					if_block.m(if_block_anchor.parentNode, if_block_anchor);
+    				}
+    			} else if (if_block) {
+    				group_outros();
+    				transition_out(if_block, 1, 1, () => {
+    					if_block = null;
+    				});
+    				check_outros();
+    			}
+    		},
+
+    		i: function intro(local) {
+    			if (current) return;
+    			transition_in(if_block);
+    			current = true;
+    		},
+
+    		o: function outro(local) {
+    			transition_out(if_block);
+    			current = false;
+    		},
+
+    		d: function destroy(detaching) {
+    			if (if_block) if_block.d(detaching);
+
+    			if (detaching) {
+    				detach_dev(if_block_anchor);
+    			}
+    		}
+    	};
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment$3.name, type: "component", source: "", ctx });
+    	return block;
+    }
+
+    function instance$2($$self, $$props, $$invalidate) {
+    	
+
+        let { visible = true, text = helpText } = $$props;
+
+        const md = markdownIt({html: true, linkify: true, typographer: true});
+        const dispatch = createEventDispatcher();
+
+    	const writable_props = ['visible', 'text'];
+    	Object.keys($$props).forEach(key => {
+    		if (!writable_props.includes(key) && !key.startsWith('$$')) console.warn(`<Modal> was created with unknown prop '${key}'`);
+    	});
+
+    	function click_handler(event) {
+    		bubble($$self, event);
+    	}
+
+    	const click_handler_1 = () => dispatch('close');
+
+    	$$self.$set = $$props => {
+    		if ('visible' in $$props) $$invalidate('visible', visible = $$props.visible);
+    		if ('text' in $$props) $$invalidate('text', text = $$props.text);
+    	};
+
+    	$$self.$capture_state = () => {
+    		return { visible, text };
+    	};
+
+    	$$self.$inject_state = $$props => {
+    		if ('visible' in $$props) $$invalidate('visible', visible = $$props.visible);
+    		if ('text' in $$props) $$invalidate('text', text = $$props.text);
+    	};
+
+    	return {
+    		visible,
+    		text,
+    		md,
+    		dispatch,
+    		click_handler,
+    		click_handler_1
+    	};
+    }
+
+    class Modal extends SvelteComponentDev {
+    	constructor(options) {
+    		super(options);
+    		init(this, options, instance$2, create_fragment$3, safe_not_equal, ["visible", "text"]);
+    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "Modal", options, id: create_fragment$3.name });
+    	}
+
+    	get visible() {
+    		throw new Error("<Modal>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set visible(value) {
+    		throw new Error("<Modal>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	get text() {
+    		throw new Error("<Modal>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+
+    	set text(value) {
+    		throw new Error("<Modal>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
+    	}
+    }
 
     var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
 
@@ -1039,1433 +18221,7 @@ var app = (function () {
     var stripIndents = new TemplateTag(stripIndentTransformer('all'), trimResultTransformer);
     //# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLCJzb3VyY2VzIjpbIi4uLy4uL3NyYy9zdHJpcEluZGVudHMvc3RyaXBJbmRlbnRzLmpzIl0sIm5hbWVzIjpbIlRlbXBsYXRlVGFnIiwic3RyaXBJbmRlbnRUcmFuc2Zvcm1lciIsInRyaW1SZXN1bHRUcmFuc2Zvcm1lciIsInN0cmlwSW5kZW50cyJdLCJtYXBwaW5ncyI6IkFBQUEsT0FBT0EsV0FBUCxNQUF3QixnQkFBeEI7QUFDQSxPQUFPQyxzQkFBUCxNQUFtQywyQkFBbkM7QUFDQSxPQUFPQyxxQkFBUCxNQUFrQywwQkFBbEM7O0FBRUEsSUFBTUMsZUFBZSxJQUFJSCxXQUFKLENBQ25CQyx1QkFBdUIsS0FBdkIsQ0FEbUIsRUFFbkJDLHFCQUZtQixDQUFyQjs7QUFLQSxlQUFlQyxZQUFmIiwiZmlsZSI6InN0cmlwSW5kZW50cy5qcyIsInNvdXJjZXNDb250ZW50IjpbImltcG9ydCBUZW1wbGF0ZVRhZyBmcm9tICcuLi9UZW1wbGF0ZVRhZyc7XG5pbXBvcnQgc3RyaXBJbmRlbnRUcmFuc2Zvcm1lciBmcm9tICcuLi9zdHJpcEluZGVudFRyYW5zZm9ybWVyJztcbmltcG9ydCB0cmltUmVzdWx0VHJhbnNmb3JtZXIgZnJvbSAnLi4vdHJpbVJlc3VsdFRyYW5zZm9ybWVyJztcblxuY29uc3Qgc3RyaXBJbmRlbnRzID0gbmV3IFRlbXBsYXRlVGFnKFxuICBzdHJpcEluZGVudFRyYW5zZm9ybWVyKCdhbGwnKSxcbiAgdHJpbVJlc3VsdFRyYW5zZm9ybWVyLFxuKTtcblxuZXhwb3J0IGRlZmF1bHQgc3RyaXBJbmRlbnRzO1xuIl19
 
-    /* src\components\paramsBuilder.svelte generated by Svelte v3.12.1 */
-
-    const file = "src\\components\\paramsBuilder.svelte";
-
-    function get_each_context_1(ctx, list, i) {
-    	const child_ctx = Object.create(ctx);
-    	child_ctx.choice = list[i];
-    	return child_ctx;
-    }
-
-    function get_each_context(ctx, list, i) {
-    	const child_ctx = Object.create(ctx);
-    	child_ctx.key = list[i][0];
-    	child_ctx.val = list[i][1];
-    	child_ctx.index = i;
-    	return child_ctx;
-    }
-
-    // (56:4) {#if (!isDisabled(key, props))}
-    function create_if_block(ctx) {
-    	var div0, t0_value = ctx.key + "", t0, t1, div1, show_if, t2, index = ctx.index, div1_class_value, div1_data_tooltip_value, dispose;
-
-    	function select_block_type(changed, ctx) {
-    		if ((show_if == null) || changed.props) show_if = !!(Array.isArray(ctx.val.type));
-    		if (show_if) return create_if_block_1;
-    		if (ctx.val.type === 'number') return create_if_block_2;
-    		if (ctx.val.type === 'string') return create_if_block_3;
-    		if (ctx.val.type === 'auto') return create_if_block_4;
-    	}
-
-    	var current_block_type = select_block_type(null, ctx);
-    	var if_block = current_block_type && current_block_type(ctx);
-
-    	const assign_div1 = () => ctx.div1_binding(div1, index);
-    	const unassign_div1 = () => ctx.div1_binding(null, index);
-
-    	function mouseover_handler(...args) {
-    		return ctx.mouseover_handler(ctx, ...args);
-    	}
-
-    	const block = {
-    		c: function create() {
-    			div0 = element("div");
-    			t0 = text(t0_value);
-    			t1 = space();
-    			div1 = element("div");
-    			if (if_block) if_block.c();
-    			t2 = space();
-    			attr_dev(div0, "class", "input-title svelte-189lgej");
-    			add_location(div0, file, 56, 8, 1280);
-    			attr_dev(div1, "class", div1_class_value = "" + null_to_empty(((ctx.index !== Object.keys(ctx.props).length - 1) ? 'tooltip-left' : 'tooltip-up-left')) + " svelte-189lgej");
-    			attr_dev(div1, "data-tooltip", div1_data_tooltip_value = ctx.val.description);
-    			add_location(div1, file, 57, 8, 1326);
-    			dispose = listen_dev(div1, "mouseover", mouseover_handler);
-    		},
-
-    		m: function mount(target, anchor) {
-    			insert_dev(target, div0, anchor);
-    			append_dev(div0, t0);
-    			insert_dev(target, t1, anchor);
-    			insert_dev(target, div1, anchor);
-    			if (if_block) if_block.m(div1, null);
-    			append_dev(div1, t2);
-    			assign_div1();
-    		},
-
-    		p: function update(changed, new_ctx) {
-    			ctx = new_ctx;
-    			if ((changed.props) && t0_value !== (t0_value = ctx.key + "")) {
-    				set_data_dev(t0, t0_value);
-    			}
-
-    			if (current_block_type === (current_block_type = select_block_type(changed, ctx)) && if_block) {
-    				if_block.p(changed, ctx);
-    			} else {
-    				if (if_block) if_block.d(1);
-    				if_block = current_block_type && current_block_type(ctx);
-    				if (if_block) {
-    					if_block.c();
-    					if_block.m(div1, t2);
-    				}
-    			}
-
-    			if (index !== ctx.index) {
-    				unassign_div1();
-    				index = ctx.index;
-    				assign_div1();
-    			}
-
-    			if ((changed.props) && div1_class_value !== (div1_class_value = "" + null_to_empty(((ctx.index !== Object.keys(ctx.props).length - 1) ? 'tooltip-left' : 'tooltip-up-left')) + " svelte-189lgej")) {
-    				attr_dev(div1, "class", div1_class_value);
-    			}
-
-    			if ((changed.props) && div1_data_tooltip_value !== (div1_data_tooltip_value = ctx.val.description)) {
-    				attr_dev(div1, "data-tooltip", div1_data_tooltip_value);
-    			}
-    		},
-
-    		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(div0);
-    				detach_dev(t1);
-    				detach_dev(div1);
-    			}
-
-    			if (if_block) if_block.d();
-    			unassign_div1();
-    			dispose();
-    		}
-    	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block.name, type: "if", source: "(56:4) {#if (!isDisabled(key, props))}", ctx });
-    	return block;
-    }
-
-    // (83:38) 
-    function create_if_block_4(ctx) {
-    	var input, dispose;
-
-    	function input_input_handler_2() {
-    		ctx.input_input_handler_2.call(input, ctx);
-    	}
-
-    	const block = {
-    		c: function create() {
-    			input = element("input");
-    			attr_dev(input, "type", "text");
-    			input.disabled = true;
-    			attr_dev(input, "class", "svelte-189lgej");
-    			add_location(input, file, 83, 12, 2689);
-    			dispose = listen_dev(input, "input", input_input_handler_2);
-    		},
-
-    		m: function mount(target, anchor) {
-    			insert_dev(target, input, anchor);
-
-    			set_input_value(input, ctx.props[ctx.key].value);
-    		},
-
-    		p: function update(changed, new_ctx) {
-    			ctx = new_ctx;
-    			if (changed.props && (input.value !== ctx.props[ctx.key].value)) set_input_value(input, ctx.props[ctx.key].value);
-    		},
-
-    		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(input);
-    			}
-
-    			dispose();
-    		}
-    	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_4.name, type: "if", source: "(83:38) ", ctx });
-    	return block;
-    }
-
-    // (81:40) 
-    function create_if_block_3(ctx) {
-    	var input, dispose;
-
-    	function input_input_handler_1() {
-    		ctx.input_input_handler_1.call(input, ctx);
-    	}
-
-    	const block = {
-    		c: function create() {
-    			input = element("input");
-    			attr_dev(input, "type", "text");
-    			attr_dev(input, "class", "svelte-189lgej");
-    			add_location(input, file, 81, 12, 2583);
-    			dispose = listen_dev(input, "input", input_input_handler_1);
-    		},
-
-    		m: function mount(target, anchor) {
-    			insert_dev(target, input, anchor);
-
-    			set_input_value(input, ctx.props[ctx.key].value);
-    		},
-
-    		p: function update(changed, new_ctx) {
-    			ctx = new_ctx;
-    			if (changed.props && (input.value !== ctx.props[ctx.key].value)) set_input_value(input, ctx.props[ctx.key].value);
-    		},
-
-    		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(input);
-    			}
-
-    			dispose();
-    		}
-    	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_3.name, type: "if", source: "(81:40) ", ctx });
-    	return block;
-    }
-
-    // (79:40) 
-    function create_if_block_2(ctx) {
-    	var input, input_updating = false, dispose;
-
-    	function input_input_handler() {
-    		input_updating = true;
-    		ctx.input_input_handler.call(input, ctx);
-    	}
-
-    	const block = {
-    		c: function create() {
-    			input = element("input");
-    			attr_dev(input, "type", "number");
-    			attr_dev(input, "class", "svelte-189lgej");
-    			add_location(input, file, 79, 12, 2473);
-    			dispose = listen_dev(input, "input", input_input_handler);
-    		},
-
-    		m: function mount(target, anchor) {
-    			insert_dev(target, input, anchor);
-
-    			set_input_value(input, ctx.props[ctx.key].value);
-    		},
-
-    		p: function update(changed, new_ctx) {
-    			ctx = new_ctx;
-    			if (!input_updating && changed.props) set_input_value(input, ctx.props[ctx.key].value);
-    			input_updating = false;
-    		},
-
-    		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(input);
-    			}
-
-    			dispose();
-    		}
-    	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_2.name, type: "if", source: "(79:40) ", ctx });
-    	return block;
-    }
-
-    // (73:8) {#if Array.isArray(val.type)}
-    function create_if_block_1(ctx) {
-    	var select, dispose;
-
-    	let each_value_1 = ctx.val.type;
-
-    	let each_blocks = [];
-
-    	for (let i = 0; i < each_value_1.length; i += 1) {
-    		each_blocks[i] = create_each_block_1(get_each_context_1(ctx, each_value_1, i));
-    	}
-
-    	function select_change_handler() {
-    		ctx.select_change_handler.call(select, ctx);
-    	}
-
-    	const block = {
-    		c: function create() {
-    			select = element("select");
-
-    			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].c();
-    			}
-    			if (ctx.props[ctx.key].value === void 0) add_render_callback(select_change_handler);
-    			add_location(select, file, 73, 12, 2189);
-    			dispose = listen_dev(select, "change", select_change_handler);
-    		},
-
-    		m: function mount(target, anchor) {
-    			insert_dev(target, select, anchor);
-
-    			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].m(select, null);
-    			}
-
-    			select_option(select, ctx.props[ctx.key].value);
-    		},
-
-    		p: function update(changed, new_ctx) {
-    			ctx = new_ctx;
-    			if (changed.props) {
-    				each_value_1 = ctx.val.type;
-
-    				let i;
-    				for (i = 0; i < each_value_1.length; i += 1) {
-    					const child_ctx = get_each_context_1(ctx, each_value_1, i);
-
-    					if (each_blocks[i]) {
-    						each_blocks[i].p(changed, child_ctx);
-    					} else {
-    						each_blocks[i] = create_each_block_1(child_ctx);
-    						each_blocks[i].c();
-    						each_blocks[i].m(select, null);
-    					}
-    				}
-
-    				for (; i < each_blocks.length; i += 1) {
-    					each_blocks[i].d(1);
-    				}
-    				each_blocks.length = each_value_1.length;
-    			}
-
-    			if (changed.props) select_option(select, ctx.props[ctx.key].value);
-    		},
-
-    		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(select);
-    			}
-
-    			destroy_each(each_blocks, detaching);
-
-    			dispose();
-    		}
-    	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_1.name, type: "if", source: "(73:8) {#if Array.isArray(val.type)}", ctx });
-    	return block;
-    }
-
-    // (75:16) {#each val.type as choice}
-    function create_each_block_1(ctx) {
-    	var option, t_value = ctx.choice + "", t, option_value_value, option_selected_value;
-
-    	const block = {
-    		c: function create() {
-    			option = element("option");
-    			t = text(t_value);
-    			option.__value = option_value_value = ctx.choice;
-    			option.value = option.__value;
-    			option.selected = option_selected_value = ctx.choice === ctx.val.value;
-    			add_location(option, file, 75, 20, 2293);
-    		},
-
-    		m: function mount(target, anchor) {
-    			insert_dev(target, option, anchor);
-    			append_dev(option, t);
-    		},
-
-    		p: function update(changed, ctx) {
-    			if ((changed.props) && t_value !== (t_value = ctx.choice + "")) {
-    				set_data_dev(t, t_value);
-    			}
-
-    			if ((changed.props) && option_value_value !== (option_value_value = ctx.choice)) {
-    				prop_dev(option, "__value", option_value_value);
-    			}
-
-    			option.value = option.__value;
-
-    			if ((changed.props) && option_selected_value !== (option_selected_value = ctx.choice === ctx.val.value)) {
-    				prop_dev(option, "selected", option_selected_value);
-    			}
-    		},
-
-    		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(option);
-    			}
-    		}
-    	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_1.name, type: "each", source: "(75:16) {#each val.type as choice}", ctx });
-    	return block;
-    }
-
-    // (55:0) {#each Object.entries(props) as [key, val], index}
-    function create_each_block(ctx) {
-    	var show_if = (!ctx.isDisabled(ctx.key, ctx.props)), if_block_anchor;
-
-    	var if_block = (show_if) && create_if_block(ctx);
-
-    	const block = {
-    		c: function create() {
-    			if (if_block) if_block.c();
-    			if_block_anchor = empty();
-    		},
-
-    		m: function mount(target, anchor) {
-    			if (if_block) if_block.m(target, anchor);
-    			insert_dev(target, if_block_anchor, anchor);
-    		},
-
-    		p: function update(changed, ctx) {
-    			if (changed.isDisabled || changed.props) show_if = (!ctx.isDisabled(ctx.key, ctx.props));
-
-    			if (show_if) {
-    				if (if_block) {
-    					if_block.p(changed, ctx);
-    				} else {
-    					if_block = create_if_block(ctx);
-    					if_block.c();
-    					if_block.m(if_block_anchor.parentNode, if_block_anchor);
-    				}
-    			} else if (if_block) {
-    				if_block.d(1);
-    				if_block = null;
-    			}
-    		},
-
-    		d: function destroy(detaching) {
-    			if (if_block) if_block.d(detaching);
-
-    			if (detaching) {
-    				detach_dev(if_block_anchor);
-    			}
-    		}
-    	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block.name, type: "each", source: "(55:0) {#each Object.entries(props) as [key, val], index}", ctx });
-    	return block;
-    }
-
-    function create_fragment(ctx) {
-    	var each_1_anchor;
-
-    	let each_value = Object.entries(ctx.props);
-
-    	let each_blocks = [];
-
-    	for (let i = 0; i < each_value.length; i += 1) {
-    		each_blocks[i] = create_each_block(get_each_context(ctx, each_value, i));
-    	}
-
-    	const block = {
-    		c: function create() {
-    			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].c();
-    			}
-
-    			each_1_anchor = empty();
-    		},
-
-    		l: function claim(nodes) {
-    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
-    		},
-
-    		m: function mount(target, anchor) {
-    			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].m(target, anchor);
-    			}
-
-    			insert_dev(target, each_1_anchor, anchor);
-    		},
-
-    		p: function update(changed, ctx) {
-    			if (changed.isDisabled || changed.props || changed.items) {
-    				each_value = Object.entries(ctx.props);
-
-    				let i;
-    				for (i = 0; i < each_value.length; i += 1) {
-    					const child_ctx = get_each_context(ctx, each_value, i);
-
-    					if (each_blocks[i]) {
-    						each_blocks[i].p(changed, child_ctx);
-    					} else {
-    						each_blocks[i] = create_each_block(child_ctx);
-    						each_blocks[i].c();
-    						each_blocks[i].m(each_1_anchor.parentNode, each_1_anchor);
-    					}
-    				}
-
-    				for (; i < each_blocks.length; i += 1) {
-    					each_blocks[i].d(1);
-    				}
-    				each_blocks.length = each_value.length;
-    			}
-    		},
-
-    		i: noop,
-    		o: noop,
-
-    		d: function destroy(detaching) {
-    			destroy_each(each_blocks, detaching);
-
-    			if (detaching) {
-    				detach_dev(each_1_anchor);
-    			}
-    		}
-    	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment.name, type: "component", source: "", ctx });
-    	return block;
-    }
-
-    function instance($$self, $$props, $$invalidate) {
-    	let { props = {}, isDisabled = false } = $$props;
-        let items = [];
-
-    	const writable_props = ['props', 'isDisabled'];
-    	Object.keys($$props).forEach(key => {
-    		if (!writable_props.includes(key) && !key.startsWith('$$')) console.warn(`<ParamsBuilder> was created with unknown prop '${key}'`);
-    	});
-
-    	function select_change_handler({ key }) {
-    		props[key].value = select_value(this);
-    		$$invalidate('props', props);
-    	}
-
-    	function input_input_handler({ key }) {
-    		props[key].value = to_number(this.value);
-    		$$invalidate('props', props);
-    	}
-
-    	function input_input_handler_1({ key }) {
-    		props[key].value = this.value;
-    		$$invalidate('props', props);
-    	}
-
-    	function input_input_handler_2({ key }) {
-    		props[key].value = this.value;
-    		$$invalidate('props', props);
-    	}
-
-    	function div1_binding($$value, index) {
-    		if (items[index] === $$value) return;
-    		binding_callbacks[$$value ? 'unshift' : 'push'](() => {
-    			items[index] = $$value;
-    			$$invalidate('items', items);
-    		});
-    	}
-
-    	const mouseover_handler = ({ index }, evt) => {
-    	                let self = items[index];
-    	                let bounds = self.getBoundingClientRect();
-    	                let styles = window.getComputedStyle(self, ':after');
-    	                self.style.setProperty('--position-right', `${bounds.left - 5}px`);
-    	                self.style.setProperty('--position-top', `${
-	                    (bounds.top + parseInt(styles.getPropertyValue('height')) > window.innerHeight) ? 
-	                    window.innerHeight - parseInt(styles.getPropertyValue('height')) - 10 : bounds.top 
-	                }px`);
-    	            };
-
-    	$$self.$set = $$props => {
-    		if ('props' in $$props) $$invalidate('props', props = $$props.props);
-    		if ('isDisabled' in $$props) $$invalidate('isDisabled', isDisabled = $$props.isDisabled);
-    	};
-
-    	$$self.$capture_state = () => {
-    		return { props, isDisabled, items };
-    	};
-
-    	$$self.$inject_state = $$props => {
-    		if ('props' in $$props) $$invalidate('props', props = $$props.props);
-    		if ('isDisabled' in $$props) $$invalidate('isDisabled', isDisabled = $$props.isDisabled);
-    		if ('items' in $$props) $$invalidate('items', items = $$props.items);
-    	};
-
-    	return {
-    		props,
-    		isDisabled,
-    		items,
-    		select_change_handler,
-    		input_input_handler,
-    		input_input_handler_1,
-    		input_input_handler_2,
-    		div1_binding,
-    		mouseover_handler
-    	};
-    }
-
-    class ParamsBuilder extends SvelteComponentDev {
-    	constructor(options) {
-    		super(options);
-    		init(this, options, instance, create_fragment, safe_not_equal, ["props", "isDisabled"]);
-    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "ParamsBuilder", options, id: create_fragment.name });
-    	}
-
-    	get props() {
-    		throw new Error("<ParamsBuilder>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	set props(value) {
-    		throw new Error("<ParamsBuilder>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	get isDisabled() {
-    		throw new Error("<ParamsBuilder>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	set isDisabled(value) {
-    		throw new Error("<ParamsBuilder>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-    }
-
-    /* src\components\timeline.svelte generated by Svelte v3.12.1 */
-
-    const file$1 = "src\\components\\timeline.svelte";
-
-    function get_each_context$1(ctx, list, i) {
-    	const child_ctx = Object.create(ctx);
-    	child_ctx.win = list[i];
-    	child_ctx.i = i;
-    	return child_ctx;
-    }
-
-    // (154:2) {#each windows as win, i}
-    function create_each_block$1(ctx) {
-    	var div, p, t_value = ctx.win.meta.name + "", t, dispose;
-
-    	function click_handler_1() {
-    		return ctx.click_handler_1(ctx);
-    	}
-
-    	const block = {
-    		c: function create() {
-    			div = element("div");
-    			p = element("p");
-    			t = text(t_value);
-    			set_style(p, "justify-self", "center");
-    			set_style(p, "align-self", "center");
-    			set_style(p, "margin", "0");
-    			set_style(p, "position", "absolute");
-    			add_location(p, file$1, 166, 4, 4619);
-    			attr_dev(div, "class", "window");
-    			set_style(div, "height", "100%");
-    			set_style(div, "flex-grow", ctx.win.data.AG_WINDOW_LENGTH.value);
-    			set_style(div, "background-color", ctx.win.meta.color);
-    			set_style(div, "border-right", ((ctx.i !== ctx.windows.length - 1) ? '1px solid black' : 'none'));
-    			set_style(div, "display", "grid");
-    			set_style(div, "position", "relative");
-    			set_style(div, "box-shadow", (ctx.anim.windowIndex == ctx.i ? 'inset 0 0 5px black' : 'none'));
-    			add_location(div, file$1, 154, 3, 4163);
-    			dispose = listen_dev(div, "click", click_handler_1);
-    		},
-
-    		m: function mount(target, anchor) {
-    			insert_dev(target, div, anchor);
-    			append_dev(div, p);
-    			append_dev(p, t);
-    		},
-
-    		p: function update(changed, new_ctx) {
-    			ctx = new_ctx;
-    			if ((changed.windows) && t_value !== (t_value = ctx.win.meta.name + "")) {
-    				set_data_dev(t, t_value);
-    			}
-
-    			if (changed.windows) {
-    				set_style(div, "flex-grow", ctx.win.data.AG_WINDOW_LENGTH.value);
-    				set_style(div, "background-color", ctx.win.meta.color);
-    				set_style(div, "border-right", ((ctx.i !== ctx.windows.length - 1) ? '1px solid black' : 'none'));
-    			}
-
-    			if (changed.anim) {
-    				set_style(div, "box-shadow", (ctx.anim.windowIndex == ctx.i ? 'inset 0 0 5px black' : 'none'));
-    			}
-    		},
-
-    		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(div);
-    			}
-
-    			dispose();
-    		}
-    	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block$1.name, type: "each", source: "(154:2) {#each windows as win, i}", ctx });
-    	return block;
-    }
-
-    // (187:39) 
-    function create_if_block_3$1(ctx) {
-    	var input, dispose;
-
-    	const block = {
-    		c: function create() {
-    			input = element("input");
-    			attr_dev(input, "type", "text");
-    			add_location(input, file$1, 187, 5, 5282);
-    			dispose = listen_dev(input, "input", ctx.input_input_handler_2);
-    		},
-
-    		m: function mount(target, anchor) {
-    			insert_dev(target, input, anchor);
-
-    			set_input_value(input, ctx.hitboxes[ctx.hitboxes.selected].meta.name);
-    		},
-
-    		p: function update(changed, ctx) {
-    			if (changed.hitboxes && (input.value !== ctx.hitboxes[ctx.hitboxes.selected].meta.name)) set_input_value(input, ctx.hitboxes[ctx.hitboxes.selected].meta.name);
-    		},
-
-    		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(input);
-    			}
-
-    			dispose();
-    		}
-    	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_3$1.name, type: "if", source: "(187:39) ", ctx });
-    	return block;
-    }
-
-    // (185:4) {#if editingMode === 'window'}
-    function create_if_block_2$1(ctx) {
-    	var input, dispose;
-
-    	const block = {
-    		c: function create() {
-    			input = element("input");
-    			attr_dev(input, "type", "text");
-    			add_location(input, file$1, 185, 5, 5166);
-    			dispose = listen_dev(input, "input", ctx.input_input_handler_1);
-    		},
-
-    		m: function mount(target, anchor) {
-    			insert_dev(target, input, anchor);
-
-    			set_input_value(input, ctx.windows[ctx.anim.windowIndex].meta.name);
-    		},
-
-    		p: function update(changed, ctx) {
-    			if ((changed.windows || changed.anim) && (input.value !== ctx.windows[ctx.anim.windowIndex].meta.name)) set_input_value(input, ctx.windows[ctx.anim.windowIndex].meta.name);
-    		},
-
-    		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(input);
-    			}
-
-    			dispose();
-    		}
-    	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_2$1.name, type: "if", source: "(185:4) {#if editingMode === 'window'}", ctx });
-    	return block;
-    }
-
-    // (195:39) 
-    function create_if_block_1$1(ctx) {
-    	var input, dispose;
-
-    	const block = {
-    		c: function create() {
-    			input = element("input");
-    			attr_dev(input, "type", "text");
-    			add_location(input, file$1, 195, 5, 5591);
-    			dispose = listen_dev(input, "input", ctx.input_input_handler_4);
-    		},
-
-    		m: function mount(target, anchor) {
-    			insert_dev(target, input, anchor);
-
-    			set_input_value(input, ctx.hitboxes[ctx.hitboxes.selected].meta.color);
-    		},
-
-    		p: function update(changed, ctx) {
-    			if (changed.hitboxes && (input.value !== ctx.hitboxes[ctx.hitboxes.selected].meta.color)) set_input_value(input, ctx.hitboxes[ctx.hitboxes.selected].meta.color);
-    		},
-
-    		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(input);
-    			}
-
-    			dispose();
-    		}
-    	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_1$1.name, type: "if", source: "(195:39) ", ctx });
-    	return block;
-    }
-
-    // (193:4) {#if editingMode === 'window'}
-    function create_if_block$1(ctx) {
-    	var input, dispose;
-
-    	const block = {
-    		c: function create() {
-    			input = element("input");
-    			attr_dev(input, "type", "text");
-    			add_location(input, file$1, 193, 5, 5474);
-    			dispose = listen_dev(input, "input", ctx.input_input_handler_3);
-    		},
-
-    		m: function mount(target, anchor) {
-    			insert_dev(target, input, anchor);
-
-    			set_input_value(input, ctx.windows[ctx.anim.windowIndex].meta.color);
-    		},
-
-    		p: function update(changed, ctx) {
-    			if ((changed.windows || changed.anim) && (input.value !== ctx.windows[ctx.anim.windowIndex].meta.color)) set_input_value(input, ctx.windows[ctx.anim.windowIndex].meta.color);
-    		},
-
-    		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(input);
-    			}
-
-    			dispose();
-    		}
-    	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block$1.name, type: "if", source: "(193:4) {#if editingMode === 'window'}", ctx });
-    	return block;
-    }
-
-    function create_fragment$1(ctx) {
-    	var div4, div1, input, input_updating = false, input_max_value, t0, p, t1, label0, t2_value = ctx.anim.animFrame + 1 + "", t2, label0_class_value, t3, t4_value = ctx.anim.duration + "", t4, t5, t6, div0, t7, t8_value = ctx.anim.windowIndex + 1 + "", t8, t9, t10_value = ctx.windows.length + "", t10, t11, button0, i0, t13, button1, i1, button1_disabled_value, t15, div2, button2, i2, t17, button3, i3, button3_disabled_value, t19, button4, i4, t20_value = ctx.anim.playing ? 'pause' : 'play_arrow' + "", t20, t21, button5, i5, button5_disabled_value, t23, div3, t24, select, option0, option1, option2, t28, div6, t29, div5, t30, div8, div7, label1, t31, t32, label2, t33, dispose;
-
-    	function input_input_handler() {
-    		input_updating = true;
-    		ctx.input_input_handler.call(input);
-    	}
-
-    	let each_value = ctx.windows;
-
-    	let each_blocks = [];
-
-    	for (let i = 0; i < each_value.length; i += 1) {
-    		each_blocks[i] = create_each_block$1(get_each_context$1(ctx, each_value, i));
-    	}
-
-    	function select_block_type(changed, ctx) {
-    		if (ctx.editingMode === 'window') return create_if_block_2$1;
-    		if (ctx.editingMode === 'hitbox') return create_if_block_3$1;
-    	}
-
-    	var current_block_type = select_block_type(null, ctx);
-    	var if_block0 = current_block_type && current_block_type(ctx);
-
-    	function select_block_type_1(changed, ctx) {
-    		if (ctx.editingMode === 'window') return create_if_block$1;
-    		if (ctx.editingMode === 'hitbox') return create_if_block_1$1;
-    	}
-
-    	var current_block_type_1 = select_block_type_1(null, ctx);
-    	var if_block1 = current_block_type_1 && current_block_type_1(ctx);
-
-    	const block = {
-    		c: function create() {
-    			div4 = element("div");
-    			div1 = element("div");
-    			input = element("input");
-    			t0 = space();
-    			p = element("p");
-    			t1 = text("frame: ");
-    			label0 = element("label");
-    			t2 = text(t2_value);
-    			t3 = text(" / ");
-    			t4 = text(t4_value);
-    			t5 = text(";");
-    			t6 = space();
-    			div0 = element("div");
-    			t7 = text("window: ");
-    			t8 = text(t8_value);
-    			t9 = text(" / ");
-    			t10 = text(t10_value);
-    			t11 = space();
-    			button0 = element("button");
-    			i0 = element("i");
-    			i0.textContent = "add";
-    			t13 = space();
-    			button1 = element("button");
-    			i1 = element("i");
-    			i1.textContent = "delete";
-    			t15 = space();
-    			div2 = element("div");
-    			button2 = element("button");
-    			i2 = element("i");
-    			i2.textContent = "loop";
-    			t17 = space();
-    			button3 = element("button");
-    			i3 = element("i");
-    			i3.textContent = "skip_previous";
-    			t19 = space();
-    			button4 = element("button");
-    			i4 = element("i");
-    			t20 = text(t20_value);
-    			t21 = space();
-    			button5 = element("button");
-    			i5 = element("i");
-    			i5.textContent = "skip_next";
-    			t23 = space();
-    			div3 = element("div");
-    			t24 = text("playback speed:\r\n\t\t\t");
-    			select = element("select");
-    			option0 = element("option");
-    			option0.textContent = "1/4x";
-    			option1 = element("option");
-    			option1.textContent = "1/2x";
-    			option2 = element("option");
-    			option2.textContent = "1x";
-    			t28 = space();
-    			div6 = element("div");
-
-    			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].c();
-    			}
-
-    			t29 = space();
-    			div5 = element("div");
-    			t30 = space();
-    			div8 = element("div");
-    			div7 = element("div");
-    			label1 = element("label");
-    			t31 = text("name:\r\n\t\t\t\t");
-    			if (if_block0) if_block0.c();
-    			t32 = space();
-    			label2 = element("label");
-    			t33 = text("color:\r\n\t\t\t\t");
-    			if (if_block1) if_block1.c();
-    			attr_dev(input, "type", "number");
-    			attr_dev(input, "id", "current-frame");
-    			attr_dev(input, "min", "0");
-    			attr_dev(input, "max", input_max_value = ctx.anim.duration - 1);
-    			attr_dev(input, "class", "svelte-1v3rt8w");
-    			add_location(input, file$1, 112, 3, 2313);
-    			set_style(label0, "width", "" + (ctx.anim.duration.toString().length * 10 + 10) + "px");
-    			attr_dev(label0, "id", "current-frame-label");
-    			attr_dev(label0, "class", label0_class_value = "" + null_to_empty(((ctx.isCurrentFrameFocused) ? 'active' : '')) + " svelte-1v3rt8w");
-    			attr_dev(label0, "for", "current-frame");
-    			add_location(label0, file$1, 120, 11, 2640);
-    			set_style(p, "width", "150px");
-    			set_style(p, "margin", "0");
-    			set_style(p, "display", "inline-block");
-    			add_location(p, file$1, 119, 3, 2569);
-    			attr_dev(i0, "class", "material-icons svelte-1v3rt8w");
-    			add_location(i0, file$1, 133, 44, 3110);
-    			add_location(button0, file$1, 133, 4, 3070);
-    			attr_dev(i1, "class", "material-icons svelte-1v3rt8w");
-    			add_location(i1, file$1, 134, 77, 3231);
-    			button1.disabled = button1_disabled_value = ctx.windows.length <= 1;
-    			attr_dev(button1, "class", "svelte-1v3rt8w");
-    			add_location(button1, file$1, 134, 4, 3158);
-    			set_style(div0, "width", "400px");
-    			set_style(div0, "margin", "0");
-    			set_style(div0, "display", "inline-block");
-    			add_location(div0, file$1, 131, 3, 2949);
-    			attr_dev(div1, "class", "option-group svelte-1v3rt8w");
-    			set_style(div1, "justify-self", "left");
-    			add_location(div1, file$1, 111, 2, 2255);
-    			attr_dev(i2, "class", "material-icons svelte-1v3rt8w");
-    			add_location(i2, file$1, 138, 53, 3412);
-    			add_location(button2, file$1, 138, 3, 3362);
-    			attr_dev(i3, "class", "material-icons svelte-1v3rt8w");
-    			add_location(i3, file$1, 139, 65, 3522);
-    			button3.disabled = button3_disabled_value = ctx.anim.animFrame === 0;
-    			attr_dev(button3, "class", "svelte-1v3rt8w");
-    			add_location(button3, file$1, 139, 3, 3460);
-    			attr_dev(i4, "class", "material-icons svelte-1v3rt8w");
-    			add_location(i4, file$1, 140, 35, 3611);
-    			add_location(button4, file$1, 140, 3, 3579);
-    			attr_dev(i5, "class", "material-icons svelte-1v3rt8w");
-    			add_location(i5, file$1, 141, 82, 3773);
-    			button5.disabled = button5_disabled_value = ctx.anim.animFrame === ctx.anim.duration - 1;
-    			attr_dev(button5, "class", "svelte-1v3rt8w");
-    			add_location(button5, file$1, 141, 3, 3694);
-    			attr_dev(div2, "class", "option-group svelte-1v3rt8w");
-    			set_style(div2, "justify-self", "center");
-    			add_location(div2, file$1, 137, 2, 3301);
-    			option0.__value = "0.25";
-    			option0.value = option0.__value;
-    			add_location(option0, file$1, 146, 4, 3957);
-    			option1.__value = "0.5";
-    			option1.value = option1.__value;
-    			add_location(option1, file$1, 147, 4, 3997);
-    			option2.__value = "1";
-    			option2.value = option2.__value;
-    			option2.selected = true;
-    			add_location(option2, file$1, 148, 4, 4036);
-    			if (ctx.anim.playSpeed === void 0) add_render_callback(() => ctx.select_change_handler.call(select));
-    			add_location(select, file$1, 145, 3, 3915);
-    			attr_dev(div3, "class", "option-group svelte-1v3rt8w");
-    			set_style(div3, "justify-self", "right");
-    			add_location(div3, file$1, 143, 2, 3835);
-    			attr_dev(div4, "id", "timeline-controls");
-    			attr_dev(div4, "class", "svelte-1v3rt8w");
-    			add_location(div4, file$1, 110, 0, 2223);
-    			attr_dev(div5, "id", "playhead");
-    			set_style(div5, "height", "100%");
-    			set_style(div5, "width", "2px");
-    			set_style(div5, "background-color", "#8888");
-    			set_style(div5, "box-shadow", "0 0 0 1px #000");
-    			set_style(div5, "position", "absolute");
-    			set_style(div5, "margin-left", "" + ((ctx.anim.duration != 0) ? ctx.anim.animFrame * 100 / ctx.anim.duration : 0) + "%");
-    			add_location(div5, file$1, 169, 2, 4748);
-    			attr_dev(div6, "id", "timeline");
-    			attr_dev(div6, "class", "svelte-1v3rt8w");
-    			add_location(div6, file$1, 152, 1, 4110);
-    			set_style(label1, "display", "inline-block");
-    			add_location(label1, file$1, 182, 3, 5074);
-    			set_style(label2, "display", "inline-block");
-    			add_location(label2, file$1, 190, 3, 5381);
-    			attr_dev(div7, "class", "option-group svelte-1v3rt8w");
-    			add_location(div7, file$1, 181, 2, 5043);
-    			attr_dev(div8, "id", "window-metadata");
-    			attr_dev(div8, "class", "svelte-1v3rt8w");
-    			add_location(div8, file$1, 180, 1, 5013);
-
-    			dispose = [
-    				listen_dev(input, "input", input_input_handler),
-    				listen_dev(input, "focus", ctx.focus_handler),
-    				listen_dev(input, "blur", ctx.blur_handler),
-    				listen_dev(button0, "click", ctx.handleWindowAddition),
-    				listen_dev(button1, "click", ctx.handleWindowDeletion),
-    				listen_dev(button2, "click", ctx.click_handler),
-    				listen_dev(button3, "click", ctx.skipBack),
-    				listen_dev(button4, "click", ctx.startPlaying),
-    				listen_dev(button5, "click", ctx.skipAhead),
-    				listen_dev(select, "change", ctx.select_change_handler)
-    			];
-    		},
-
-    		l: function claim(nodes) {
-    			throw new Error("options.hydrate only works if the component was compiled with the `hydratable: true` option");
-    		},
-
-    		m: function mount(target, anchor) {
-    			insert_dev(target, div4, anchor);
-    			append_dev(div4, div1);
-    			append_dev(div1, input);
-
-    			set_input_value(input, ctx.anim.animFrame);
-
-    			append_dev(div1, t0);
-    			append_dev(div1, p);
-    			append_dev(p, t1);
-    			append_dev(p, label0);
-    			append_dev(label0, t2);
-    			ctx.label0_binding(label0);
-    			append_dev(p, t3);
-    			append_dev(p, t4);
-    			append_dev(p, t5);
-    			append_dev(div1, t6);
-    			append_dev(div1, div0);
-    			append_dev(div0, t7);
-    			append_dev(div0, t8);
-    			append_dev(div0, t9);
-    			append_dev(div0, t10);
-    			append_dev(div0, t11);
-    			append_dev(div0, button0);
-    			append_dev(button0, i0);
-    			append_dev(div0, t13);
-    			append_dev(div0, button1);
-    			append_dev(button1, i1);
-    			append_dev(div4, t15);
-    			append_dev(div4, div2);
-    			append_dev(div2, button2);
-    			append_dev(button2, i2);
-    			append_dev(div2, t17);
-    			append_dev(div2, button3);
-    			append_dev(button3, i3);
-    			append_dev(div2, t19);
-    			append_dev(div2, button4);
-    			append_dev(button4, i4);
-    			append_dev(i4, t20);
-    			append_dev(div2, t21);
-    			append_dev(div2, button5);
-    			append_dev(button5, i5);
-    			append_dev(div4, t23);
-    			append_dev(div4, div3);
-    			append_dev(div3, t24);
-    			append_dev(div3, select);
-    			append_dev(select, option0);
-    			append_dev(select, option1);
-    			append_dev(select, option2);
-
-    			select_option(select, ctx.anim.playSpeed);
-
-    			insert_dev(target, t28, anchor);
-    			insert_dev(target, div6, anchor);
-
-    			for (let i = 0; i < each_blocks.length; i += 1) {
-    				each_blocks[i].m(div6, null);
-    			}
-
-    			append_dev(div6, t29);
-    			append_dev(div6, div5);
-    			insert_dev(target, t30, anchor);
-    			insert_dev(target, div8, anchor);
-    			append_dev(div8, div7);
-    			append_dev(div7, label1);
-    			append_dev(label1, t31);
-    			if (if_block0) if_block0.m(label1, null);
-    			append_dev(div7, t32);
-    			append_dev(div7, label2);
-    			append_dev(label2, t33);
-    			if (if_block1) if_block1.m(label2, null);
-    		},
-
-    		p: function update(changed, ctx) {
-    			if (!input_updating && changed.anim) set_input_value(input, ctx.anim.animFrame);
-    			input_updating = false;
-
-    			if ((changed.anim) && input_max_value !== (input_max_value = ctx.anim.duration - 1)) {
-    				attr_dev(input, "max", input_max_value);
-    			}
-
-    			if ((changed.anim) && t2_value !== (t2_value = ctx.anim.animFrame + 1 + "")) {
-    				set_data_dev(t2, t2_value);
-    			}
-
-    			if (changed.anim) {
-    				set_style(label0, "width", "" + (ctx.anim.duration.toString().length * 10 + 10) + "px");
-    			}
-
-    			if ((changed.isCurrentFrameFocused) && label0_class_value !== (label0_class_value = "" + null_to_empty(((ctx.isCurrentFrameFocused) ? 'active' : '')) + " svelte-1v3rt8w")) {
-    				attr_dev(label0, "class", label0_class_value);
-    			}
-
-    			if ((changed.anim) && t4_value !== (t4_value = ctx.anim.duration + "")) {
-    				set_data_dev(t4, t4_value);
-    			}
-
-    			if ((changed.anim) && t8_value !== (t8_value = ctx.anim.windowIndex + 1 + "")) {
-    				set_data_dev(t8, t8_value);
-    			}
-
-    			if ((changed.windows) && t10_value !== (t10_value = ctx.windows.length + "")) {
-    				set_data_dev(t10, t10_value);
-    			}
-
-    			if ((changed.windows) && button1_disabled_value !== (button1_disabled_value = ctx.windows.length <= 1)) {
-    				prop_dev(button1, "disabled", button1_disabled_value);
-    			}
-
-    			if ((changed.anim) && button3_disabled_value !== (button3_disabled_value = ctx.anim.animFrame === 0)) {
-    				prop_dev(button3, "disabled", button3_disabled_value);
-    			}
-
-    			if ((changed.anim) && t20_value !== (t20_value = ctx.anim.playing ? 'pause' : 'play_arrow' + "")) {
-    				set_data_dev(t20, t20_value);
-    			}
-
-    			if ((changed.anim) && button5_disabled_value !== (button5_disabled_value = ctx.anim.animFrame === ctx.anim.duration - 1)) {
-    				prop_dev(button5, "disabled", button5_disabled_value);
-    			}
-
-    			if (changed.anim) select_option(select, ctx.anim.playSpeed);
-
-    			if (changed.windows || changed.anim) {
-    				each_value = ctx.windows;
-
-    				let i;
-    				for (i = 0; i < each_value.length; i += 1) {
-    					const child_ctx = get_each_context$1(ctx, each_value, i);
-
-    					if (each_blocks[i]) {
-    						each_blocks[i].p(changed, child_ctx);
-    					} else {
-    						each_blocks[i] = create_each_block$1(child_ctx);
-    						each_blocks[i].c();
-    						each_blocks[i].m(div6, t29);
-    					}
-    				}
-
-    				for (; i < each_blocks.length; i += 1) {
-    					each_blocks[i].d(1);
-    				}
-    				each_blocks.length = each_value.length;
-    			}
-
-    			if (changed.anim) {
-    				set_style(div5, "margin-left", "" + ((ctx.anim.duration != 0) ? ctx.anim.animFrame * 100 / ctx.anim.duration : 0) + "%");
-    			}
-
-    			if (current_block_type === (current_block_type = select_block_type(changed, ctx)) && if_block0) {
-    				if_block0.p(changed, ctx);
-    			} else {
-    				if (if_block0) if_block0.d(1);
-    				if_block0 = current_block_type && current_block_type(ctx);
-    				if (if_block0) {
-    					if_block0.c();
-    					if_block0.m(label1, null);
-    				}
-    			}
-
-    			if (current_block_type_1 === (current_block_type_1 = select_block_type_1(changed, ctx)) && if_block1) {
-    				if_block1.p(changed, ctx);
-    			} else {
-    				if (if_block1) if_block1.d(1);
-    				if_block1 = current_block_type_1 && current_block_type_1(ctx);
-    				if (if_block1) {
-    					if_block1.c();
-    					if_block1.m(label2, null);
-    				}
-    			}
-    		},
-
-    		i: noop,
-    		o: noop,
-
-    		d: function destroy(detaching) {
-    			if (detaching) {
-    				detach_dev(div4);
-    			}
-
-    			ctx.label0_binding(null);
-
-    			if (detaching) {
-    				detach_dev(t28);
-    				detach_dev(div6);
-    			}
-
-    			destroy_each(each_blocks, detaching);
-
-    			if (detaching) {
-    				detach_dev(t30);
-    				detach_dev(div8);
-    			}
-
-    			if (if_block0) if_block0.d();
-    			if (if_block1) if_block1.d();
-    			run_all(dispose);
-    		}
-    	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment$1.name, type: "component", source: "", ctx });
-    	return block;
-    }
-
-    function instance$1($$self, $$props, $$invalidate) {
-    	let { anim, windows, hitboxes, skipAhead, skipBack, editingMode, winProps } = $$props;
-
-        let currentFrameLabel;
-    	let isCurrentFrameFocused = false;
-
-        const startPlaying = () => {
-    		$$invalidate('anim', anim.playing = !anim.playing, anim);
-    		if (anim.playing) play();
-    	};
-    	const play = () => {
-    		if (anim.playing) {
-    			setTimeout(() => { 
-    				if (anim.animFrame + 1 === anim.duration) { 
-    					$$invalidate('anim', anim.animFrame = 0, anim);
-    					if (!anim.loop) { $$invalidate('anim', anim.playing = false, anim); }
-    				}
-    				else { $$invalidate('anim', anim.animFrame += 1, anim); }
-    				requestAnimationFrame(play);
-    			}, 1000 / 60 * (1 / anim.playSpeed));
-    		}
-    	};
-
-    	const handleWindowAddition = () => {
-    		windows.splice(anim.windowIndex, 0, {meta: {}, data: JSON.parse(JSON.stringify({...winProps}))} );
-    		$$invalidate('anim', anim);
-    	};
-    	const handleWindowDeletion = () => {
-    		windows.splice(anim.windowIndex, 1);
-    		$$invalidate('anim', anim.animFrame = anim.windowPositions[anim.windowIndex - 1] || 0, anim);
-    	};
-
-    	const writable_props = ['anim', 'windows', 'hitboxes', 'skipAhead', 'skipBack', 'editingMode', 'winProps'];
-    	Object.keys($$props).forEach(key => {
-    		if (!writable_props.includes(key) && !key.startsWith('$$')) console.warn(`<Timeline> was created with unknown prop '${key}'`);
-    	});
-
-    	function input_input_handler() {
-    		anim.animFrame = to_number(this.value);
-    		$$invalidate('anim', anim);
-    	}
-
-    	const focus_handler = (evt) => {$$invalidate('isCurrentFrameFocused', isCurrentFrameFocused = true); evt.target.select();};
-
-    	const blur_handler = () => $$invalidate('isCurrentFrameFocused', isCurrentFrameFocused = false);
-
-    	function label0_binding($$value) {
-    		binding_callbacks[$$value ? 'unshift' : 'push'](() => {
-    			$$invalidate('currentFrameLabel', currentFrameLabel = $$value);
-    		});
-    	}
-
-    	const click_handler = () => {$$invalidate('anim', anim.loop = !anim.loop, anim);};
-
-    	function select_change_handler() {
-    		anim.playSpeed = select_value(this);
-    		$$invalidate('anim', anim);
-    	}
-
-    	const click_handler_1 = ({ i }) => {$$invalidate('anim', anim.animFrame = anim.windowPositions[i], anim); $$invalidate('editingMode', editingMode = "window");};
-
-    	function input_input_handler_1() {
-    		windows[anim.windowIndex].meta.name = this.value;
-    		$$invalidate('windows', windows);
-    		$$invalidate('anim', anim);
-    	}
-
-    	function input_input_handler_2() {
-    		hitboxes[hitboxes.selected].meta.name = this.value;
-    		$$invalidate('hitboxes', hitboxes);
-    	}
-
-    	function input_input_handler_3() {
-    		windows[anim.windowIndex].meta.color = this.value;
-    		$$invalidate('windows', windows);
-    		$$invalidate('anim', anim);
-    	}
-
-    	function input_input_handler_4() {
-    		hitboxes[hitboxes.selected].meta.color = this.value;
-    		$$invalidate('hitboxes', hitboxes);
-    	}
-
-    	$$self.$set = $$props => {
-    		if ('anim' in $$props) $$invalidate('anim', anim = $$props.anim);
-    		if ('windows' in $$props) $$invalidate('windows', windows = $$props.windows);
-    		if ('hitboxes' in $$props) $$invalidate('hitboxes', hitboxes = $$props.hitboxes);
-    		if ('skipAhead' in $$props) $$invalidate('skipAhead', skipAhead = $$props.skipAhead);
-    		if ('skipBack' in $$props) $$invalidate('skipBack', skipBack = $$props.skipBack);
-    		if ('editingMode' in $$props) $$invalidate('editingMode', editingMode = $$props.editingMode);
-    		if ('winProps' in $$props) $$invalidate('winProps', winProps = $$props.winProps);
-    	};
-
-    	$$self.$capture_state = () => {
-    		return { anim, windows, hitboxes, skipAhead, skipBack, editingMode, winProps, currentFrameLabel, isCurrentFrameFocused };
-    	};
-
-    	$$self.$inject_state = $$props => {
-    		if ('anim' in $$props) $$invalidate('anim', anim = $$props.anim);
-    		if ('windows' in $$props) $$invalidate('windows', windows = $$props.windows);
-    		if ('hitboxes' in $$props) $$invalidate('hitboxes', hitboxes = $$props.hitboxes);
-    		if ('skipAhead' in $$props) $$invalidate('skipAhead', skipAhead = $$props.skipAhead);
-    		if ('skipBack' in $$props) $$invalidate('skipBack', skipBack = $$props.skipBack);
-    		if ('editingMode' in $$props) $$invalidate('editingMode', editingMode = $$props.editingMode);
-    		if ('winProps' in $$props) $$invalidate('winProps', winProps = $$props.winProps);
-    		if ('currentFrameLabel' in $$props) $$invalidate('currentFrameLabel', currentFrameLabel = $$props.currentFrameLabel);
-    		if ('isCurrentFrameFocused' in $$props) $$invalidate('isCurrentFrameFocused', isCurrentFrameFocused = $$props.isCurrentFrameFocused);
-    	};
-
-    	return {
-    		anim,
-    		windows,
-    		hitboxes,
-    		skipAhead,
-    		skipBack,
-    		editingMode,
-    		winProps,
-    		currentFrameLabel,
-    		isCurrentFrameFocused,
-    		startPlaying,
-    		handleWindowAddition,
-    		handleWindowDeletion,
-    		input_input_handler,
-    		focus_handler,
-    		blur_handler,
-    		label0_binding,
-    		click_handler,
-    		select_change_handler,
-    		click_handler_1,
-    		input_input_handler_1,
-    		input_input_handler_2,
-    		input_input_handler_3,
-    		input_input_handler_4
-    	};
-    }
-
-    class Timeline extends SvelteComponentDev {
-    	constructor(options) {
-    		super(options);
-    		init(this, options, instance$1, create_fragment$1, safe_not_equal, ["anim", "windows", "hitboxes", "skipAhead", "skipBack", "editingMode", "winProps"]);
-    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "Timeline", options, id: create_fragment$1.name });
-
-    		const { ctx } = this.$$;
-    		const props = options.props || {};
-    		if (ctx.anim === undefined && !('anim' in props)) {
-    			console.warn("<Timeline> was created without expected prop 'anim'");
-    		}
-    		if (ctx.windows === undefined && !('windows' in props)) {
-    			console.warn("<Timeline> was created without expected prop 'windows'");
-    		}
-    		if (ctx.hitboxes === undefined && !('hitboxes' in props)) {
-    			console.warn("<Timeline> was created without expected prop 'hitboxes'");
-    		}
-    		if (ctx.skipAhead === undefined && !('skipAhead' in props)) {
-    			console.warn("<Timeline> was created without expected prop 'skipAhead'");
-    		}
-    		if (ctx.skipBack === undefined && !('skipBack' in props)) {
-    			console.warn("<Timeline> was created without expected prop 'skipBack'");
-    		}
-    		if (ctx.editingMode === undefined && !('editingMode' in props)) {
-    			console.warn("<Timeline> was created without expected prop 'editingMode'");
-    		}
-    		if (ctx.winProps === undefined && !('winProps' in props)) {
-    			console.warn("<Timeline> was created without expected prop 'winProps'");
-    		}
-    	}
-
-    	get anim() {
-    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	set anim(value) {
-    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	get windows() {
-    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	set windows(value) {
-    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	get hitboxes() {
-    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	set hitboxes(value) {
-    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	get skipAhead() {
-    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	set skipAhead(value) {
-    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	get skipBack() {
-    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	set skipBack(value) {
-    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	get editingMode() {
-    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	set editingMode(value) {
-    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	get winProps() {
-    		throw new Error("<Timeline>: Props cannot be read directly from the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-
-    	set winProps(value) {
-    		throw new Error("<Timeline>: Props cannot be set directly on the component instance unless compiling with 'accessors: true' or '<svelte:options accessors/>'");
-    	}
-    }
+    var sfx = ["mfx_back", "mfx_change_color", "mfx_chat_received", "mfx_coin", "mfx_coin_portal", "mfx_confirm", "mfx_flashy_shing", "mfx_forward", "mfx_hover", "mfx_hp", "mfx_hp_spawn", "mfx_input_back", "mfx_input_end", "mfx_input_key", "mfx_levelup", "mfx_logo_shing", "mfx_map_open", "mfx_map_zoom", "mfx_mm_coin", "mfx_mm_coin_all", "mfx_mm_coin_win", "mfx_move_cursor", "mfx_notice", "mfx_option", "mfx_orby_talk", "mfx_orby_talk_done", "mfx_place_marker", "mfx_player_found", "mfx_player_ready", "mfx_result_expand", "mfx_return_cursor", "mfx_ring_bell", "mfx_ring_bell2", "mfx_star", "mfx_timertick", "mfx_timertick2", "mfx_timertick_holy", "mfx_timertick_holy2", "mfx_title_loop", "mfx_title_start", "mfx_title_zoom", "mfx_title_zoom_fast", "mfx_tut_fail", "mfx_unstar", "mfx_wave_complete", "mfx_xp", "playerdefeated_sfx", "plop_sfx", "pullbomb_sfx", "punch_sfx", "select_sfx", "sfx_321", "sfx_absa_8b", "sfx_absa_boltcloud", "sfx_absa_champ_loop", "sfx_absa_cloud_crackle", "sfx_absa_cloud_place", "sfx_absa_cloud_placepop", "sfx_absa_cloud_pop", "sfx_absa_cloud_send", "sfx_absa_concentrate", "sfx_absa_current_pop", "sfx_absa_dashdown", "sfx_absa_dashup", "sfx_absa_dattack", "sfx_absa_gp", "sfx_absa_harderhit", "sfx_absa_jab1", "sfx_absa_jab2", "sfx_absa_jabloop", "sfx_absa_jump", "sfx_absa_kickhit", "sfx_absa_new_whip1", "sfx_absa_new_whip2", "sfx_absa_orb_hit", "sfx_absa_orb_miss", "sfx_absa_orb_missrelease", "sfx_absa_singlezap1", "sfx_absa_singlezap2", "sfx_absa_taunt", "sfx_absa_uair", "sfx_absa_whip", "sfx_absa_whip2", "sfx_absa_whip3", "sfx_absa_whip_charge", "sfx_abyss_bomb_spawn", "sfx_abyss_capture_end", "sfx_abyss_capturing", "sfx_abyss_despawn", "sfx_abyss_explosion", "sfx_abyss_explosion_big", "sfx_abyss_explosion_start", "sfx_abyss_hazard_burst", "sfx_abyss_hazard_hit", "sfx_abyss_hazard_start", "sfx_abyss_hex_curse", "sfx_abyss_hex_hit", "sfx_abyss_portal_intro", "sfx_abyss_portal_spawn", "sfx_abyss_rumble", "sfx_abyss_seed_explode", "sfx_abyss_seed_fall", "sfx_abyss_seed_land", "sfx_abyss_spawn", "sfx_bigplant_clamp", "sfx_bigplant_eat", "sfx_bigplant_lunge", "sfx_birdclap", "sfx_birdflap", "sfx_bird_downspecial", "sfx_bird_downspecial_end", "sfx_bird_nspecial", "sfx_bird_nspecial2", "sfx_bird_screech", "sfx_bird_sidespecial", "sfx_bird_sidespecial_start", "sfx_bird_upspecial", "sfx_bite", "sfx_blink_dash", "sfx_blow_double1", "sfx_blow_double2", "sfx_blow_heavy1", "sfx_blow_heavy2", "sfx_blow_medium1", "sfx_blow_medium2", "sfx_blow_medium3", "sfx_blow_weak1", "sfx_blow_weak2", "sfx_boss_explosion", "sfx_boss_final_cannon", "sfx_boss_final_charge", "sfx_boss_fireball", "sfx_boss_fireball_big", "sfx_boss_fireball_land", "sfx_boss_laser", "sfx_boss_laser_hit", "sfx_boss_shine", "sfx_boss_vortex", "sfx_boss_vortex_end", "sfx_boss_vortex_start", "sfx_bubblemouth", "sfx_bubblepop", "sfx_bubblespray", "sfx_bubblespray_breathless", "sfx_burnapplied", "sfx_burnconsume", "sfx_burnend", "sfx_buzzsaw_hit", "sfx_buzzsaw_throw", "sfx_charge_blade_ready", "sfx_charge_blade_swing", "sfx_chester_appear", "sfx_chester_jump", "sfx_chest_open", "sfx_chest_rummage", "sfx_clairen_dspecial_counter_active", "sfx_clairen_dspecial_counter_success", "sfx_clairen_fspecial_dash", "sfx_clairen_fspecial_slash", "sfx_clairen_hair", "sfx_clairen_hit_med", "sfx_clairen_hit_strong", "sfx_clairen_hit_weak", "sfx_clairen_nspecial_grab_miss", "sfx_clairen_nspecial_grab_success", "sfx_clairen_poke_med", "sfx_clairen_poke_strong", "sfx_clairen_poke_weak", "sfx_clairen_spin", "sfx_clairen_swing_med", "sfx_clairen_swing_mega_delayed", "sfx_clairen_swing_mega_instant", "sfx_clairen_swing_strong", "sfx_clairen_swing_weak", "sfx_clairen_sword_activate", "sfx_clairen_sword_deactivate", "sfx_clairen_tip_assist", "sfx_clairen_tip_loop", "sfx_clairen_tip_med", "sfx_clairen_tip_strong", "sfx_clairen_tip_weak", "sfx_clairen_uspecial_rise", "sfx_clairen_uspecial_swing", "sfx_coin_capture", "sfx_coin_collect", "sfx_crunch", "sfx_crunch_water", "sfx_dash_start", "sfx_death1", "sfx_death2", "sfx_diamond_collect", "sfx_diamond_small_collect", "sfx_dizzy", "sfx_dust_knuckle", "sfx_ell_arc_small_missile_ground", "sfx_ell_arc_taunt_collect", "sfx_ell_arc_taunt_collide", "sfx_ell_arc_taunt_end", "sfx_ell_arc_taunt_start", "sfx_ell_big_missile_fire", "sfx_ell_big_missile_ground", "sfx_ell_cooldown", "sfx_ell_drill_loop", "sfx_ell_drill_stab", "sfx_ell_dspecial_drop", "sfx_ell_dspecial_explosion_1", "sfx_ell_dspecial_explosion_2", "sfx_ell_dspecial_explosion_3", "sfx_ell_dspecial_hit", "sfx_ell_dspecial_stick", "sfx_ell_dtilt1", "sfx_ell_dtilt2", "sfx_ell_eject", "sfx_ell_explosion_medium", "sfx_ell_fist_explode", "sfx_ell_fist_fire", "sfx_ell_fspecial_charge", "sfx_ell_hover", "sfx_ell_missile_loop", "sfx_ell_nair", "sfx_ell_overheat", "sfx_ell_propeller_loop_heavy", "sfx_ell_propeller_loop_light", "sfx_ell_propeller_loop_med", "sfx_ell_small_missile_fire", "sfx_ell_small_missile_ground", "sfx_ell_steam_hit", "sfx_ell_steam_release", "sfx_ell_strong_attack_explosion", "sfx_ell_uspecial_explode", "sfx_ell_uspecial_rebuild", "sfx_ell_utilt_cannon", "sfx_ell_utilt_fire", "sfx_ell_utilt_hit", "sfx_ell_utilt_loop", "sfx_ell_utilt_retract", "sfx_fishing_rod_cast", "sfx_fishing_rod_catch", "sfx_fishing_rod_land", "sfx_fishing_rod_reel", "sfx_fish_collect", "sfx_flareo_rod", "sfx_flare_razer", "sfx_forsburn_breath", "sfx_forsburn_cape_hit", "sfx_forsburn_cape_multihit", "sfx_forsburn_cape_swipe", "sfx_forsburn_combust", "sfx_forsburn_consume", "sfx_forsburn_consume_fail", "sfx_forsburn_consume_full", "sfx_forsburn_disappear", "sfx_forsburn_reappear", "sfx_forsburn_reappear_hit", "sfx_forsburn_spew2", "sfx_forsburn_spew_end", "sfx_forsburn_spew_smoke", "sfx_forsburn_split", "sfx_frog_croak", "sfx_frog_dspecial_cast", "sfx_frog_dspecial_hit", "sfx_frog_dspecial_hit_ground", "sfx_frog_dspecial_spit", "sfx_frog_dspecial_swallow", "sfx_frog_dstrong", "sfx_frog_fspecial_cancel", "sfx_frog_fspecial_charge_full", "sfx_frog_fspecial_charge_gained_1", "sfx_frog_fspecial_charge_gained_2", "sfx_frog_fspecial_charge_loop", "sfx_frog_fspecial_fire", "sfx_frog_fspecial_start", "sfx_frog_fstrong", "sfx_frog_gong_hit", "sfx_frog_jab", "sfx_frog_nspecial_cast", "sfx_frog_nspecial_shove", "sfx_frog_uspecial_cast", "sfx_frog_uspecial_divekick", "sfx_frog_uspecial_spin", "sfx_frog_ustrong", "sfx_gem_collect", "sfx_ghost_glove", "sfx_go", "sfx_grass_creature", "sfx_gus_dirt", "sfx_gus_jump", "sfx_gus_land", "sfx_gus_propeller_dagger_wall", "sfx_holy_die", "sfx_holy_grass", "sfx_holy_lightning", "sfx_holy_tablet", "sfx_holy_tablet_appear", "sfx_holy_tablet_spawning", "sfx_holy_textbox", "sfx_icehit_heavy1", "sfx_icehit_heavy2", "sfx_icehit_medium1", "sfx_icehit_medium2", "sfx_icehit_weak1", "sfx_icehit_weak2", "sfx_ice_back_air", "sfx_ice_burst_up", "sfx_ice_chain", "sfx_ice_dspecial_form", "sfx_ice_dspecial_ground", "sfx_ice_end", "sfx_ice_fspecial_hit_ground", "sfx_ice_fspecial_roar", "sfx_ice_ftilt", "sfx_ice_hammerstart", "sfx_ice_nspecial_armor", "sfx_ice_nspecial_hit_ground", "sfx_ice_on_player", "sfx_ice_shatter", "sfx_ice_shatter_big", "sfx_ice_shieldup", "sfx_ice_sleep", "sfx_ice_uspecial_jump", "sfx_ice_uspecial_start", "sfx_ice_wake", "sfx_infinidagger", "sfx_jumpair", "sfx_jumpground", "sfx_kragg_rock_land", "sfx_kragg_rock_pillar", "sfx_kragg_rock_pull", "sfx_kragg_rock_shatter", "sfx_kragg_roll_end", "sfx_kragg_roll_land", "sfx_kragg_roll_loop", "sfx_kragg_roll_start", "sfx_kragg_roll_turn", "sfx_kragg_spike", "sfx_kragg_throw", "sfx_land", "sfx_land_heavy", "sfx_land_light", "sfx_land_med", "sfx_land_med2", "sfx_leafy_hit1", "sfx_leafy_hit2", "sfx_leafy_hit3", "sfx_leaves", "sfx_may_arc_coineat", "sfx_may_arc_cointoss", "sfx_may_arc_five", "sfx_may_arc_hit", "sfx_may_arc_plant", "sfx_may_arc_talk", "sfx_may_arc_talkstart", "sfx_may_root", "sfx_may_whip1", "sfx_may_whip2", "sfx_may_wrap1", "sfx_may_wrap2", "sfx_metal_hit_strong", "sfx_metal_hit_weak", "sfx_mobile_gear_deploy", "sfx_mobile_gear_jump", "sfx_mobile_gear_move", "sfx_mobile_gear_wall", "sfx_obstacle_hit", "sfx_old_orca_bite", "sfx_orcane_dsmash", "sfx_orcane_fspecial", "sfx_orcane_fspecial_pud", "sfx_orca_absorb", "sfx_orca_bite", "sfx_orca_crunch", "sfx_orca_roll", "sfx_orca_roll_snow", "sfx_orca_shake", "sfx_orca_shake_water", "sfx_orca_snow_evaporate", "sfx_orca_snow_mouth", "sfx_orca_soak", "sfx_ori_bash_hit", "sfx_ori_bash_launch", "sfx_ori_bash_projectile", "sfx_ori_bash_use", "sfx_ori_charged_flame_charge", "sfx_ori_charged_flame_charge2", "sfx_ori_charged_flame_hit", "sfx_ori_charged_flame_release", "sfx_ori_dash_attack_perform", "sfx_ori_dsmash_seinhits", "sfx_ori_dsmash_skitter_alone", "sfx_ori_dsmash_skitter_sein", "sfx_ori_dspecial_bash_miss", "sfx_ori_dtilt_perform", "sfx_ori_energyhit_heavy", "sfx_ori_energyhit_medium", "sfx_ori_energyhit_weak", "sfx_ori_energy_hit", "sfx_ori_glide_end", "sfx_ori_glide_featherout", "sfx_ori_glide_hit", "sfx_ori_glide_start", "sfx_ori_grenade_aim", "sfx_ori_grenade_hit", "sfx_ori_grenade_hit_ground", "sfx_ori_grenade_launch", "sfx_ori_seinhit_heavy", "sfx_ori_seinhit_medium", "sfx_ori_seinhit_weak", "sfx_ori_sein_fstrong", "sfx_ori_sein_fstrong_hit", "sfx_ori_sein_fstrong_hit_final", "sfx_ori_sein_strong_start", "sfx_ori_spirit_flame_1", "sfx_ori_spirit_flame_2", "sfx_ori_spirit_flame_hit_1", "sfx_ori_spirit_flame_hit_2", "sfx_ori_stomp_hit", "sfx_ori_stomp_hitplayer", "sfx_ori_stomp_spin", "sfx_ori_superjump_sein", "sfx_ori_taunt", "sfx_ori_taunt2", "sfx_ori_uptilt", "sfx_ori_uptilt_single", "sfx_ori_ustrong_charge", "sfx_ori_ustrong_launch", "sfx_owl0", "sfx_owl1", "sfx_owl2", "sfx_owl3", "sfx_owl4", "sfx_parry_success", "sfx_parry_use", "sfx_phase_locket", "sfx_pillar_crumble", "sfx_plant_eat", "sfx_plant_fat", "sfx_plant_ready", "sfx_plant_shoot", "sfx_plant_stepped", "sfx_plasma_field_loop", "sfx_playerdefeated", "sfx_poison_hit_med", "sfx_poison_hit_strong", "sfx_poison_hit_weak", "sfx_propeller_dagger_draw", "sfx_propeller_dagger_loop", "sfx_propeller_dagger_release", "sfx_quick_dodge", "sfx_rag_axe_hitsground", "sfx_rag_axe_swing", "sfx_rag_mark", "sfx_rag_plant_eat", "sfx_rag_plant_ready", "sfx_rag_plant_shoot", "sfx_rag_root", "sfx_rag_whip", "sfx_ring_crowd", "sfx_roll", "sfx_sand_screech", "sfx_sand_yell", "sfx_shop_buy", "sfx_shop_close", "sfx_shop_invalid", "sfx_shop_move", "sfx_shop_open", "sfx_shovel_brandish", "sfx_shovel_dig", "sfx_shovel_hit_heavy1", "sfx_shovel_hit_heavy2", "sfx_shovel_hit_light1", "sfx_shovel_hit_light2", "sfx_shovel_hit_light3", "sfx_shovel_hit_med1", "sfx_shovel_hit_med2", "sfx_shovel_knight_die", "sfx_shovel_knight_fanfare", "sfx_shovel_swing_heavy1", "sfx_shovel_swing_heavy2", "sfx_shovel_swing_light1", "sfx_shovel_swing_light2", "sfx_shovel_swing_med1", "sfx_shovel_swing_med2", "sfx_spin", "sfx_spin_longer", "sfx_springgo", "sfx_springswitch", "sfx_stage_pillar", "sfx_swipe_heavy1", "sfx_swipe_heavy2", "sfx_swipe_medium1", "sfx_swipe_medium2", "sfx_swipe_weak1", "sfx_swipe_weak2", "sfx_swish_heavy", "sfx_swish_heavy2", "sfx_swish_medium", "sfx_swish_weak", "sfx_syl_dspecial_growth", "sfx_syl_dspecial_howl", "sfx_syl_dspecial_howlgrowth", "sfx_syl_dspecial_plantaway", "sfx_syl_dstrong", "sfx_syl_fspecial_bite", "sfx_syl_fstrong", "sfx_syl_fstrong_final", "sfx_syl_nspecial", "sfx_syl_nspecial_flowerhit", "sfx_syl_nspecial_plantgrowth", "sfx_syl_promo1", "sfx_syl_uspecial_travel_loop", "sfx_syl_uspecial_travel_start", "sfx_syl_ustrong", "sfx_syl_ustrong_part1", "sfx_syl_ustrong_part2", "sfx_syl_ustrong_part3", "sfx_tow_anchor_land", "sfx_tow_anchor_start", "sfx_troupple_fin_flap", "sfx_troupple_fish_splash_in", "sfx_troupple_fish_splash_out", "sfx_troupple_rumble", "sfx_troupple_splash_big", "sfx_troupple_swipe", "sfx_upbcharge", "sfx_upbmove", "sfx_war_horn", "sfx_watergun_fire", "sfx_watergun_splash", "sfx_waterhit_heavy", "sfx_waterhit_heavy2", "sfx_waterhit_medium", "sfx_waterhit_weak", "sfx_waterwarp", "sfx_waterwarp_start", "sfx_waveland_abs", "sfx_waveland_cla", "sfx_waveland_ell", "sfx_waveland_eta", "sfx_waveland_fors", "sfx_waveland_gus", "sfx_waveland_kra", "sfx_waveland_may", "sfx_waveland_orc", "sfx_waveland_ori", "sfx_waveland_ran", "sfx_waveland_syl", "sfx_waveland_wra", "sfx_waveland_zet", "sfx_zap", "sfx_zetter_downb", "sfx_zetter_fireball_fire", "sfx_zetter_shine", "sfx_zetter_shine_charged", "sfx_zetter_shine_taunt", "sfx_zetter_upb_hit"];
 
     var winProps = {
         AG_WINDOW_TYPE: {
@@ -2595,7 +18351,8 @@ var app = (function () {
         AG_WINDOW_SFX: {
             value: null,
             description: 'The index of the sound effect. Only applies if AG_WINDOW_HAS_SFX is 1',
-            type: 'number',
+            type: `sound`,
+            options: JSON.stringify(sfx),
             dependencies: ["obj.AG_WINDOW_HAS_SFX.value == 1"]
         },
         AG_WINDOW_SFX_FRAME: {
@@ -2804,7 +18561,8 @@ var app = (function () {
             description: stripIndent`
         The index of the sound effect to play when the attack hits
         `,
-            type: 'number',
+            options: JSON.stringify(sfx),
+            type: `sound {${JSON.stringify(sfx)}}`,
         },
         HG_ANGLE_FLIPPER: {
             value: 0,
@@ -3207,9 +18965,97 @@ var app = (function () {
         } 
     };
 
+    var charProps = {
+        ground_friction: {
+            value: 1.00,
+            description: `how fast the character's horizontal speed decreases on the ground`,
+            type: 'number'
+        },
+        air_friction: {
+            value: 0.07,
+            description: `how fast the character's horizontal speed decreases in midair`,
+            type: 'number'
+        },
+        gravity_speed: {
+            value: 0.50,
+            description: 'how fast the character falls naturally',
+            type: 'number'
+        },
+        sprite_offset_x: {
+            value: 0,
+            description: 'sprite offset X location',
+            type: 'number'
+        },
+        sprite_offset_y: {
+            value: 0,
+            description: 'sprite offset Y location',
+            type: 'number'
+        },
+        position_locked: {
+            value: false,
+            description: `whether or not the character's offset will move in the editor`,
+            type: [true, false]
+        }
+    };
+
     const velocityAtFrameGrav = (baseAccel, baseVelocity, frame) => {
         return baseAccel * frame + baseVelocity;
       };
+
+    const strip = (toStrip, clone = true) => {
+        const stripped = (clone) ? JSON.parse(JSON.stringify(toStrip)) : toStrip;
+
+        if (Array.isArray(stripped)) {
+            for (const entry of stripped) {
+                strip(entry, false);
+            }
+        } else if (stripped.data) {
+            for (const [key, val] of Object.entries(stripped.data)) {
+                stripped.data[key] = val.value;
+            }
+        } else {
+            for (const [key, val] of Object.entries(stripped)) {
+                stripped[key] = val.value;
+            }
+        }
+        
+        return stripped;
+    };
+
+    const populate = (stripped, fields, clone = true) => {
+        const populated = (clone) ? JSON.parse(JSON.stringify(stripped)) : stripped;
+
+        if (Array.isArray(populated)) {
+            for (const entry of populated) {
+                populate(entry, fields, false);
+            }
+        } else if (populated.data) {
+            for (const [key, val] of Object.entries(populated.data)) {
+                if (!Object.keys(fields).includes(key)) {
+                    delete populated.data[key];
+                    continue;
+                }
+                populated.data[key] = {
+                    ...fields[key],
+                    value: val
+                };
+            }
+        } else {
+            for (const [key, val] of Object.entries(populated)) {
+                if (!Object.keys(fields).includes(key)) {
+                    delete populated[key];
+                    continue;
+                }
+                populated[key] = {
+                    ...fields[key],
+                    value: val
+                };
+            }
+        }
+
+        
+        return populated;
+    };
 
     const setAtkValTemplate = `set_attack_value(__ATKNAME__, __AGINDEX__, __VALUE__);`;
     const setAtkValSpriteTemplate = `set_attack_value(__ATKNAME__, __AGINDEX__, sprite_get("__VALUE__"));`;
@@ -3255,7 +19101,7 @@ var app = (function () {
         36: "AT_TAUNT_2",
         37: "AT_EXTRA_2",
         38: "AT_EXTRA_3",
-        41: "A,T_NSPECIAL_AIR"
+        41: "AT_NSPECIAL_AIR"
     };
 
     var exporter = (charData, atkData, windows, hitboxes) => {
@@ -3264,7 +19110,7 @@ var app = (function () {
         let out_ATK = "";
 
         let ATK_NAME;
-        if (Object.keys(ATK_INDEXES).includes(parseInt(atkData.ATK_INDEX.value))) ATK_NAME = ATK_INDEXES[parseInt(atkData.ATK_INDEX.value)];
+        if (Object.keys(ATK_INDEXES).includes(atkData.ATK_INDEX.value.toString())) ATK_NAME = ATK_INDEXES[parseInt(atkData.ATK_INDEX.value.toString())];
         else ATK_NAME = atkData.ATK_INDEX.value;
 
         for (const [key, entry] of Object.entries(charData)) {        
@@ -3284,7 +19130,7 @@ var app = (function () {
             + '\n';
 
         for (const [key, entry] of Object.entries(atkData)) {    
-            if (entry.value === 0) continue;    
+            if ([null, undefined, '...', '--REPLACE_ME--', 0].includes(entry.value)) continue;
             switch (key) {
                 case 'ATK_INDEX': 
                     continue;
@@ -3315,7 +19161,7 @@ var app = (function () {
                     .replace("__ATKNAME__", ATK_NAME)
                     .replace("__WINDOWNUM__", i + 1)
                     .replace("__AGINDEX__", key)
-                    .replace("__VALUE__", entry.value)
+                    .replace("__VALUE__", (key === 'AG_WINDOW_SFX') ? `asset_get("${entry.value}")` : entry.value)
                     + '\n';
             }
             out_ATK += '\n';
@@ -3362,8 +19208,9 @@ var app = (function () {
     };
 
     /* src\App.svelte generated by Svelte v3.12.1 */
+    const { window: window_1 } = globals;
 
-    const file$2 = "src\\App.svelte";
+    const file$3 = "src\\App.svelte";
 
     function get_each_context$2(ctx, list, i) {
     	const child_ctx = Object.create(ctx);
@@ -3379,19 +19226,19 @@ var app = (function () {
     	return child_ctx;
     }
 
-    function get_each_context_2(ctx, list, i) {
+    function get_each_context_2$1(ctx, list, i) {
     	const child_ctx = Object.create(ctx);
     	child_ctx._ = list[i];
     	child_ctx.i = i;
     	return child_ctx;
     }
 
-    // (625:3) {#each new Array(spritesheetSrc.framecount).fill(0) as _, i}
-    function create_each_block_2(ctx) {
+    // (679:3) {#each new Array(spritesheetSrc.framecount).fill(0) as _, i}
+    function create_each_block_2$1(ctx) {
     	var div, dispose;
 
-    	function click_handler_7() {
-    		return ctx.click_handler_7(ctx);
+    	function click_handler_6() {
+    		return ctx.click_handler_6(ctx);
     	}
 
     	const block = {
@@ -3406,8 +19253,8 @@ var app = (function () {
     			set_style(div, "box-shadow", ((ctx.anim.spriteFrame % ctx.spritesheetSrc.framecount == ctx.i) ? 'inset 0 0 5px black' : 'none'));
     			set_style(div, "border-right", "2px solid black");
     			set_style(div, "display", "inline-block");
-    			add_location(div, file$2, 625, 4, 16675);
-    			dispose = listen_dev(div, "click", click_handler_7);
+    			add_location(div, file$3, 679, 4, 18499);
+    			dispose = listen_dev(div, "click", click_handler_6);
     		},
 
     		m: function mount(target, anchor) {
@@ -3445,11 +19292,11 @@ var app = (function () {
     			dispose();
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_2.name, type: "each", source: "(625:3) {#each new Array(spritesheetSrc.framecount).fill(0) as _, i}", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_2$1.name, type: "each", source: "(679:3) {#each new Array(spritesheetSrc.framecount).fill(0) as _, i}", ctx });
     	return block;
     }
 
-    // (831:4) {:else}
+    // (872:4) {:else}
     function create_else_block_2(ctx) {
     	var each_1_anchor;
 
@@ -3510,13 +19357,13 @@ var app = (function () {
     			}
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_else_block_2.name, type: "else", source: "(831:4) {:else}", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_else_block_2.name, type: "else", source: "(872:4) {:else}", ctx });
     	return block;
     }
 
-    // (795:4) {#if mainViewInfo}
+    // (831:4) {#if mainViewInfo}
     function create_if_block_13(ctx) {
-    	var div0, t0, select, option0, option1, option2, option3, option4, option5, t7, div1, t8, input0, input0_updating = false, t9, div2, t10, input1, input1_updating = false, t11, div3, label0, t12, input2, t13, span0, t14, label1, t15, input3, t16, span1, t17, div4, t18, t19_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].xvel + "", t19, br0, t20, t21_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].yvel + "", t21, br1, t22, t23_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].xpos + "", t23, br2, t24, t25_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].ypos + "", t25, br3, dispose;
+    	var div0, t0, select, option0, option1, option2, option3, option4, option5, t7, div1, t8, input0, input0_updating = false, t9, div2, t10, input1, input1_updating = false, t11, div3, label0, t12, input2, t13, span0, t14, label1, t15, input3, t16, span1, t17, label2, t18, input4, t19, span2, t20, div4, t21, t22_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].xvel + "", t22, br0, t23, t24_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].yvel + "", t24, br1, t25, t26_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].xpos + "", t26, br2, t27, t28_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].ypos + "", t28, br3, dispose;
 
     	function input0_input_handler() {
     		input0_updating = true;
@@ -3567,89 +19414,102 @@ var app = (function () {
     			t16 = space();
     			span1 = element("span");
     			t17 = space();
+    			label2 = element("label");
+    			t18 = text("play sounds: \n\t\t\t\t\t\t\t");
+    			input4 = element("input");
+    			t19 = space();
+    			span2 = element("span");
+    			t20 = space();
     			div4 = element("div");
-    			t18 = text("xvel: ");
-    			t19 = text(t19_value);
+    			t21 = text("xvel: ");
+    			t22 = text(t22_value);
     			br0 = element("br");
-    			t20 = text("\n\t\t\t\t\t\tyvel: ");
-    			t21 = text(t21_value);
+    			t23 = text("\n\t\t\t\t\t\tyvel: ");
+    			t24 = text(t24_value);
     			br1 = element("br");
-    			t22 = text("\n\t\t\t\t\t\txpos: ");
-    			t23 = text(t23_value);
+    			t25 = text("\n\t\t\t\t\t\txpos: ");
+    			t26 = text(t26_value);
     			br2 = element("br");
-    			t24 = text("\n\t\t\t\t\t\typos: ");
-    			t25 = text(t25_value);
+    			t27 = text("\n\t\t\t\t\t\typos: ");
+    			t28 = text(t28_value);
     			br3 = element("br");
     			option0.__value = "0.25";
     			option0.value = option0.__value;
-    			add_location(option0, file$2, 798, 7, 23396);
+    			add_location(option0, file$3, 834, 7, 25037);
     			option1.__value = "0.5";
     			option1.value = option1.__value;
-    			add_location(option1, file$2, 799, 7, 23438);
+    			add_location(option1, file$3, 835, 7, 25079);
     			option2.__value = "1";
     			option2.value = option2.__value;
     			option2.selected = true;
-    			add_location(option2, file$2, 800, 7, 23479);
+    			add_location(option2, file$3, 836, 7, 25120);
     			option3.__value = "2";
     			option3.value = option3.__value;
-    			add_location(option3, file$2, 801, 7, 23525);
+    			add_location(option3, file$3, 837, 7, 25166);
     			option4.__value = "4";
     			option4.value = option4.__value;
-    			add_location(option4, file$2, 802, 7, 23563);
+    			add_location(option4, file$3, 838, 7, 25204);
     			option5.__value = "8";
     			option5.value = option5.__value;
-    			add_location(option5, file$2, 803, 7, 23601);
+    			add_location(option5, file$3, 839, 7, 25242);
     			if (ctx.anim.zoom === void 0) add_render_callback(() => ctx.select_change_handler.call(select));
-    			add_location(select, file$2, 797, 6, 23357);
+    			add_location(select, file$3, 833, 6, 24998);
     			attr_dev(div0, "class", "option-param svelte-17vzh85");
     			set_style(div0, "justify-self", "right");
     			set_style(div0, "display", "block");
-    			add_location(div0, file$2, 795, 5, 23267);
+    			add_location(div0, file$3, 831, 5, 24908);
     			attr_dev(input0, "type", "number");
     			attr_dev(input0, "min", "1");
     			attr_dev(input0, "max", "100");
-    			add_location(input0, file$2, 807, 14, 23751);
+    			add_location(input0, file$3, 843, 14, 25392);
     			attr_dev(div1, "class", "option-param svelte-17vzh85");
     			set_style(div1, "justify-self", "right");
     			set_style(div1, "display", "block");
-    			add_location(div1, file$2, 806, 5, 23665);
+    			add_location(div1, file$3, 842, 5, 25306);
     			attr_dev(input1, "type", "number");
     			attr_dev(input1, "min", "1");
     			attr_dev(input1, "max", "100");
-    			add_location(input1, file$2, 810, 14, 23937);
+    			add_location(input1, file$3, 846, 14, 25578);
     			attr_dev(div2, "class", "option-param svelte-17vzh85");
     			set_style(div2, "justify-self", "right");
     			set_style(div2, "display", "block");
-    			add_location(div2, file$2, 809, 5, 23851);
+    			add_location(div2, file$3, 845, 5, 25492);
     			attr_dev(input2, "type", "checkbox");
     			attr_dev(input2, "class", "svelte-17vzh85");
-    			add_location(input2, file$2, 815, 7, 24151);
+    			add_location(input2, file$3, 851, 7, 25792);
     			attr_dev(span0, "class", "checkmark svelte-17vzh85");
-    			add_location(span0, file$2, 816, 7, 24226);
-    			add_location(label0, file$2, 813, 6, 24115);
+    			add_location(span0, file$3, 852, 7, 25867);
+    			add_location(label0, file$3, 849, 6, 25756);
     			attr_dev(input3, "type", "checkbox");
     			attr_dev(input3, "class", "svelte-17vzh85");
-    			add_location(input3, file$2, 820, 7, 24315);
+    			add_location(input3, file$3, 856, 7, 25956);
     			attr_dev(span1, "class", "checkmark svelte-17vzh85");
-    			add_location(span1, file$2, 821, 7, 24377);
-    			add_location(label1, file$2, 818, 6, 24279);
+    			add_location(span1, file$3, 857, 7, 26018);
+    			add_location(label1, file$3, 854, 6, 25920);
+    			attr_dev(input4, "type", "checkbox");
+    			attr_dev(input4, "class", "svelte-17vzh85");
+    			add_location(input4, file$3, 861, 7, 26107);
+    			attr_dev(span2, "class", "checkmark svelte-17vzh85");
+    			add_location(span2, file$3, 862, 7, 26166);
+    			add_location(label2, file$3, 859, 6, 26071);
     			attr_dev(div3, "class", "option-param svelte-17vzh85");
     			set_style(div3, "justify-self", "right");
     			set_style(div3, "display", "block");
-    			add_location(div3, file$2, 812, 5, 24037);
-    			add_location(br0, file$2, 825, 81, 24542);
-    			add_location(br1, file$2, 826, 81, 24629);
-    			add_location(br2, file$2, 827, 81, 24716);
-    			add_location(br3, file$2, 828, 81, 24803);
+    			add_location(div3, file$3, 848, 5, 25678);
+    			add_location(br0, file$3, 866, 81, 26331);
+    			add_location(br1, file$3, 867, 81, 26418);
+    			add_location(br2, file$3, 868, 81, 26505);
+    			add_location(br3, file$3, 869, 81, 26592);
     			attr_dev(div4, "class", "stats svelte-17vzh85");
-    			add_location(div4, file$2, 824, 5, 24441);
+    			add_location(div4, file$3, 865, 5, 26230);
 
     			dispose = [
     				listen_dev(select, "change", ctx.select_change_handler),
     				listen_dev(input0, "input", input0_input_handler),
     				listen_dev(input1, "input", input1_input_handler_1),
     				listen_dev(input2, "change", ctx.input2_change_handler),
-    				listen_dev(input3, "change", ctx.input3_change_handler)
+    				listen_dev(input3, "change", ctx.input3_change_handler),
+    				listen_dev(input4, "change", ctx.input4_change_handler)
     			];
     		},
 
@@ -3699,19 +19559,28 @@ var app = (function () {
 
     			append_dev(label1, t16);
     			append_dev(label1, span1);
-    			insert_dev(target, t17, anchor);
+    			append_dev(div3, t17);
+    			append_dev(div3, label2);
+    			append_dev(label2, t18);
+    			append_dev(label2, input4);
+
+    			input4.checked = ctx.anim.audio;
+
+    			append_dev(label2, t19);
+    			append_dev(label2, span2);
+    			insert_dev(target, t20, anchor);
     			insert_dev(target, div4, anchor);
-    			append_dev(div4, t18);
-    			append_dev(div4, t19);
-    			append_dev(div4, br0);
-    			append_dev(div4, t20);
     			append_dev(div4, t21);
-    			append_dev(div4, br1);
     			append_dev(div4, t22);
+    			append_dev(div4, br0);
     			append_dev(div4, t23);
-    			append_dev(div4, br2);
     			append_dev(div4, t24);
+    			append_dev(div4, br1);
     			append_dev(div4, t25);
+    			append_dev(div4, t26);
+    			append_dev(div4, br2);
+    			append_dev(div4, t27);
+    			append_dev(div4, t28);
     			append_dev(div4, br3);
     		},
 
@@ -3723,21 +19592,22 @@ var app = (function () {
     			input1_updating = false;
     			if (changed.char) input2.checked = ctx.char.position_locked.value;
     			if (changed.anim) input3.checked = ctx.anim.movement;
+    			if (changed.anim) input4.checked = ctx.anim.audio;
 
-    			if ((changed.anim) && t19_value !== (t19_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].xvel + "")) {
-    				set_data_dev(t19, t19_value);
+    			if ((changed.anim) && t22_value !== (t22_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].xvel + "")) {
+    				set_data_dev(t22, t22_value);
     			}
 
-    			if ((changed.anim) && t21_value !== (t21_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].yvel + "")) {
-    				set_data_dev(t21, t21_value);
+    			if ((changed.anim) && t24_value !== (t24_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].yvel + "")) {
+    				set_data_dev(t24, t24_value);
     			}
 
-    			if ((changed.anim) && t23_value !== (t23_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].xpos + "")) {
-    				set_data_dev(t23, t23_value);
+    			if ((changed.anim) && t26_value !== (t26_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].xpos + "")) {
+    				set_data_dev(t26, t26_value);
     			}
 
-    			if ((changed.anim) && t25_value !== (t25_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].ypos + "")) {
-    				set_data_dev(t25, t25_value);
+    			if ((changed.anim) && t28_value !== (t28_value = ctx.anim.charFramePositionData[ctx.anim.windowIndex][ctx.anim.windowFrame].ypos + "")) {
+    				set_data_dev(t28, t28_value);
     			}
     		},
 
@@ -3750,23 +19620,23 @@ var app = (function () {
     				detach_dev(div2);
     				detach_dev(t11);
     				detach_dev(div3);
-    				detach_dev(t17);
+    				detach_dev(t20);
     				detach_dev(div4);
     			}
 
     			run_all(dispose);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_13.name, type: "if", source: "(795:4) {#if mainViewInfo}", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_13.name, type: "if", source: "(831:4) {#if mainViewInfo}", ctx });
     	return block;
     }
 
-    // (832:5) {#each tools as tool}
+    // (873:5) {#each tools as tool}
     function create_each_block_1$1(ctx) {
     	var button, i, t0_value = ctx.tool[0] + "", t0, span, t1_value = ctx.tool[1] + "", t1, t2, button_active_value, dispose;
 
-    	function click_handler_10() {
-    		return ctx.click_handler_10(ctx);
+    	function click_handler_9() {
+    		return ctx.click_handler_9(ctx);
     	}
 
     	const block = {
@@ -3778,13 +19648,13 @@ var app = (function () {
     			t1 = text(t1_value);
     			t2 = space();
     			attr_dev(i, "class", "material-icons svelte-17vzh85");
-    			add_location(i, file$2, 836, 7, 24997);
+    			add_location(i, file$3, 877, 7, 26786);
     			attr_dev(span, "class", "svelte-17vzh85");
-    			add_location(span, file$2, 836, 46, 25036);
+    			add_location(span, file$3, 877, 46, 26825);
     			attr_dev(button, "class", "tool svelte-17vzh85");
     			attr_dev(button, "active", button_active_value = ctx.tools.selected === ctx.tool[1]);
-    			add_location(button, file$2, 832, 6, 24866);
-    			dispose = listen_dev(button, "click", click_handler_10);
+    			add_location(button, file$3, 873, 6, 26655);
+    			dispose = listen_dev(button, "click", click_handler_9);
     		},
 
     		m: function mount(target, anchor) {
@@ -3819,11 +19689,11 @@ var app = (function () {
     			dispose();
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_1$1.name, type: "each", source: "(832:5) {#each tools as tool}", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block_1$1.name, type: "each", source: "(873:5) {#each tools as tool}", ctx });
     	return block;
     }
 
-    // (906:4) {:else}
+    // (947:4) {:else}
     function create_else_block_1(ctx) {
     	var image, image_x_value, image_y_value, image_width_value, image_height_value, image_xlink_href_value, dispose;
 
@@ -3836,7 +19706,7 @@ var app = (function () {
     			attr_dev(image, "height", image_height_value = ctx.spritesheetSrc.dimensions.height);
     			xlink_attr(image, "xlink:href", image_xlink_href_value = ctx.spritesheetSrc.dataUrl);
     			attr_dev(image, "clip-path", "url(#spriteClip)");
-    			add_location(image, file$2, 906, 5, 27329);
+    			add_location(image, file$3, 947, 5, 29118);
 
     			dispose = [
     				listen_dev(image, "mousedown", stop_propagation(mousedown_handler), false, false, true),
@@ -3880,11 +19750,11 @@ var app = (function () {
     			run_all(dispose);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_else_block_1.name, type: "else", source: "(906:4) {:else}", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_else_block_1.name, type: "else", source: "(947:4) {:else}", ctx });
     	return block;
     }
 
-    // (897:4) {#if char.position_locked.value || tools.selected !== "pan"}
+    // (938:4) {#if char.position_locked.value || tools.selected !== "pan"}
     function create_if_block_12(ctx) {
     	var image, image_x_value, image_y_value, image_width_value, image_height_value, image_xlink_href_value;
 
@@ -3897,7 +19767,7 @@ var app = (function () {
     			attr_dev(image, "height", image_height_value = ctx.spritesheetSrc.dimensions.height);
     			xlink_attr(image, "xlink:href", image_xlink_href_value = ctx.spritesheetSrc.dataUrl);
     			attr_dev(image, "clip-path", "url(#spriteClip)");
-    			add_location(image, file$2, 897, 5, 27069);
+    			add_location(image, file$3, 938, 5, 28858);
     		},
 
     		m: function mount(target, anchor) {
@@ -3932,18 +19802,18 @@ var app = (function () {
     			}
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_12.name, type: "if", source: "(897:4) {#if char.position_locked.value || tools.selected !== \"pan\"}", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_12.name, type: "if", source: "(938:4) {#if char.position_locked.value || tools.selected !== \"pan\"}", ctx });
     	return block;
     }
 
-    // (926:5) {#if anim.hitboxFrames[anim.animFrame] && anim.hitboxFrames[anim.animFrame].includes(i)}
+    // (967:5) {#if anim.hitboxFrames[anim.animFrame] && anim.hitboxFrames[anim.animFrame].includes(i)}
     function create_if_block_8(ctx) {
     	var line, line_x__value, line_x__value_1, line_y__value, line_y__value_1, line_stroke_width_value, line_stroke_dasharray_value, if_block1_anchor;
 
     	function select_block_type_2(changed, ctx) {
     		if (ctx.hitbox.data.HG_SHAPE.value === 0) return create_if_block_10;
     		if (ctx.hitbox.data.HG_SHAPE.value === 1) return create_if_block_11;
-    		return create_else_block;
+    		return create_else_block$1;
     	}
 
     	var current_block_type = select_block_type_2(null, ctx);
@@ -3973,7 +19843,7 @@ var app = (function () {
     			attr_dev(line, "stroke", "#0008");
     			attr_dev(line, "stroke-width", line_stroke_width_value = 4/ctx.anim.zoom);
     			attr_dev(line, "stroke-dasharray", line_stroke_dasharray_value = (ctx.hitbox.data.HG_ANGLE.value === 361) ? 4/ctx.anim.zoom : 0);
-    			add_location(line, file$2, 968, 6, 30301);
+    			add_location(line, file$3, 1009, 6, 32090);
     		},
 
     		m: function mount(target, anchor) {
@@ -4054,12 +19924,12 @@ var app = (function () {
     			}
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_8.name, type: "if", source: "(926:5) {#if anim.hitboxFrames[anim.animFrame] && anim.hitboxFrames[anim.animFrame].includes(i)}", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_8.name, type: "if", source: "(967:5) {#if anim.hitboxFrames[anim.animFrame] && anim.hitboxFrames[anim.animFrame].includes(i)}", ctx });
     	return block;
     }
 
-    // (953:6) {:else}
-    function create_else_block(ctx) {
+    // (994:6) {:else}
+    function create_else_block$1(ctx) {
     	var rect, hitbox = ctx.hitbox, rect_x_value, rect_y_value, rect_rx_value, rect_ry_value, rect_width_value, rect_height_value, rect_fill_value, rect_stroke_value, rect_stroke_width_value;
 
     	const assign_rect = () => ctx.rect_binding_1(rect, hitbox);
@@ -4079,7 +19949,7 @@ var app = (function () {
     			attr_dev(rect, "fill", rect_fill_value = ctx.hitbox.meta.color);
     			attr_dev(rect, "stroke", rect_stroke_value = (ctx.hitboxes.selected === ctx.i) ? 'black' : ctx.hitbox.meta.stroke || 'black');
     			attr_dev(rect, "stroke-width", rect_stroke_width_value = (ctx.hitboxes.selected === ctx.i) ? 4/ctx.anim.zoom : ctx.hitbox.meta.strokeWidth || 0);
-    			add_location(rect, file$2, 953, 7, 29551);
+    			add_location(rect, file$3, 994, 7, 31340);
     		},
 
     		m: function mount(target, anchor) {
@@ -4140,11 +20010,11 @@ var app = (function () {
     			unassign_rect();
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_else_block.name, type: "else", source: "(953:6) {:else}", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_else_block$1.name, type: "else", source: "(994:6) {:else}", ctx });
     	return block;
     }
 
-    // (940:49) 
+    // (981:49) 
     function create_if_block_11(ctx) {
     	var rect, hitbox = ctx.hitbox, rect_x_value, rect_y_value, rect_width_value, rect_height_value, rect_fill_value, rect_stroke_value, rect_stroke_width_value;
 
@@ -4163,7 +20033,7 @@ var app = (function () {
     			attr_dev(rect, "fill", rect_fill_value = ctx.hitbox.meta.color);
     			attr_dev(rect, "stroke", rect_stroke_value = (ctx.hitboxes.selected === ctx.i) ? 'black' : ctx.hitbox.meta.stroke || 'black');
     			attr_dev(rect, "stroke-width", rect_stroke_width_value = (ctx.hitboxes.selected === ctx.i) ? 4/ctx.anim.zoom : ctx.hitbox.meta.strokeWidth || 0);
-    			add_location(rect, file$2, 940, 7, 28897);
+    			add_location(rect, file$3, 981, 7, 30686);
     		},
 
     		m: function mount(target, anchor) {
@@ -4216,11 +20086,11 @@ var app = (function () {
     			unassign_rect();
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_11.name, type: "if", source: "(940:49) ", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_11.name, type: "if", source: "(981:49) ", ctx });
     	return block;
     }
 
-    // (927:6) {#if hitbox.data.HG_SHAPE.value === 0}
+    // (968:6) {#if hitbox.data.HG_SHAPE.value === 0}
     function create_if_block_10(ctx) {
     	var ellipse, hitbox = ctx.hitbox, ellipse_cx_value, ellipse_cy_value, ellipse_rx_value, ellipse_ry_value, ellipse_fill_value, ellipse_stroke_value, ellipse_stroke_width_value;
 
@@ -4239,7 +20109,7 @@ var app = (function () {
     			attr_dev(ellipse, "fill", ellipse_fill_value = ctx.hitbox.meta.color);
     			attr_dev(ellipse, "stroke", ellipse_stroke_value = (ctx.hitboxes.selected === ctx.i) ? 'black' : ctx.hitbox.meta.stroke || 'black');
     			attr_dev(ellipse, "stroke-width", ellipse_stroke_width_value = (ctx.hitboxes.selected === ctx.i) ? 4/ctx.anim.zoom : ctx.hitbox.meta.strokeWidth || 0);
-    			add_location(ellipse, file$2, 927, 7, 28268);
+    			add_location(ellipse, file$3, 968, 7, 30057);
     		},
 
     		m: function mount(target, anchor) {
@@ -4292,11 +20162,11 @@ var app = (function () {
     			unassign_ellipse();
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_10.name, type: "if", source: "(927:6) {#if hitbox.data.HG_SHAPE.value === 0}", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_10.name, type: "if", source: "(968:6) {#if hitbox.data.HG_SHAPE.value === 0}", ctx });
     	return block;
     }
 
-    // (987:6) {#if tools.selected === 'pan'}
+    // (1028:6) {#if tools.selected === 'pan'}
     function create_if_block_9(ctx) {
     	var circle, circle_cx_value, circle_cy_value, circle_r_value;
 
@@ -4308,7 +20178,7 @@ var app = (function () {
     			attr_dev(circle, "cx", circle_cx_value = ctx.calc.sprXPos + ctx.hitbox.data.HG_HITBOX_X.value + ctx.calc.frameWidth * (ctx.anim.spriteFrame));
     			attr_dev(circle, "cy", circle_cy_value = ctx.calc.sprYPos + ctx.hitbox.data.HG_HITBOX_Y.value);
     			attr_dev(circle, "r", circle_r_value = 4/ctx.anim.zoom);
-    			add_location(circle, file$2, 987, 7, 31110);
+    			add_location(circle, file$3, 1028, 7, 32899);
     		},
 
     		m: function mount(target, anchor) {
@@ -4335,11 +20205,11 @@ var app = (function () {
     			}
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_9.name, type: "if", source: "(987:6) {#if tools.selected === 'pan'}", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_9.name, type: "if", source: "(1028:6) {#if tools.selected === 'pan'}", ctx });
     	return block;
     }
 
-    // (925:4) {#each hitboxes as hitbox, i}
+    // (966:4) {#each hitboxes as hitbox, i}
     function create_each_block$2(ctx) {
     	var show_if = ctx.anim.hitboxFrames[ctx.anim.animFrame] && ctx.anim.hitboxFrames[ctx.anim.animFrame].includes(ctx.i), if_block_anchor;
 
@@ -4381,11 +20251,11 @@ var app = (function () {
     			}
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block$2.name, type: "each", source: "(925:4) {#each hitboxes as hitbox, i}", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_each_block$2.name, type: "each", source: "(966:4) {#each hitboxes as hitbox, i}", ctx });
     	return block;
     }
 
-    // (1018:72) 
+    // (1059:72) 
     function create_if_block_7(ctx) {
     	var ellipse, ellipse_cx_value, ellipse_cy_value;
 
@@ -4400,7 +20270,7 @@ var app = (function () {
     			attr_dev(ellipse, "fill", "#F008");
     			attr_dev(ellipse, "stroke", "black");
     			attr_dev(ellipse, "stroke-width", "0");
-    			add_location(ellipse, file$2, 1018, 5, 32051);
+    			add_location(ellipse, file$3, 1059, 5, 33840);
     		},
 
     		m: function mount(target, anchor) {
@@ -4423,11 +20293,11 @@ var app = (function () {
     			}
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_7.name, type: "if", source: "(1018:72) ", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_7.name, type: "if", source: "(1059:72) ", ctx });
     	return block;
     }
 
-    // (998:4) {#if tools.active}
+    // (1039:4) {#if tools.active}
     function create_if_block_4$1(ctx) {
     	var if_block_anchor;
 
@@ -4471,11 +20341,11 @@ var app = (function () {
     			}
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_4$1.name, type: "if", source: "(998:4) {#if tools.active}", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_4$1.name, type: "if", source: "(1039:4) {#if tools.active}", ctx });
     	return block;
     }
 
-    // (1008:76) 
+    // (1049:76) 
     function create_if_block_6(ctx) {
     	var rect, rect_x_value, rect_y_value, rect_stroke_width_value;
 
@@ -4487,7 +20357,7 @@ var app = (function () {
     			attr_dev(rect, "fill", "white");
     			attr_dev(rect, "stroke", "black");
     			attr_dev(rect, "stroke-width", rect_stroke_width_value = 4 / ctx.anim.zoom);
-    			add_location(rect, file$2, 1008, 6, 31757);
+    			add_location(rect, file$3, 1049, 6, 33546);
     		},
 
     		m: function mount(target, anchor) {
@@ -4517,11 +20387,11 @@ var app = (function () {
     			ctx.rect_binding_2(null);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_6.name, type: "if", source: "(1008:76) ", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_6.name, type: "if", source: "(1049:76) ", ctx });
     	return block;
     }
 
-    // (999:5) {#if tools.selected === 'circle'}
+    // (1040:5) {#if tools.selected === 'circle'}
     function create_if_block_5(ctx) {
     	var ellipse, ellipse_cx_value, ellipse_cy_value, ellipse_stroke_width_value;
 
@@ -4533,7 +20403,7 @@ var app = (function () {
     			attr_dev(ellipse, "fill", "white");
     			attr_dev(ellipse, "stroke", "black");
     			attr_dev(ellipse, "stroke-width", ellipse_stroke_width_value = 4 / ctx.anim.zoom);
-    			add_location(ellipse, file$2, 999, 6, 31465);
+    			add_location(ellipse, file$3, 1040, 6, 33254);
     		},
 
     		m: function mount(target, anchor) {
@@ -4563,11 +20433,11 @@ var app = (function () {
     			ctx.ellipse_binding_1(null);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_5.name, type: "if", source: "(999:5) {#if tools.selected === 'circle'}", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_5.name, type: "if", source: "(1040:5) {#if tools.selected === 'circle'}", ctx });
     	return block;
     }
 
-    // (1041:38) 
+    // (1094:38) 
     function create_if_block_3$2(ctx) {
     	var updating_props, current;
 
@@ -4587,6 +20457,7 @@ var app = (function () {
     	});
 
     	binding_callbacks.push(() => bind(paramsbuilder, 'props', paramsbuilder_props_binding_3));
+    	paramsbuilder.$on("dataChanged", ctx.dataChanged_handler_3);
 
     	const block = {
     		c: function create() {
@@ -4622,11 +20493,11 @@ var app = (function () {
     			destroy_component(paramsbuilder, detaching);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_3$2.name, type: "if", source: "(1041:38) ", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_3$2.name, type: "if", source: "(1094:38) ", ctx });
     	return block;
     }
 
-    // (1039:38) 
+    // (1088:38) 
     function create_if_block_2$2(ctx) {
     	var updating_props, current;
 
@@ -4646,6 +20517,7 @@ var app = (function () {
     	});
 
     	binding_callbacks.push(() => bind(paramsbuilder, 'props', paramsbuilder_props_binding_2));
+    	paramsbuilder.$on("dataChanged", ctx.dataChanged_handler_2);
 
     	const block = {
     		c: function create() {
@@ -4681,11 +20553,11 @@ var app = (function () {
     			destroy_component(paramsbuilder, detaching);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_2$2.name, type: "if", source: "(1039:38) ", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_2$2.name, type: "if", source: "(1088:38) ", ctx });
     	return block;
     }
 
-    // (1037:37) 
+    // (1082:37) 
     function create_if_block_1$2(ctx) {
     	var updating_props, current;
 
@@ -4705,6 +20577,7 @@ var app = (function () {
     	});
 
     	binding_callbacks.push(() => bind(paramsbuilder, 'props', paramsbuilder_props_binding_1));
+    	paramsbuilder.$on("dataChanged", ctx.dataChanged_handler_1);
 
     	const block = {
     		c: function create() {
@@ -4740,12 +20613,12 @@ var app = (function () {
     			destroy_component(paramsbuilder, detaching);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_1$2.name, type: "if", source: "(1037:37) ", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block_1$2.name, type: "if", source: "(1082:37) ", ctx });
     	return block;
     }
 
-    // (1035:2) {#if editingMode === 'window'}
-    function create_if_block$2(ctx) {
+    // (1076:2) {#if editingMode === 'window'}
+    function create_if_block$3(ctx) {
     	var updating_props, current;
 
     	function paramsbuilder_props_binding(value) {
@@ -4764,6 +20637,7 @@ var app = (function () {
     	});
 
     	binding_callbacks.push(() => bind(paramsbuilder, 'props', paramsbuilder_props_binding));
+    	paramsbuilder.$on("dataChanged", ctx.dataChanged_handler);
 
     	const block = {
     		c: function create() {
@@ -4799,12 +20673,35 @@ var app = (function () {
     			destroy_component(paramsbuilder, detaching);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block$2.name, type: "if", source: "(1035:2) {#if editingMode === 'window'}", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_if_block$3.name, type: "if", source: "(1076:2) {#if editingMode === 'window'}", ctx });
     	return block;
     }
 
-    function create_fragment$2(ctx) {
-    	var div13, div5, div0, label0, button0, t1, input0, t2, p, t3_value = ctx.spritesheetSrc ? ctx.spritesheetSrc.file.name : '...' + "", t3, t4, div1, label1, t6, input1, input1_updating = false, t7, div2, button1, i0, span0, t10, button2, i1, span1, t13, div3, button3, i2, span2, t16, button4, i3, span3, t19, button5, i4, span4, t22, div4, button6, i5, span5, t25, button7, i6, span6, t28, button8, i7, span7, t31, textarea, t32, button9, i8, span8, t35, button10, i9, span9, t38, div7, div6, t39, updating_anim, updating_windows, updating_hitboxes, updating_editingMode, t40, div11, div9, button11, t41, t42, button12, t43, button12_active_value, t44, div8, t45, div10, svg, defs, filter, feGaussianBlur, clipPath, rect0, rect0_x_value, rect0_width_value, mask, circle, circle_cx_value, circle_cy_value, circle_r_value, path0, path0_d_value, path0_stroke_width_value, path1, path1_d_value, path1_stroke_width_value, path2, path2_d_value, path2_stroke_width_value, rect1, rect1_x_value, rect1_y_value, rect1_width_value, rect1_height_value, if_block1_anchor, each1_anchor, show_if, svg_viewBox_value, t46, div12, current_block_type_index, if_block3, current, dispose;
+    function create_fragment$4(ctx) {
+    	var updating_visible, t0, t1, div13, div5, div0, button0, t3, label0, button1, t5, input0, t6, div1, label1, t8, input1, input1_updating = false, t9, div2, button2, i0, span0, t12, button3, i1, span1, t15, div3, button4, i2, span2, t18, button5, i3, span3, t21, button6, i4, span4, t24, div4, button7, i5, span5, t27, button8, i6, span6, t30, button9, i7, span7, t33, textarea, t34, button10, i8, span8, t37, label2, button11, i9, span9, t40, input2, t41, div7, div6, t42, updating_anim, updating_windows, updating_hitboxes, updating_editingMode, updating_updateStates, t43, div11, div9, button12, t44, t45, button13, t46, button13_active_value, t47, div8, t48, div10, svg, defs, filter, feGaussianBlur, clipPath, rect0, rect0_x_value, rect0_width_value, mask, circle, circle_cx_value, circle_cy_value, circle_r_value, path0, path0_d_value, path0_stroke_width_value, path1, path1_d_value, path1_stroke_width_value, path2, path2_d_value, path2_stroke_width_value, rect1, rect1_x_value, rect1_y_value, rect1_width_value, rect1_height_value, if_block1_anchor, each1_anchor, show_if, svg_viewBox_value, t49, div12, current_block_type_index, if_block3, current, dispose;
+
+    	function modal_visible_binding(value) {
+    		ctx.modal_visible_binding.call(null, value);
+    		updating_visible = true;
+    		add_flush_callback(() => updating_visible = false);
+    	}
+
+    	let modal_props = {};
+    	if (ctx.modalVisible !== void 0) {
+    		modal_props.visible = ctx.modalVisible;
+    	}
+    	var modal = new Modal({ props: modal_props, $$inline: true });
+
+    	binding_callbacks.push(() => bind(modal, 'visible', modal_visible_binding));
+    	modal.$on("close", ctx.close_handler);
+
+    	var localstoragefs = new LocalStorageFS({
+    		props: {
+    		saveMode: false,
+    		active: false
+    	},
+    		$$inline: true
+    	});
 
     	function input1_input_handler() {
     		input1_updating = true;
@@ -4816,31 +20713,37 @@ var app = (function () {
     	let each_blocks_1 = [];
 
     	for (let i = 0; i < each_value_2.length; i += 1) {
-    		each_blocks_1[i] = create_each_block_2(get_each_context_2(ctx, each_value_2, i));
+    		each_blocks_1[i] = create_each_block_2$1(get_each_context_2$1(ctx, each_value_2, i));
     	}
 
-    	function timeline_anim_binding(value) {
-    		ctx.timeline_anim_binding.call(null, value);
+    	function timeline_anim_binding(value_1) {
+    		ctx.timeline_anim_binding.call(null, value_1);
     		updating_anim = true;
     		add_flush_callback(() => updating_anim = false);
     	}
 
-    	function timeline_windows_binding(value_1) {
-    		ctx.timeline_windows_binding.call(null, value_1);
+    	function timeline_windows_binding(value_2) {
+    		ctx.timeline_windows_binding.call(null, value_2);
     		updating_windows = true;
     		add_flush_callback(() => updating_windows = false);
     	}
 
-    	function timeline_hitboxes_binding(value_2) {
-    		ctx.timeline_hitboxes_binding.call(null, value_2);
+    	function timeline_hitboxes_binding(value_3) {
+    		ctx.timeline_hitboxes_binding.call(null, value_3);
     		updating_hitboxes = true;
     		add_flush_callback(() => updating_hitboxes = false);
     	}
 
-    	function timeline_editingMode_binding(value_3) {
-    		ctx.timeline_editingMode_binding.call(null, value_3);
+    	function timeline_editingMode_binding(value_4) {
+    		ctx.timeline_editingMode_binding.call(null, value_4);
     		updating_editingMode = true;
     		add_flush_callback(() => updating_editingMode = false);
+    	}
+
+    	function timeline_updateStates_binding(value_5) {
+    		ctx.timeline_updateStates_binding.call(null, value_5);
+    		updating_updateStates = true;
+    		add_flush_callback(() => updating_updateStates = false);
     	}
 
     	let timeline_props = {
@@ -4860,12 +20763,16 @@ var app = (function () {
     	if (ctx.editingMode !== void 0) {
     		timeline_props.editingMode = ctx.editingMode;
     	}
+    	if (ctx.updateStates !== void 0) {
+    		timeline_props.updateStates = ctx.updateStates;
+    	}
     	var timeline = new Timeline({ props: timeline_props, $$inline: true });
 
     	binding_callbacks.push(() => bind(timeline, 'anim', timeline_anim_binding));
     	binding_callbacks.push(() => bind(timeline, 'windows', timeline_windows_binding));
     	binding_callbacks.push(() => bind(timeline, 'hitboxes', timeline_hitboxes_binding));
     	binding_callbacks.push(() => bind(timeline, 'editingMode', timeline_editingMode_binding));
+    	binding_callbacks.push(() => bind(timeline, 'updateStates', timeline_updateStates_binding));
 
     	function select_block_type(changed, ctx) {
     		if (ctx.mainViewInfo) return create_if_block_13;
@@ -4901,7 +20808,7 @@ var app = (function () {
     	var if_block2 = current_block_type_2 && current_block_type_2(ctx);
 
     	var if_block_creators = [
-    		create_if_block$2,
+    		create_if_block$3,
     		create_if_block_1$2,
     		create_if_block_2$2,
     		create_if_block_3$2
@@ -4923,89 +20830,96 @@ var app = (function () {
 
     	const block = {
     		c: function create() {
+    			modal.$$.fragment.c();
+    			t0 = space();
+    			localstoragefs.$$.fragment.c();
+    			t1 = space();
     			div13 = element("div");
     			div5 = element("div");
     			div0 = element("div");
-    			label0 = element("label");
     			button0 = element("button");
-    			button0.textContent = "upload spritesheet";
-    			t1 = space();
+    			button0.textContent = "Help / Credits";
+    			t3 = space();
+    			label0 = element("label");
+    			button1 = element("button");
+    			button1.textContent = "upload spritesheet";
+    			t5 = space();
     			input0 = element("input");
-    			t2 = space();
-    			p = element("p");
-    			t3 = text(t3_value);
-    			t4 = space();
+    			t6 = space();
     			div1 = element("div");
     			label1 = element("label");
     			label1.textContent = "number of frames in spritesheet:";
-    			t6 = space();
+    			t8 = space();
     			input1 = element("input");
-    			t7 = space();
+    			t9 = space();
     			div2 = element("div");
-    			button1 = element("button");
+    			button2 = element("button");
     			i0 = element("i");
     			i0.textContent = "edit";
     			span0 = element("span");
     			span0.textContent = "edit attack data";
-    			t10 = space();
-    			button2 = element("button");
+    			t12 = space();
+    			button3 = element("button");
     			i1 = element("i");
     			i1.textContent = "person";
     			span1 = element("span");
     			span1.textContent = "edit character data";
-    			t13 = space();
+    			t15 = space();
     			div3 = element("div");
-    			button3 = element("button");
+    			button4 = element("button");
     			i2 = element("i");
     			i2.textContent = "save_alt";
     			span2 = element("span");
     			span2.textContent = "save to browser";
-    			t16 = space();
-    			button4 = element("button");
+    			t18 = space();
+    			button5 = element("button");
     			i3 = element("i");
     			i3.textContent = "unarchive";
     			span3 = element("span");
     			span3.textContent = "load from browser";
-    			t19 = space();
-    			button5 = element("button");
+    			t21 = space();
+    			button6 = element("button");
     			i4 = element("i");
     			i4.textContent = "import_export";
     			span4 = element("span");
     			span4.textContent = "export to GML";
-    			t22 = space();
+    			t24 = space();
     			div4 = element("div");
-    			button6 = element("button");
+    			button7 = element("button");
     			i5 = element("i");
     			i5.textContent = "attachment";
     			span5 = element("span");
     			span5.textContent = "init.gml";
-    			t25 = space();
-    			button7 = element("button");
+    			t27 = space();
+    			button8 = element("button");
     			i6 = element("i");
     			i6.textContent = "attachment";
     			span6 = element("span");
     			span6.textContent = "load.gml";
-    			t28 = space();
-    			button8 = element("button");
+    			t30 = space();
+    			button9 = element("button");
     			i7 = element("i");
     			i7.textContent = "attachment";
     			span7 = element("span");
     			span7.textContent = "[attackname].gml";
-    			t31 = space();
+    			t33 = space();
     			textarea = element("textarea");
-    			t32 = space();
-    			button9 = element("button");
+    			t34 = space();
+    			button10 = element("button");
     			i8 = element("i");
     			i8.textContent = "attachment";
     			span8 = element("span");
     			span8.textContent = "export WIP";
-    			t35 = space();
-    			button10 = element("button");
+    			t37 = space();
+    			label2 = element("label");
+    			button11 = element("button");
     			i9 = element("i");
     			i9.textContent = "attachment";
     			span9 = element("span");
     			span9.textContent = "import WIP";
-    			t38 = space();
+    			t40 = space();
+    			input2 = element("input");
+    			t41 = space();
     			div7 = element("div");
     			div6 = element("div");
 
@@ -5013,20 +20927,20 @@ var app = (function () {
     				each_blocks_1[i].c();
     			}
 
-    			t39 = space();
+    			t42 = space();
     			timeline.$$.fragment.c();
-    			t40 = space();
+    			t43 = space();
     			div11 = element("div");
     			div9 = element("div");
-    			button11 = element("button");
-    			t41 = text("info");
-    			t42 = space();
     			button12 = element("button");
-    			t43 = text("tools");
-    			t44 = space();
+    			t44 = text("info");
+    			t45 = space();
+    			button13 = element("button");
+    			t46 = text("tools");
+    			t47 = space();
     			div8 = element("div");
     			if_block0.c();
-    			t45 = space();
+    			t48 = space();
     			div10 = element("div");
     			svg = svg_element("svg");
     			defs = svg_element("defs");
@@ -5049,168 +20963,176 @@ var app = (function () {
 
     			each1_anchor = empty();
     			if (if_block2) if_block2.c();
-    			t46 = space();
+    			t49 = space();
     			div12 = element("div");
     			if (if_block3) if_block3.c();
-    			set_style(button0, "pointer-events", "none");
     			attr_dev(button0, "class", "svelte-17vzh85");
-    			add_location(button0, file$2, 559, 4, 14084);
+    			add_location(button0, file$3, 626, 3, 16086);
+    			set_style(button1, "pointer-events", "none");
+    			attr_dev(button1, "class", "svelte-17vzh85");
+    			add_location(button1, file$3, 628, 4, 16195);
     			attr_dev(label0, "for", "spritesheet-upload");
-    			add_location(label0, file$2, 558, 3, 14047);
+    			add_location(label0, file$3, 627, 3, 16158);
     			attr_dev(input0, "id", "spritesheet-upload");
     			attr_dev(input0, "type", "file");
     			attr_dev(input0, "class", "svelte-17vzh85");
-    			add_location(input0, file$2, 561, 3, 14164);
-    			attr_dev(p, "class", "filename svelte-17vzh85");
-    			add_location(p, file$2, 562, 3, 14317);
+    			add_location(input0, file$3, 630, 3, 16275);
     			attr_dev(div0, "class", "inputGroup svelte-17vzh85");
-    			add_location(div0, file$2, 557, 2, 14019);
+    			add_location(div0, file$3, 625, 2, 16058);
     			attr_dev(label1, "for", "framecount");
-    			add_location(label1, file$2, 565, 3, 14432);
+    			add_location(label1, file$3, 633, 3, 16464);
     			attr_dev(input1, "id", "framecount");
     			attr_dev(input1, "type", "number");
     			attr_dev(input1, "min", "1");
     			attr_dev(input1, "max", "99");
-    			add_location(input1, file$2, 566, 3, 14500);
+    			add_location(input1, file$3, 634, 3, 16532);
     			attr_dev(div1, "class", "inputGroup svelte-17vzh85");
-    			add_location(div1, file$2, 564, 2, 14404);
+    			add_location(div1, file$3, 632, 2, 16436);
     			attr_dev(i0, "class", "material-icons svelte-17vzh85");
-    			add_location(i0, file$2, 569, 52, 14682);
+    			add_location(i0, file$3, 637, 52, 16714);
     			attr_dev(span0, "class", "svelte-17vzh85");
-    			add_location(span0, file$2, 569, 86, 14716);
-    			attr_dev(button1, "class", "svelte-17vzh85");
-    			add_location(button1, file$2, 569, 3, 14633);
-    			attr_dev(i1, "class", "material-icons svelte-17vzh85");
-    			add_location(i1, file$2, 570, 52, 14807);
-    			attr_dev(span1, "class", "svelte-17vzh85");
-    			add_location(span1, file$2, 570, 88, 14843);
+    			add_location(span0, file$3, 637, 86, 16748);
     			attr_dev(button2, "class", "svelte-17vzh85");
-    			add_location(button2, file$2, 570, 3, 14758);
-    			attr_dev(div2, "class", "inputGroup svelte-17vzh85");
-    			add_location(div2, file$2, 568, 2, 14605);
-    			attr_dev(i2, "class", "material-icons svelte-17vzh85");
-    			add_location(i2, file$2, 573, 27, 14949);
-    			attr_dev(span2, "class", "svelte-17vzh85");
-    			add_location(span2, file$2, 573, 65, 14987);
+    			add_location(button2, file$3, 637, 3, 16665);
+    			attr_dev(i1, "class", "material-icons svelte-17vzh85");
+    			add_location(i1, file$3, 638, 52, 16839);
+    			attr_dev(span1, "class", "svelte-17vzh85");
+    			add_location(span1, file$3, 638, 88, 16875);
     			attr_dev(button3, "class", "svelte-17vzh85");
-    			add_location(button3, file$2, 573, 3, 14925);
-    			attr_dev(i3, "class", "material-icons svelte-17vzh85");
-    			add_location(i3, file$2, 574, 27, 15052);
-    			attr_dev(span3, "class", "svelte-17vzh85");
-    			add_location(span3, file$2, 574, 66, 15091);
+    			add_location(button3, file$3, 638, 3, 16790);
+    			attr_dev(div2, "class", "inputGroup svelte-17vzh85");
+    			add_location(div2, file$3, 636, 2, 16637);
+    			attr_dev(i2, "class", "material-icons svelte-17vzh85");
+    			add_location(i2, file$3, 641, 27, 16981);
+    			attr_dev(span2, "class", "svelte-17vzh85");
+    			add_location(span2, file$3, 641, 65, 17019);
     			attr_dev(button4, "class", "svelte-17vzh85");
-    			add_location(button4, file$2, 574, 3, 15028);
-    			attr_dev(i4, "class", "material-icons svelte-17vzh85");
-    			add_location(i4, file$2, 575, 32, 15163);
-    			attr_dev(span4, "class", "svelte-17vzh85");
-    			add_location(span4, file$2, 575, 75, 15206);
+    			add_location(button4, file$3, 641, 3, 16957);
+    			attr_dev(i3, "class", "material-icons svelte-17vzh85");
+    			add_location(i3, file$3, 642, 27, 17084);
+    			attr_dev(span3, "class", "svelte-17vzh85");
+    			add_location(span3, file$3, 642, 66, 17123);
     			attr_dev(button5, "class", "svelte-17vzh85");
-    			add_location(button5, file$2, 575, 3, 15134);
-    			attr_dev(div3, "class", "inputGroup svelte-17vzh85");
-    			add_location(div3, file$2, 572, 2, 14897);
-    			attr_dev(i5, "class", "material-icons svelte-17vzh85");
-    			add_location(i5, file$2, 578, 52, 15330);
-    			attr_dev(span5, "class", "svelte-17vzh85");
-    			add_location(span5, file$2, 578, 92, 15370);
+    			add_location(button5, file$3, 642, 3, 17060);
+    			attr_dev(i4, "class", "material-icons svelte-17vzh85");
+    			add_location(i4, file$3, 643, 32, 17195);
+    			attr_dev(span4, "class", "svelte-17vzh85");
+    			add_location(span4, file$3, 643, 75, 17238);
     			attr_dev(button6, "class", "svelte-17vzh85");
-    			add_location(button6, file$2, 578, 3, 15281);
-    			attr_dev(i6, "class", "material-icons svelte-17vzh85");
-    			add_location(i6, file$2, 579, 52, 15453);
-    			attr_dev(span6, "class", "svelte-17vzh85");
-    			add_location(span6, file$2, 579, 92, 15493);
+    			add_location(button6, file$3, 643, 3, 17166);
+    			attr_dev(div3, "class", "inputGroup svelte-17vzh85");
+    			add_location(div3, file$3, 640, 2, 16929);
+    			attr_dev(i5, "class", "material-icons svelte-17vzh85");
+    			add_location(i5, file$3, 646, 52, 17362);
+    			attr_dev(span5, "class", "svelte-17vzh85");
+    			add_location(span5, file$3, 646, 92, 17402);
     			attr_dev(button7, "class", "svelte-17vzh85");
-    			add_location(button7, file$2, 579, 3, 15404);
-    			attr_dev(i7, "class", "material-icons svelte-17vzh85");
-    			add_location(i7, file$2, 580, 54, 15578);
-    			attr_dev(span7, "class", "svelte-17vzh85");
-    			add_location(span7, file$2, 580, 94, 15618);
+    			add_location(button7, file$3, 646, 3, 17313);
+    			attr_dev(i6, "class", "material-icons svelte-17vzh85");
+    			add_location(i6, file$3, 647, 52, 17485);
+    			attr_dev(span6, "class", "svelte-17vzh85");
+    			add_location(span6, file$3, 647, 92, 17525);
     			attr_dev(button8, "class", "svelte-17vzh85");
-    			add_location(button8, file$2, 580, 3, 15527);
+    			add_location(button8, file$3, 647, 3, 17436);
+    			attr_dev(i7, "class", "material-icons svelte-17vzh85");
+    			add_location(i7, file$3, 648, 54, 17610);
+    			attr_dev(span7, "class", "svelte-17vzh85");
+    			add_location(span7, file$3, 648, 94, 17650);
+    			attr_dev(button9, "class", "svelte-17vzh85");
+    			add_location(button9, file$3, 648, 3, 17559);
     			set_style(textarea, "height", "300px");
     			set_style(textarea, "width", "100%");
     			set_style(textarea, "color", "#DDD");
     			set_style(textarea, "font-size", "10px");
     			set_style(textarea, "font-family", "monospace");
     			set_style(textarea, "background-color", "black");
-    			add_location(textarea, file$2, 581, 3, 15660);
+    			add_location(textarea, file$3, 649, 3, 17692);
     			attr_dev(i8, "class", "material-icons svelte-17vzh85");
-    			add_location(i8, file$2, 602, 4, 16045);
+    			add_location(i8, file$3, 661, 4, 17929);
     			attr_dev(span8, "class", "svelte-17vzh85");
-    			add_location(span8, file$2, 602, 44, 16085);
-    			attr_dev(button9, "class", "svelte-17vzh85");
-    			add_location(button9, file$2, 592, 3, 15873);
-    			attr_dev(i9, "class", "material-icons svelte-17vzh85");
-    			add_location(i9, file$2, 613, 4, 16347);
-    			attr_dev(span9, "class", "svelte-17vzh85");
-    			add_location(span9, file$2, 613, 44, 16387);
+    			add_location(span8, file$3, 661, 44, 17969);
     			attr_dev(button10, "class", "svelte-17vzh85");
-    			add_location(button10, file$2, 604, 3, 16125);
+    			add_location(button10, file$3, 660, 3, 17895);
+    			attr_dev(i9, "class", "material-icons svelte-17vzh85");
+    			add_location(i9, file$3, 665, 5, 18082);
+    			attr_dev(span9, "class", "svelte-17vzh85");
+    			add_location(span9, file$3, 665, 45, 18122);
+    			set_style(button11, "pointer-events", "none");
+    			attr_dev(button11, "class", "svelte-17vzh85");
+    			add_location(button11, file$3, 664, 4, 18039);
+    			attr_dev(label2, "for", "import-wip");
+    			add_location(label2, file$3, 663, 3, 18009);
+    			attr_dev(input2, "id", "import-wip");
+    			attr_dev(input2, "type", "file");
+    			attr_dev(input2, "accept", ".roab");
+    			attr_dev(input2, "class", "svelte-17vzh85");
+    			add_location(input2, file$3, 668, 3, 18178);
     			attr_dev(div4, "class", "inputGroup svelte-17vzh85");
-    			add_location(div4, file$2, 577, 2, 15253);
+    			add_location(div4, file$3, 645, 2, 17285);
     			attr_dev(div5, "id", "file");
     			attr_dev(div5, "class", "svelte-17vzh85");
-    			add_location(div5, file$2, 556, 1, 14001);
+    			add_location(div5, file$3, 624, 1, 16040);
     			attr_dev(div6, "class", "frameContainer");
     			set_style(div6, "width", "" + ctx.spritesheetSrc.dimensions.width + "px");
     			set_style(div6, "height", "100%");
     			set_style(div6, "background-color", "black");
-    			add_location(div6, file$2, 618, 2, 16467);
+    			add_location(div6, file$3, 672, 2, 18291);
     			attr_dev(div7, "id", "frames");
     			attr_dev(div7, "class", "svelte-17vzh85");
-    			add_location(div7, file$2, 617, 1, 16447);
-    			attr_dev(button11, "class", "tab svelte-17vzh85");
-    			attr_dev(button11, "active", ctx.mainViewInfo);
-    			add_location(button11, file$2, 791, 3, 23015);
+    			add_location(div7, file$3, 671, 1, 18271);
     			attr_dev(button12, "class", "tab svelte-17vzh85");
-    			attr_dev(button12, "active", button12_active_value = !ctx.mainViewInfo);
-    			add_location(button12, file$2, 792, 3, 23111);
+    			attr_dev(button12, "active", ctx.mainViewInfo);
+    			add_location(button12, file$3, 827, 3, 24656);
+    			attr_dev(button13, "class", "tab svelte-17vzh85");
+    			attr_dev(button13, "active", button13_active_value = !ctx.mainViewInfo);
+    			add_location(button13, file$3, 828, 3, 24752);
     			attr_dev(div8, "class", "tool-container svelte-17vzh85");
-    			add_location(div8, file$2, 793, 3, 23210);
+    			add_location(div8, file$3, 829, 3, 24851);
     			attr_dev(div9, "class", "option-container svelte-17vzh85");
     			set_style(div9, "z-index", "500");
     			set_style(div9, "height", "auto");
     			set_style(div9, "pointer-events", "none");
-    			add_location(div9, file$2, 790, 2, 22923);
+    			add_location(div9, file$3, 826, 2, 24564);
     			attr_dev(feGaussianBlur, "in", "SourceGraphic");
     			attr_dev(feGaussianBlur, "stdDeviation", "5");
-    			add_location(feGaussianBlur, file$2, 856, 6, 25589);
+    			add_location(feGaussianBlur, file$3, 897, 6, 27378);
     			attr_dev(filter, "id", "blur");
     			attr_dev(filter, "x", "0");
     			attr_dev(filter, "y", "0");
-    			add_location(filter, file$2, 855, 5, 25552);
+    			add_location(filter, file$3, 896, 5, 27341);
     			attr_dev(rect0, "x", rect0_x_value = (ctx.anim.spriteFrame % ctx.spritesheetSrc.framecount) / ctx.spritesheetSrc.framecount);
     			attr_dev(rect0, "y", "0");
     			attr_dev(rect0, "width", rect0_width_value = 1 / ctx.spritesheetSrc.framecount);
     			attr_dev(rect0, "height", "1");
-    			add_location(rect0, file$2, 859, 6, 25731);
+    			add_location(rect0, file$3, 900, 6, 27520);
     			attr_dev(clipPath, "id", "spriteClip");
     			attr_dev(clipPath, "clipPathUnits", "objectBoundingBox");
-    			add_location(clipPath, file$2, 858, 5, 25664);
+    			add_location(clipPath, file$3, 899, 5, 27453);
     			attr_dev(circle, "cx", circle_cx_value = ctx.calc.relMouseX);
     			attr_dev(circle, "cy", circle_cy_value = ctx.calc.relMouseY);
     			attr_dev(circle, "r", circle_r_value = ctx.anim.gridViewerRadius / ctx.anim.zoom);
     			attr_dev(circle, "fill", "white");
     			attr_dev(circle, "filter", "url(#blur)");
-    			add_location(circle, file$2, 862, 6, 25928);
+    			add_location(circle, file$3, 903, 6, 27717);
     			attr_dev(mask, "id", "mouseMask");
-    			add_location(mask, file$2, 861, 5, 25900);
-    			add_location(defs, file$2, 854, 4, 25540);
+    			add_location(mask, file$3, 902, 5, 27689);
+    			add_location(defs, file$3, 895, 4, 27329);
     			attr_dev(path0, "d", path0_d_value = "\n\t\t\t\t\tM " + -4 * ctx.rend.clientWidth / 2 + " 0\n\t\t\t\t\th " + ctx.rend.clientWidth * 4 + "\n\t\t\t\t");
     			attr_dev(path0, "stroke-width", path0_stroke_width_value = 2 / ctx.anim.zoom);
     			attr_dev(path0, "stroke", "#000F");
     			attr_dev(path0, "shape-rendering", "crispEdges");
-    			add_location(path0, file$2, 865, 4, 26086);
+    			add_location(path0, file$3, 906, 4, 27875);
     			attr_dev(path1, "d", path1_d_value = "\n\t\t\t\t\tM 0 " + -4 * ctx.rend.clientHeight / 2 + "\n\t\t\t\t\tv " + ctx.rend.clientHeight * 4 + "\n\t\t\t\t");
     			attr_dev(path1, "stroke-width", path1_stroke_width_value = 2 / ctx.anim.zoom);
     			attr_dev(path1, "stroke", "#000F");
     			attr_dev(path1, "shape-rendering", "crispEdges");
-    			add_location(path1, file$2, 873, 4, 26271);
+    			add_location(path1, file$3, 914, 4, 28060);
     			attr_dev(path2, "d", path2_d_value = (ctx.anim.grid) ? ctx.drawGridOverlay(ctx.anim.zoomGrids[ctx.anim.zoom][0], ctx.anim.zoomGrids[ctx.anim.zoom][1], ctx.anim.gridViewerRadius / ctx.anim.zoom, ctx.calc.relMouseX, ctx.calc.relMouseY) : '');
     			attr_dev(path2, "stroke-width", path2_stroke_width_value = 1 / ctx.anim.zoom);
     			attr_dev(path2, "stroke", "#0008");
     			attr_dev(path2, "shape-rendering", "crispEdges");
     			attr_dev(path2, "mask", "url(#mouseMask)");
-    			add_location(path2, file$2, 881, 4, 26458);
+    			add_location(path2, file$3, 922, 4, 28247);
     			attr_dev(rect1, "x", rect1_x_value = ctx.calc.sprXPos + ctx.calc.frameWidth * (ctx.anim.spriteFrame));
     			attr_dev(rect1, "y", rect1_y_value = ctx.calc.sprYPos);
     			attr_dev(rect1, "width", rect1_width_value = ctx.calc.frameWidth);
@@ -5218,12 +21140,12 @@ var app = (function () {
     			attr_dev(rect1, "stroke", "black");
     			attr_dev(rect1, "stroke-width", "2");
     			attr_dev(rect1, "fill", "none");
-    			add_location(rect1, file$2, 887, 4, 26759);
+    			add_location(rect1, file$3, 928, 4, 28548);
     			attr_dev(svg, "version", "2.0");
     			set_style(svg, "width", "100%");
     			set_style(svg, "height", "100%");
     			attr_dev(svg, "viewBox", svg_viewBox_value = "\n\t\t\t\t\t" + (ctx.anim.cameraX - ctx.rend.clientWidth) / 2 / ctx.anim.zoom + " \n\t\t\t\t\t" + (ctx.anim.cameraY - ctx.rend.clientHeight) / 2 / ctx.anim.zoom + " \n\t\t\t\t\t" + ctx.rend.clientWidth / ctx.anim.zoom + " \n\t\t\t\t\t" + ctx.rend.clientHeight / ctx.anim.zoom);
-    			add_location(svg, file$2, 845, 3, 25260);
+    			add_location(svg, file$3, 886, 3, 27049);
     			attr_dev(div10, "class", "grid");
     			set_style(div10, "width", "100%");
     			set_style(div10, "height", "100%");
@@ -5232,35 +21154,35 @@ var app = (function () {
     			set_style(div10, "left", "0");
     			set_style(div10, "display", "grid");
     			set_style(div10, "image-rendering", "pixelated");
-    			add_location(div10, file$2, 844, 2, 25124);
+    			add_location(div10, file$3, 885, 2, 26913);
     			attr_dev(div11, "id", "main");
-    			attr_dev(div11, "tabindex", "0");
     			attr_dev(div11, "class", "svelte-17vzh85");
-    			add_location(div11, file$2, 650, 1, 17443);
+    			add_location(div11, file$3, 705, 1, 19302);
     			attr_dev(div12, "id", "settings");
     			attr_dev(div12, "class", "svelte-17vzh85");
-    			add_location(div12, file$2, 1033, 1, 32317);
+    			add_location(div12, file$3, 1074, 1, 34106);
     			attr_dev(div13, "id", "app");
     			attr_dev(div13, "class", "svelte-17vzh85");
-    			add_location(div13, file$2, 555, 0, 13985);
+    			add_location(div13, file$3, 623, 0, 16024);
 
     			dispose = [
+    				listen_dev(window_1, "keydown", ctx.keydown_handler),
+    				listen_dev(button0, "click", ctx.click_handler),
     				listen_dev(input0, "change", ctx.change_handler),
     				listen_dev(input1, "input", input1_input_handler),
-    				listen_dev(button1, "click", ctx.click_handler),
     				listen_dev(button2, "click", ctx.click_handler_1),
-    				listen_dev(button3, "click", ctx.save),
-    				listen_dev(button4, "click", ctx.load),
-    				listen_dev(button5, "click", ctx.gmlExport),
-    				listen_dev(button6, "click", ctx.click_handler_2),
+    				listen_dev(button3, "click", ctx.click_handler_2),
+    				listen_dev(button4, "click", ctx.save),
+    				listen_dev(button5, "click", ctx.load),
+    				listen_dev(button6, "click", ctx.gmlExport),
     				listen_dev(button7, "click", ctx.click_handler_3),
     				listen_dev(button8, "click", ctx.click_handler_4),
-    				listen_dev(textarea, "input", ctx.textarea_input_handler),
     				listen_dev(button9, "click", ctx.click_handler_5),
-    				listen_dev(button10, "click", ctx.click_handler_6),
-    				listen_dev(button11, "click", ctx.click_handler_8),
-    				listen_dev(button12, "click", ctx.click_handler_9),
-    				listen_dev(div11, "keydown", ctx.keydown_handler),
+    				listen_dev(textarea, "input", ctx.textarea_input_handler),
+    				listen_dev(button10, "click", ctx.exportWIP),
+    				listen_dev(input2, "change", ctx.loadWIP),
+    				listen_dev(button12, "click", ctx.click_handler_7),
+    				listen_dev(button13, "click", ctx.click_handler_8),
     				listen_dev(div11, "mousemove", ctx.mousemove_handler_1),
     				listen_dev(div11, "mousedown", ctx.mousedown_handler_1),
     				listen_dev(div11, "mouseup", ctx.mouseup_handler_1)
@@ -5272,73 +21194,79 @@ var app = (function () {
     		},
 
     		m: function mount(target, anchor) {
+    			mount_component(modal, target, anchor);
+    			insert_dev(target, t0, anchor);
+    			mount_component(localstoragefs, target, anchor);
+    			insert_dev(target, t1, anchor);
     			insert_dev(target, div13, anchor);
     			append_dev(div13, div5);
     			append_dev(div5, div0);
+    			append_dev(div0, button0);
+    			append_dev(div0, t3);
     			append_dev(div0, label0);
-    			append_dev(label0, button0);
-    			append_dev(div0, t1);
+    			append_dev(label0, button1);
+    			append_dev(div0, t5);
     			append_dev(div0, input0);
-    			append_dev(div0, t2);
-    			append_dev(div0, p);
-    			append_dev(p, t3);
-    			append_dev(div5, t4);
+    			append_dev(div5, t6);
     			append_dev(div5, div1);
     			append_dev(div1, label1);
-    			append_dev(div1, t6);
+    			append_dev(div1, t8);
     			append_dev(div1, input1);
 
     			set_input_value(input1, ctx.spritesheetSrc.framecount);
 
-    			append_dev(div5, t7);
+    			append_dev(div5, t9);
     			append_dev(div5, div2);
-    			append_dev(div2, button1);
-    			append_dev(button1, i0);
-    			append_dev(button1, span0);
-    			append_dev(div2, t10);
     			append_dev(div2, button2);
-    			append_dev(button2, i1);
-    			append_dev(button2, span1);
-    			append_dev(div5, t13);
+    			append_dev(button2, i0);
+    			append_dev(button2, span0);
+    			append_dev(div2, t12);
+    			append_dev(div2, button3);
+    			append_dev(button3, i1);
+    			append_dev(button3, span1);
+    			append_dev(div5, t15);
     			append_dev(div5, div3);
-    			append_dev(div3, button3);
-    			append_dev(button3, i2);
-    			append_dev(button3, span2);
-    			append_dev(div3, t16);
     			append_dev(div3, button4);
-    			append_dev(button4, i3);
-    			append_dev(button4, span3);
-    			append_dev(div3, t19);
+    			append_dev(button4, i2);
+    			append_dev(button4, span2);
+    			append_dev(div3, t18);
     			append_dev(div3, button5);
-    			append_dev(button5, i4);
-    			append_dev(button5, span4);
-    			append_dev(div5, t22);
+    			append_dev(button5, i3);
+    			append_dev(button5, span3);
+    			append_dev(div3, t21);
+    			append_dev(div3, button6);
+    			append_dev(button6, i4);
+    			append_dev(button6, span4);
+    			append_dev(div5, t24);
     			append_dev(div5, div4);
-    			append_dev(div4, button6);
-    			append_dev(button6, i5);
-    			append_dev(button6, span5);
-    			append_dev(div4, t25);
     			append_dev(div4, button7);
-    			append_dev(button7, i6);
-    			append_dev(button7, span6);
-    			append_dev(div4, t28);
+    			append_dev(button7, i5);
+    			append_dev(button7, span5);
+    			append_dev(div4, t27);
     			append_dev(div4, button8);
-    			append_dev(button8, i7);
-    			append_dev(button8, span7);
-    			append_dev(div4, t31);
+    			append_dev(button8, i6);
+    			append_dev(button8, span6);
+    			append_dev(div4, t30);
+    			append_dev(div4, button9);
+    			append_dev(button9, i7);
+    			append_dev(button9, span7);
+    			append_dev(div4, t33);
     			append_dev(div4, textarea);
 
     			set_input_value(textarea, ctx.outputBox);
 
-    			append_dev(div4, t32);
-    			append_dev(div4, button9);
-    			append_dev(button9, i8);
-    			append_dev(button9, span8);
-    			append_dev(div4, t35);
+    			append_dev(div4, t34);
     			append_dev(div4, button10);
-    			append_dev(button10, i9);
-    			append_dev(button10, span9);
-    			append_dev(div13, t38);
+    			append_dev(button10, i8);
+    			append_dev(button10, span8);
+    			append_dev(div4, t37);
+    			append_dev(div4, label2);
+    			append_dev(label2, button11);
+    			append_dev(button11, i9);
+    			append_dev(button11, span9);
+    			append_dev(div4, t40);
+    			append_dev(div4, input2);
+    			append_dev(div13, t41);
     			append_dev(div13, div7);
     			append_dev(div7, div6);
 
@@ -5346,20 +21274,20 @@ var app = (function () {
     				each_blocks_1[i].m(div6, null);
     			}
 
-    			append_dev(div13, t39);
+    			append_dev(div13, t42);
     			mount_component(timeline, div13, null);
-    			append_dev(div13, t40);
+    			append_dev(div13, t43);
     			append_dev(div13, div11);
     			append_dev(div11, div9);
-    			append_dev(div9, button11);
-    			append_dev(button11, t41);
-    			append_dev(div9, t42);
     			append_dev(div9, button12);
-    			append_dev(button12, t43);
-    			append_dev(div9, t44);
+    			append_dev(button12, t44);
+    			append_dev(div9, t45);
+    			append_dev(div9, button13);
+    			append_dev(button13, t46);
+    			append_dev(div9, t47);
     			append_dev(div9, div8);
     			if_block0.m(div8, null);
-    			append_dev(div11, t45);
+    			append_dev(div11, t48);
     			append_dev(div11, div10);
     			append_dev(div10, svg);
     			append_dev(svg, defs);
@@ -5383,16 +21311,18 @@ var app = (function () {
     			append_dev(svg, each1_anchor);
     			if (if_block2) if_block2.m(svg, null);
     			ctx.div11_binding(div11);
-    			append_dev(div13, t46);
+    			append_dev(div13, t49);
     			append_dev(div13, div12);
     			if (~current_block_type_index) if_blocks[current_block_type_index].m(div12, null);
     			current = true;
     		},
 
     		p: function update(changed, ctx) {
-    			if ((!current || changed.spritesheetSrc) && t3_value !== (t3_value = ctx.spritesheetSrc ? ctx.spritesheetSrc.file.name : '...' + "")) {
-    				set_data_dev(t3, t3_value);
+    			var modal_changes = {};
+    			if (!updating_visible && changed.modalVisible) {
+    				modal_changes.visible = ctx.modalVisible;
     			}
+    			modal.$set(modal_changes);
 
     			if (!input1_updating && changed.spritesheetSrc) set_input_value(input1, ctx.spritesheetSrc.framecount);
     			input1_updating = false;
@@ -5403,12 +21333,12 @@ var app = (function () {
 
     				let i;
     				for (i = 0; i < each_value_2.length; i += 1) {
-    					const child_ctx = get_each_context_2(ctx, each_value_2, i);
+    					const child_ctx = get_each_context_2$1(ctx, each_value_2, i);
 
     					if (each_blocks_1[i]) {
     						each_blocks_1[i].p(changed, child_ctx);
     					} else {
-    						each_blocks_1[i] = create_each_block_2(child_ctx);
+    						each_blocks_1[i] = create_each_block_2$1(child_ctx);
     						each_blocks_1[i].c();
     						each_blocks_1[i].m(div6, null);
     					}
@@ -5437,14 +21367,17 @@ var app = (function () {
     			if (!updating_editingMode && changed.editingMode) {
     				timeline_changes.editingMode = ctx.editingMode;
     			}
+    			if (!updating_updateStates && changed.updateStates) {
+    				timeline_changes.updateStates = ctx.updateStates;
+    			}
     			timeline.$set(timeline_changes);
 
     			if (!current || changed.mainViewInfo) {
-    				attr_dev(button11, "active", ctx.mainViewInfo);
+    				attr_dev(button12, "active", ctx.mainViewInfo);
     			}
 
-    			if ((!current || changed.mainViewInfo) && button12_active_value !== (button12_active_value = !ctx.mainViewInfo)) {
-    				attr_dev(button12, "active", button12_active_value);
+    			if ((!current || changed.mainViewInfo) && button13_active_value !== (button13_active_value = !ctx.mainViewInfo)) {
+    				attr_dev(button13, "active", button13_active_value);
     			}
 
     			if (current_block_type === (current_block_type = select_block_type(changed, ctx)) && if_block0) {
@@ -5595,6 +21528,10 @@ var app = (function () {
 
     		i: function intro(local) {
     			if (current) return;
+    			transition_in(modal.$$.fragment, local);
+
+    			transition_in(localstoragefs.$$.fragment, local);
+
     			transition_in(timeline.$$.fragment, local);
 
     			transition_in(if_block3);
@@ -5602,13 +21539,24 @@ var app = (function () {
     		},
 
     		o: function outro(local) {
+    			transition_out(modal.$$.fragment, local);
+    			transition_out(localstoragefs.$$.fragment, local);
     			transition_out(timeline.$$.fragment, local);
     			transition_out(if_block3);
     			current = false;
     		},
 
     		d: function destroy(detaching) {
+    			destroy_component(modal, detaching);
+
     			if (detaching) {
+    				detach_dev(t0);
+    			}
+
+    			destroy_component(localstoragefs, detaching);
+
+    			if (detaching) {
+    				detach_dev(t1);
     				detach_dev(div13);
     			}
 
@@ -5627,7 +21575,7 @@ var app = (function () {
     			run_all(dispose);
     		}
     	};
-    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment$2.name, type: "component", source: "", ctx });
+    	dispatch_dev("SvelteRegisterBlock", { block, id: create_fragment$4.name, type: "component", source: "", ctx });
     	return block;
     }
 
@@ -5637,10 +21585,14 @@ var app = (function () {
 
     const mouseup_handler = (evt) => evt.target.dragging = false;
 
-    function instance$2($$self, $$props, $$invalidate) {
-    	window.onbeforeunload = (e) => {
-    		return 'derp';
-    	};
+    function instance$3($$self, $$props, $$invalidate) {
+    	
+
+    	// makes a confirmation dialog appear before closing the window
+    	window.onbeforeunload = (e) => 'derp';
+
+
+    	let modalVisible = true;
 
     	let spritesheetSrc = {
     		file: '...',
@@ -5651,45 +21603,8 @@ var app = (function () {
     		},
     		framecount: 1
     	};
-    	let hurtboxSrc = {
-    		file: '...',
-    		buffer: null
-    	};
-    	let codeFile;
 
-
-    	let char = {
-    		ground_friction: {
-    			value: 1.00,
-    			description: `how fast the character's horizontal speed decreases on the ground`,
-    			type: 'number'
-    		},
-    		air_friction: {
-    			value: 0.07,
-    			description: `how fast the character's horizontal speed decreases in midair`,
-    			type: 'number'
-    		},
-    		gravity_speed: {
-    			value: 0.50,
-    			description: 'how fast the character falls naturally',
-    			type: 'number'
-    		},
-    		sprite_offset_x: {
-    			value: 0,
-    			description: 'sprite offset X location',
-    			type: 'number'
-    		},
-    		sprite_offset_y: {
-    			value: 0,
-    			description: 'sprite offset Y location',
-    			type: 'number'
-    		},
-    		position_locked: {
-    			value: false,
-    			description: `whether or not the character's offset will move in the editor`,
-    			type: [true, false]
-    		}
-    	};
+    	let char = charProps;
     	let windows = [
     		{
     			meta: {
@@ -5748,6 +21663,8 @@ var app = (function () {
     			8.00: [1, 1],
     		},
 
+    		audio: true,
+
     		// calculated
     		duration: 0,
     		spriteFrame: 0,
@@ -5759,7 +21676,7 @@ var app = (function () {
     		
     		xpos: 0,
     		ypos: 0,
-    		charFramePositionData: []
+    		charFramePositionData: [],
     	};
 
     	let calc = {
@@ -5773,25 +21690,67 @@ var app = (function () {
     		aspectRatio: 1
     	};
 
+    	let updateStates = {
+    		length: true,
+    		movement: true,
+    		hitboxes: true,
+    		frames: true,
+    	};
+
+    	const fullUpdate = () => {
+    		$$invalidate('updateStates', updateStates.hitboxes = true, updateStates);
+    		$$invalidate('updateStates', updateStates.movement = true, updateStates);
+    		$$invalidate('updateStates', updateStates.length = true, updateStates);
+    		$$invalidate('updateStates', updateStates.frames = true, updateStates);
+    	};
+
     	const save = () => {
     		store2({
     			anim,
-    			windows,
-    			hitboxes,
+    			windows: strip(windows),
+    			hitboxes: strip(hitboxes),
     			spritesheetSrc,
-    			char,
+    			char: strip(char),
     			atkData,
     		});
     	};
     	const load = () => {
     		let data = store2();
-    		
     		$$invalidate('anim', anim = data.anim);
-    		$$invalidate('windows', windows = data.windows);
+    		$$invalidate('windows', windows = populate(data.windows, winProps));
     		$$invalidate('spritesheetSrc', spritesheetSrc = data.spritesheetSrc);
-    		$$invalidate('char', char = data.char);
-    		$$invalidate('hitboxes', hitboxes = data.hitboxes);
+    		$$invalidate('char', char = populate(data.char, charProps));
+    		$$invalidate('hitboxes', hitboxes = populate(data.hitboxes, hitboxProps));
     		$$invalidate('atkData', atkData = data.atkData);
+    		fullUpdate();
+    	};
+    	const exportWIP = () => {
+    		const fileStream = StreamSaver.createWriteStream('WIP.roab');
+    		const data = (lzString.compressToUint8Array(JSON.stringify({
+    			anim,
+    			windows: strip(windows),
+    			hitboxes: strip(hitboxes),
+    			spritesheetSrc,
+    			char: strip(char),
+    			atkData,
+    		})));
+
+    		new Response(data).body
+    			.pipeTo(fileStream);
+    	};
+    	const loadWIP = async (evt) => {
+    		const file = evt.target.files[0];
+    		const data = new Uint8Array(await file.arrayBuffer());
+    		const d = JSON.parse(lzString.decompressFromUint8Array(data));
+    		
+    		$$invalidate('anim', anim = d.anim);
+    		$$invalidate('windows', windows = populate(d.windows, winProps));
+    		$$invalidate('hitboxes', hitboxes = populate(d.hitboxes, hitboxProps));
+    		$$invalidate('spritesheetSrc', spritesheetSrc = d.spritesheetSrc);
+    		$$invalidate('char', char = populate(d.char, charProps));
+    		$$invalidate('atkData', atkData = d.atkData);
+
+    		fullUpdate();
     	};
 
     	let initGMLCode = 'nothing exported yet';
@@ -5824,6 +21783,7 @@ var app = (function () {
     			let img = new Image();
     			img.onload = function() {
     				$$invalidate('spritesheetSrc', spritesheetSrc.dimensions = {width: this.width, height: this.height}, spritesheetSrc);
+
     			};
     			img.src = fileReader.result;
     		};
@@ -5849,6 +21809,45 @@ var app = (function () {
     		return out;
     	};
 
+    	const keydown_handler = (evt) => {
+    			switch(evt.key) {
+    				case '[':
+    					skipBack();
+    					$$invalidate('updateStates', updateStates.frames = true, updateStates);
+    					break;
+    				case ',':
+    					if (anim.animFrame > 0) $$invalidate('anim', anim.animFrame --, anim);
+    					$$invalidate('updateStates', updateStates.frames = true, updateStates);
+    					break;
+    				case ']':
+    					skipAhead();
+    					$$invalidate('updateStates', updateStates.frames = true, updateStates);
+    					break;
+    				case '.':
+    					if (anim.animFrame < anim.duration - 1) $$invalidate('anim', anim.animFrame ++, anim);
+    					$$invalidate('updateStates', updateStates.frames = true, updateStates);
+    					break;
+    				default: 
+    					for (const t of tools) {
+    						if (t[1] === tools.selected) continue;
+    						else if (t[2] === evt.key) {
+    							$$invalidate('tools', tools.selected = t[1], tools);
+    							break;
+    						}
+    					}
+    			}
+
+    		};
+
+    	function modal_visible_binding(value) {
+    		modalVisible = value;
+    		$$invalidate('modalVisible', modalVisible);
+    	}
+
+    	const close_handler = () => $$invalidate('modalVisible', modalVisible = false);
+
+    	const click_handler = () => $$invalidate('modalVisible', modalVisible = true);
+
     	const change_handler = async (evt) => {$$invalidate('spritesheetSrc', spritesheetSrc.file = evt.target.files[0], spritesheetSrc); processImage(evt.target.files[0]);};
 
     	function input1_input_handler() {
@@ -5856,81 +21855,65 @@ var app = (function () {
     		$$invalidate('spritesheetSrc', spritesheetSrc);
     	}
 
-    	const click_handler = () => $$invalidate('editingMode', editingMode = 'atkData');
+    	const click_handler_1 = () => $$invalidate('editingMode', editingMode = 'atkData');
 
-    	const click_handler_1 = () => $$invalidate('editingMode', editingMode = 'chrData');
+    	const click_handler_2 = () => $$invalidate('editingMode', editingMode = 'chrData');
 
-    	const click_handler_2 = () => $$invalidate('outputBox', outputBox = initGMLCode);
+    	const click_handler_3 = () => $$invalidate('outputBox', outputBox = initGMLCode);
 
-    	const click_handler_3 = () => $$invalidate('outputBox', outputBox = loadGMLCode);
+    	const click_handler_4 = () => $$invalidate('outputBox', outputBox = loadGMLCode);
 
-    	const click_handler_4 = () => $$invalidate('outputBox', outputBox = attackGMLCode);
+    	const click_handler_5 = () => $$invalidate('outputBox', outputBox = attackGMLCode);
 
     	function textarea_input_handler() {
     		outputBox = this.value;
     		$$invalidate('outputBox', outputBox);
     	}
 
-    	const click_handler_5 = () => {
-    					$$invalidate('outputBox', outputBox = JSON.stringify({
-    						anim,
-    						windows,
-    						hitboxes,
-    						spritesheetSrc,
-    						char,
-    						atkData,
-    					}, null, 2));
-    				};
+    	const click_handler_6 = ({ i }) => {$$invalidate('windows', windows[anim.windowIndex].data.AG_WINDOW_ANIM_FRAME_START.value = i, windows);};
 
-    	const click_handler_6 = () => {
-    					let d = JSON.parse(outputBox);
-    					$$invalidate('anim', anim = d.anim);
-    					$$invalidate('windows', windows = d.windows);
-    					$$invalidate('hitboxes', hitboxes = d.hitboxes);
-    					$$invalidate('spritesheetSrc', spritesheetSrc = d.spritesheetSrc);
-    					$$invalidate('char', char = d.char);
-    					$$invalidate('atkData', atkData = d.atkData);
-    				};
-
-    	const click_handler_7 = ({ i }) => {$$invalidate('windows', windows[anim.windowIndex].data.AG_WINDOW_ANIM_FRAME_START.value = i, windows);};
-
-    	function timeline_anim_binding(value) {
-    		anim = value;
-    		$$invalidate('anim', anim), $$invalidate('windows', windows), $$invalidate('char', char), $$invalidate('atkData', atkData), $$invalidate('hitboxes', hitboxes), $$invalidate('spritesheetSrc', spritesheetSrc);
+    	function timeline_anim_binding(value_1) {
+    		anim = value_1;
+    		$$invalidate('anim', anim), $$invalidate('updateStates', updateStates), $$invalidate('windows', windows), $$invalidate('char', char), $$invalidate('atkData', atkData), $$invalidate('hitboxes', hitboxes), $$invalidate('spritesheetSrc', spritesheetSrc);
     	}
 
-    	function timeline_windows_binding(value_1) {
-    		windows = value_1;
+    	function timeline_windows_binding(value_2) {
+    		windows = value_2;
     		$$invalidate('windows', windows);
     	}
 
-    	function timeline_hitboxes_binding(value_2) {
-    		hitboxes = value_2;
+    	function timeline_hitboxes_binding(value_3) {
+    		hitboxes = value_3;
     		$$invalidate('hitboxes', hitboxes);
     	}
 
-    	function timeline_editingMode_binding(value_3) {
-    		editingMode = value_3;
+    	function timeline_editingMode_binding(value_4) {
+    		editingMode = value_4;
     		$$invalidate('editingMode', editingMode);
     	}
 
-    	const click_handler_8 = () => $$invalidate('mainViewInfo', mainViewInfo = true);
+    	function timeline_updateStates_binding(value_5) {
+    		updateStates = value_5;
+    		$$invalidate('updateStates', updateStates), $$invalidate('anim', anim), $$invalidate('windows', windows), $$invalidate('char', char), $$invalidate('atkData', atkData), $$invalidate('hitboxes', hitboxes), $$invalidate('spritesheetSrc', spritesheetSrc);
+    	}
 
-    	const click_handler_9 = () => $$invalidate('mainViewInfo', mainViewInfo = false);
+    	const click_handler_7 = () => $$invalidate('mainViewInfo', mainViewInfo = true);
+
+    	const click_handler_8 = () => $$invalidate('mainViewInfo', mainViewInfo = false);
 
     	function select_change_handler() {
     		anim.zoom = select_value(this);
-    		$$invalidate('anim', anim), $$invalidate('windows', windows), $$invalidate('char', char), $$invalidate('atkData', atkData), $$invalidate('hitboxes', hitboxes), $$invalidate('spritesheetSrc', spritesheetSrc);
+    		$$invalidate('anim', anim), $$invalidate('updateStates', updateStates), $$invalidate('windows', windows), $$invalidate('char', char), $$invalidate('atkData', atkData), $$invalidate('hitboxes', hitboxes), $$invalidate('spritesheetSrc', spritesheetSrc);
     	}
 
     	function input0_input_handler() {
     		anim.zoomGrids[anim.zoom][0] = to_number(this.value);
-    		$$invalidate('anim', anim), $$invalidate('windows', windows), $$invalidate('char', char), $$invalidate('atkData', atkData), $$invalidate('hitboxes', hitboxes), $$invalidate('spritesheetSrc', spritesheetSrc);
+    		$$invalidate('anim', anim), $$invalidate('updateStates', updateStates), $$invalidate('windows', windows), $$invalidate('char', char), $$invalidate('atkData', atkData), $$invalidate('hitboxes', hitboxes), $$invalidate('spritesheetSrc', spritesheetSrc);
     	}
 
     	function input1_input_handler_1() {
     		anim.zoomGrids[anim.zoom][1] = to_number(this.value);
-    		$$invalidate('anim', anim), $$invalidate('windows', windows), $$invalidate('char', char), $$invalidate('atkData', atkData), $$invalidate('hitboxes', hitboxes), $$invalidate('spritesheetSrc', spritesheetSrc);
+    		$$invalidate('anim', anim), $$invalidate('updateStates', updateStates), $$invalidate('windows', windows), $$invalidate('char', char), $$invalidate('atkData', atkData), $$invalidate('hitboxes', hitboxes), $$invalidate('spritesheetSrc', spritesheetSrc);
     	}
 
     	function input2_change_handler() {
@@ -5940,10 +21923,15 @@ var app = (function () {
 
     	function input3_change_handler() {
     		anim.movement = this.checked;
-    		$$invalidate('anim', anim), $$invalidate('windows', windows), $$invalidate('char', char), $$invalidate('atkData', atkData), $$invalidate('hitboxes', hitboxes), $$invalidate('spritesheetSrc', spritesheetSrc);
+    		$$invalidate('anim', anim), $$invalidate('updateStates', updateStates), $$invalidate('windows', windows), $$invalidate('char', char), $$invalidate('atkData', atkData), $$invalidate('hitboxes', hitboxes), $$invalidate('spritesheetSrc', spritesheetSrc);
     	}
 
-    	const click_handler_10 = ({ tool }) => $$invalidate('tools', tools.selected = tool[1], tools);
+    	function input4_change_handler() {
+    		anim.audio = this.checked;
+    		$$invalidate('anim', anim), $$invalidate('updateStates', updateStates), $$invalidate('windows', windows), $$invalidate('char', char), $$invalidate('atkData', atkData), $$invalidate('hitboxes', hitboxes), $$invalidate('spritesheetSrc', spritesheetSrc);
+    	}
+
+    	const click_handler_9 = ({ tool }) => $$invalidate('tools', tools.selected = tool[1], tools);
 
     	const mousemove_handler = (evt) => {
     								if (evt.target.dragging && !char.position_locked.value && tools.selected === "pan") {
@@ -5994,32 +21982,6 @@ var app = (function () {
     		});
     	}
 
-    	const keydown_handler = (evt) => {
-    				switch(evt.key) {
-    					case '[':
-    						skipBack();
-    						break;
-    					case ',':
-    						if (anim.animFrame > 0) $$invalidate('anim', anim.animFrame --, anim);
-    						break;
-    					case ']':
-    						skipAhead();
-    						break;
-    					case '.':
-    						if (anim.animFrame < anim.duration - 1) $$invalidate('anim', anim.animFrame ++, anim);
-    						break;
-    					default: 
-    						for (const t of tools) {
-    							if (t[1] === tools.selected) continue;
-    							else if (t[2] === evt.key) {
-    								$$invalidate('tools', tools.selected = t[1], tools);
-    								break;
-    							}
-    						}
-    				}
-
-    			};
-
     	const mousemove_handler_1 = (evt) => {
     				if (renderer.dragging) {
     					switch(tools.selected) {
@@ -6028,13 +21990,16 @@ var app = (function () {
     								case 'hitbox':
     									$$invalidate('hitboxes', hitboxes[hitboxes.selected].data.HG_HITBOX_X.value += evt.movementX/anim.zoom, hitboxes);
     									$$invalidate('hitboxes', hitboxes[hitboxes.selected].data.HG_HITBOX_Y.value += evt.movementY/anim.zoom, hitboxes);
+    									$$invalidate('updateStates', updateStates.hitboxes = true, updateStates);
     									break;
     								case 'angle-indicator':
     									$$invalidate('hitboxes', hitboxes[hitboxes.selected].data.HG_ANGLE.value = 180 - Math.atan2(renderer.mouseOrigin[1] - evt.pageY, renderer.mouseOrigin[0] - evt.pageX) * 180/Math.PI, hitboxes);
+    									$$invalidate('updateStates', updateStates.hitboxes = true, updateStates);
     									break;
     								case 'resizer':
     									$$invalidate('hitboxes', hitboxes[hitboxes.selected].data.HG_WIDTH.value = Math.ceil(Math.abs((renderer.mouseOrigin[0] - evt.pageX)/anim.zoom)), hitboxes);
     									$$invalidate('hitboxes', hitboxes[hitboxes.selected].data.HG_HEIGHT.value = Math.ceil(Math.abs((renderer.mouseOrigin[1] - evt.pageY)/anim.zoom)), hitboxes);
+    									$$invalidate('updateStates', updateStates.hitboxes = true, updateStates);
     									break;
     								default:
     									$$invalidate('anim', anim.cameraX -= evt.movementX, anim);
@@ -6071,18 +22036,20 @@ var app = (function () {
     					if (tools.selected === 'eraser') {
     						$$invalidate('editingMode', editingMode = 'window');
     						hitboxes.splice(evt.target.getAttributeNS(null, 'data-index'), 1);
-    						$$invalidate('hitboxes', hitboxes.forceUpdate = true, hitboxes);
+    						$$invalidate('updateStates', updateStates.hitboxes = true, updateStates);
     					} else {
     						$$invalidate('editingMode', editingMode = 'hitbox');
     						$$invalidate('hitboxes', hitboxes.selected = parseInt(evt.target.getAttributeNS(null, 'data-index')), hitboxes);
     						const hb = hitboxes[hitboxes.selected];
     						const br = hb.meta.el.getBoundingClientRect();
     						$$invalidate('renderer', renderer.mouseOrigin = [br.left + (br.right - br.left)/2, br.top + (br.bottom - br.top)/2], renderer);
+    						$$invalidate('updateStates', updateStates.hitboxes = true, updateStates);
     					}
 
     				} else {
     					if (renderer.target === "resizer") {
     						$$invalidate('hitboxes', hitboxes.selected = parseInt(evt.target.getAttributeNS(null, 'data-index')), hitboxes);
+    						$$invalidate('updateStates', updateStates.hitboxes = true, updateStates);
     					}
     					$$invalidate('renderer', renderer.mouseOrigin = [evt.pageX, evt.pageY], renderer);
     				}
@@ -6099,15 +22066,17 @@ var app = (function () {
     							case 'hitbox':
     								hb.data.HG_HITBOX_X.value = Math.round(hb.data.HG_HITBOX_X.value);
     								hb.data.HG_HITBOX_Y.value = Math.round(hb.data.HG_HITBOX_Y.value);
+    								$$invalidate('updateStates', updateStates.hitboxes = true, updateStates);
     								break;
     							case 'angle-indicator':
     								hb.data.HG_ANGLE.value = Math.round(hb.data.HG_ANGLE.value);
+    								$$invalidate('updateStates', updateStates.hitboxes = true, updateStates);
     								break;
     							case 'resizer':
     								if (hb.data.HG_WIDTH.value === 0 || hb.data.HG_HEIGHT.value === 0) {
     									$$invalidate('editingMode', editingMode = 'window');
     									hitboxes.splice(hitboxes.selected, 1);
-    									$$invalidate('hitboxes', hitboxes.forceUpdate = true, hitboxes);
+    									$$invalidate('updateStates', updateStates.hitboxes = true, updateStates);
     								}
     							default:
     								break;
@@ -6128,6 +22097,7 @@ var app = (function () {
     						attributes.HG_WINDOW_CREATION_FRAME.value = anim.windowFrame;
     						hitboxes.push({meta: {color: '#f008', stroke: '#fFF8', strokeWidth: 0.5, el: null}, data: attributes});
     						$$invalidate('hitboxes', hitboxes.selected = hitboxes.length - 1, hitboxes);
+    						$$invalidate('updateStates', updateStates.hitboxes = true, updateStates);
     						$$invalidate('editingMode', editingMode = 'hitbox');
     						break;
     				}
@@ -6138,29 +22108,36 @@ var app = (function () {
     		$$invalidate('windows', windows);
     	}
 
+    	const dataChanged_handler = () => {$$invalidate('updateStates', updateStates.length = true, updateStates); $$invalidate('updateStates', updateStates.movement = true, updateStates); $$invalidate('updateStates', updateStates.frames = true, updateStates);};
+
     	function paramsbuilder_props_binding_1(value) {
     		hitboxes[hitboxes.selected].data = value;
     		$$invalidate('hitboxes', hitboxes);
     	}
+
+    	const dataChanged_handler_1 = () => $$invalidate('updateStates', updateStates.hitboxes = true, updateStates);
 
     	function paramsbuilder_props_binding_2(value) {
     		atkData = value;
     		$$invalidate('atkData', atkData);
     	}
 
+    	const dataChanged_handler_2 = () => $$invalidate('updateStates', updateStates.movement = true, updateStates);
+
     	function paramsbuilder_props_binding_3(value) {
     		char = value;
     		$$invalidate('char', char);
     	}
+
+    	const dataChanged_handler_3 = () => $$invalidate('updateStates', updateStates.movement = true, updateStates);
 
     	$$self.$capture_state = () => {
     		return {};
     	};
 
     	$$self.$inject_state = $$props => {
+    		if ('modalVisible' in $$props) $$invalidate('modalVisible', modalVisible = $$props.modalVisible);
     		if ('spritesheetSrc' in $$props) $$invalidate('spritesheetSrc', spritesheetSrc = $$props.spritesheetSrc);
-    		if ('hurtboxSrc' in $$props) hurtboxSrc = $$props.hurtboxSrc;
-    		if ('codeFile' in $$props) codeFile = $$props.codeFile;
     		if ('char' in $$props) $$invalidate('char', char = $$props.char);
     		if ('windows' in $$props) $$invalidate('windows', windows = $$props.windows);
     		if ('hitboxes' in $$props) $$invalidate('hitboxes', hitboxes = $$props.hitboxes);
@@ -6173,23 +22150,30 @@ var app = (function () {
     		if ('rend' in $$props) $$invalidate('rend', rend = $$props.rend);
     		if ('anim' in $$props) $$invalidate('anim', anim = $$props.anim);
     		if ('calc' in $$props) $$invalidate('calc', calc = $$props.calc);
+    		if ('updateStates' in $$props) $$invalidate('updateStates', updateStates = $$props.updateStates);
     		if ('initGMLCode' in $$props) $$invalidate('initGMLCode', initGMLCode = $$props.initGMLCode);
     		if ('loadGMLCode' in $$props) $$invalidate('loadGMLCode', loadGMLCode = $$props.loadGMLCode);
     		if ('attackGMLCode' in $$props) $$invalidate('attackGMLCode', attackGMLCode = $$props.attackGMLCode);
     		if ('outputBox' in $$props) $$invalidate('outputBox', outputBox = $$props.outputBox);
     	};
 
-    	$$self.$$.update = ($$dirty = { renderer: 1, windows: 1, anim: 1, char: 1, atkData: 1, hitboxes: 1, spritesheetSrc: 1, calc: 1, rend: 1 }) => {
+    	$$self.$$.update = ($$dirty = { renderer: 1, updateStates: 1, anim: 1, windows: 1, char: 1, atkData: 1, hitboxes: 1, spritesheetSrc: 1, calc: 1, rend: 1 }) => {
     		if ($$dirty.renderer) { $$invalidate('rend', rend = (renderer) ? renderer : {}); }
-    		if ($$dirty.windows || $$dirty.anim) { $$invalidate('anim', anim.duration = windows.reduce((acc, win, i) => {
-    				// gets position of window in frames
-    				if (anim.windowPositions.length !== i) $$invalidate('anim', anim.windowPositions[i] = acc, anim);
-    				else anim.windowPositions.push(acc);
+    		if ($$dirty.updateStates || $$dirty.anim || $$dirty.windows) { if (updateStates.length) {
+    				$$invalidate('updateStates', updateStates.length = false, updateStates);
+    				let temp = anim.duration;
+    				$$invalidate('anim', anim.duration = windows.reduce((acc, win, i) => {
+    					// gets position of window in frames
+    					if (anim.windowPositions.length !== i) $$invalidate('anim', anim.windowPositions[i] = acc, anim);
+    					else anim.windowPositions.push(acc);
     		
-    				// actually calculates the duration		
-    				return acc + (win.data.AG_WINDOW_LENGTH.value || 1)
-    			} , 0), anim); }
-    		if ($$dirty.anim || $$dirty.windows || $$dirty.char || $$dirty.atkData) { if (anim.movement) {
+    					// actually calculates the duration		
+    					return acc + (win.data.AG_WINDOW_LENGTH.value || 1)
+    				} , 0), anim);
+    				if (temp !== anim.duration) $$invalidate('updateStates', updateStates.movement = true, updateStates);
+    			} }
+    		if ($$dirty.anim || $$dirty.updateStates || $$dirty.windows || $$dirty.char || $$dirty.atkData) { if (anim.movement && updateStates.movement) {
+    				$$invalidate('updateStates', updateStates.movement = false, updateStates);
     				let prevData = {xvel: 0, yvel: 0, xpos: 0, ypos: 0};
     				for (const [windex, win] of windows.entries()) {
     					let data = win.data;
@@ -6287,7 +22271,8 @@ var app = (function () {
     					prevData = movementData[movementData.length - 1];
     				}
     			} }
-    		if ($$dirty.hitboxes || $$dirty.anim) { {
+    		if ($$dirty.updateStates || $$dirty.hitboxes || $$dirty.anim) { if (updateStates.hitboxes) {
+    				$$invalidate('updateStates', updateStates.hitboxes = false, updateStates);
     				$$invalidate('anim', anim.hitboxFrames = {}, anim);
     				for (const [index, hb] of hitboxes.entries()) {
     					const frame = anim.windowPositions[hb.data.HG_WINDOW.value] + hb.data.HG_WINDOW_CREATION_FRAME.value;
@@ -6298,13 +22283,14 @@ var app = (function () {
     					}
     				}
     			} }
-    		if ($$dirty.anim || $$dirty.windows || $$dirty.spritesheetSrc) { {
+    		if ($$dirty.updateStates || $$dirty.anim || $$dirty.windows || $$dirty.spritesheetSrc) { if (updateStates.frames) {
+    				$$invalidate('updateStates', updateStates.frames = false, updateStates);
     				if (anim.animFrame >= anim.duration) $$invalidate('anim', anim.animFrame = anim.windowPositions[anim.windowIndex], anim);
     				let tracker = anim.animFrame;
     				for (const [i, win] of windows.entries()) {
     					tracker -= win.data.AG_WINDOW_LENGTH.value;
     					if (tracker <= 0) {
-    						if (tracker === 0) {
+    						if (tracker === 0 && anim.duration !== 1) {
     							$$invalidate('anim', anim.windowIndex = i + 1, anim);
     							$$invalidate('anim', anim.windowFrame = 0, anim);
     							break;
@@ -6324,6 +22310,15 @@ var app = (function () {
     					$$invalidate('anim', anim.xpos = 0, anim);
     					$$invalidate('anim', anim.ypos = 0, anim);
     				}
+    		
+    				if (anim.audio) {
+    					const path = (win.AG_WINDOW_SFX.options.includes(win.AG_WINDOW_SFX.value)) ?
+    					`./sounds/${win.AG_WINDOW_SFX.value}` : '';
+    					if (path !== '' && win.AG_WINDOW_SFX_FRAME.value === anim.windowFrame) {
+    						let thing = new Audio(path);
+    						thing.play();
+    					}
+    				}
     			} }
     		if ($$dirty.spritesheetSrc || $$dirty.anim || $$dirty.calc || $$dirty.char || $$dirty.rend) { {
     				$$invalidate('calc', calc.frameWidth = spritesheetSrc.dimensions.width / spritesheetSrc.framecount, calc);
@@ -6341,6 +22336,7 @@ var app = (function () {
     	};
 
     	return {
+    		modalVisible,
     		spritesheetSrc,
     		char,
     		windows,
@@ -6354,8 +22350,11 @@ var app = (function () {
     		rend,
     		anim,
     		calc,
+    		updateStates,
     		save,
     		load,
+    		exportWIP,
+    		loadWIP,
     		initGMLCode,
     		loadGMLCode,
     		attackGMLCode,
@@ -6368,29 +22367,33 @@ var app = (function () {
     		JSON,
     		Array,
     		Math,
+    		keydown_handler,
+    		modal_visible_binding,
+    		close_handler,
+    		click_handler,
     		change_handler,
     		input1_input_handler,
-    		click_handler,
     		click_handler_1,
     		click_handler_2,
     		click_handler_3,
     		click_handler_4,
-    		textarea_input_handler,
     		click_handler_5,
+    		textarea_input_handler,
     		click_handler_6,
-    		click_handler_7,
     		timeline_anim_binding,
     		timeline_windows_binding,
     		timeline_hitboxes_binding,
     		timeline_editingMode_binding,
+    		timeline_updateStates_binding,
+    		click_handler_7,
     		click_handler_8,
-    		click_handler_9,
     		select_change_handler,
     		input0_input_handler,
     		input1_input_handler_1,
     		input2_change_handler,
     		input3_change_handler,
-    		click_handler_10,
+    		input4_change_handler,
+    		click_handler_9,
     		mousemove_handler,
     		ellipse_binding,
     		rect_binding,
@@ -6398,22 +22401,25 @@ var app = (function () {
     		ellipse_binding_1,
     		rect_binding_2,
     		div11_binding,
-    		keydown_handler,
     		mousemove_handler_1,
     		mousedown_handler_1,
     		mouseup_handler_1,
     		paramsbuilder_props_binding,
+    		dataChanged_handler,
     		paramsbuilder_props_binding_1,
+    		dataChanged_handler_1,
     		paramsbuilder_props_binding_2,
-    		paramsbuilder_props_binding_3
+    		dataChanged_handler_2,
+    		paramsbuilder_props_binding_3,
+    		dataChanged_handler_3
     	};
     }
 
     class App extends SvelteComponentDev {
     	constructor(options) {
     		super(options);
-    		init(this, options, instance$2, create_fragment$2, safe_not_equal, []);
-    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "App", options, id: create_fragment$2.name });
+    		init(this, options, instance$3, create_fragment$4, safe_not_equal, []);
+    		dispatch_dev("SvelteRegisterComponent", { component: this, tagName: "App", options, id: create_fragment$4.name });
     	}
     }
 
