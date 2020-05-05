@@ -1,165 +1,240 @@
-<!doctype html><html dir="ltr" lang="en"><head> <meta charset="utf-8"> <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=5.0"> <title>Stencil Component Starter</title> <link rel="modulepreload" href="/build/p-ce235454.js"><link rel="modulepreload" href="/build/p-fd7d85a7.entry.js"><script type="module" data-resources-url="/build/" data-stencil-namespace="fudgeapps">import{p as e,b as i}from"/build/p-ce235454.js";e().then(e=>i([["p-fd7d85a7",[[0,"fudge-hex-editor",{displayAscii:[4,"display-ascii"],displayHex:[4,"display-hex"],displayBin:[4,"display-bin"],maxLines:[2,"max-lines"],bytesPerLine:[2,"bytes-per-line"],chunks:[16],displayAsChunks:[4,"display-as-chunks"],asciiInline:[4,"ascii-inline"],bytesPerGroup:[2,"bytes-per-group"],bitsPerGroup:[2,"bits-per-group"],mode:[1],editType:[1,"edit-type"],regionDepth:[2,"region-depth"],regions:[16],fileMetadata:[32],file:[32],lineNumber:[32],selection:[32],cursor:[32],bit:[32],editingMode:[32],searchType:[32],searchByteCount:[32],searchEndian:[32],searchInput:[32],searchResults:[32],searchActive:[32],acceptFile:[64],saveFile:[64],setLineNumber:[64],setCursorPosition:[64],setSelection:[64],getChunk:[64],getFileMetadata:[64],executeSearch:[64]}],[0,"fudge-hex-tooltip",{active:[4],data:[1,"complex"],simpleText:[1,"simple"]}]]]],e));</script> <script nomodule="" src="/build/fudgeapps.js"></script> <link href="https://fonts.googleapis.com/css?family=Open+Sans&amp;display=swap" rel="stylesheet"> <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.4.5/ace.js"></script> --> <script src="https://unpkg.com/jsoneditor@6.0.0/dist/jsoneditor.min.js"></script> <link href="https://unpkg.com/jsoneditor@6.0.0/dist/jsoneditor.min.css" rel="stylesheet"> <style>/* afaik this does need to be hardcoded here lol */
-  body {
-    height: 100vh;
-    width: 100vw;
+<!doctype html>
+<html dir="ltr" lang="en">
 
-    position: relative;
-    display: grid;
-    grid-auto-rows: 100%;
-    grid-template-columns: 350px auto;
-    overflow: scroll;
-  }
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=5.0">
+  <title>fudgedit</title>
+  <link rel="modulepreload" href="/build/p-ce235454.js">
+  <link rel="modulepreload" href="/build/p-fd7d85a7.entry.js">
+  <script type="module" data-resources-url="/build/" data-stencil-namespace="fudgeapps">
+    import{p as e,b as i}from"/build/p-ce235454.js";e().then(e=>i([["p-fd7d85a7",[[0,"fudge-hex-editor",{displayAscii:[4,"display-ascii"],displayHex:[4,"display-hex"],displayBin:[4,"display-bin"],maxLines:[2,"max-lines"],bytesPerLine:[2,"bytes-per-line"],chunks:[16],displayAsChunks:[4,"display-as-chunks"],asciiInline:[4,"ascii-inline"],bytesPerGroup:[2,"bytes-per-group"],bitsPerGroup:[2,"bits-per-group"],mode:[1],editType:[1,"edit-type"],regionDepth:[2,"region-depth"],regions:[16],fileMetadata:[32],file:[32],lineNumber:[32],selection:[32],cursor:[32],bit:[32],editingMode:[32],searchType:[32],searchByteCount:[32],searchEndian:[32],searchInput:[32],searchResults:[32],searchActive:[32],acceptFile:[64],saveFile:[64],setLineNumber:[64],setCursorPosition:[64],setSelection:[64],getChunk:[64],getFileMetadata:[64],executeSearch:[64]}],[0,"fudge-hex-tooltip",{active:[4],data:[1,"complex"],simpleText:[1,"simple"]}]]]],e));
+  </script>
+  <script nomodule="" src="/build/fudgeapps.js"></script>
+  <link href="https://fonts.googleapis.com/css?family=Open+Sans&amp;display=swap" rel="stylesheet">
+  <!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.4.5/ace.js"></script> -->
+  <script src="https://unpkg.com/jsoneditor@6.0.0/dist/jsoneditor.min.js"></script>
+  <link href="https://unpkg.com/jsoneditor@6.0.0/dist/jsoneditor.min.css" rel="stylesheet">
+  <style>
+    /* afaik this does need to be hardcoded here lol */
+    body {
+      height: 100vh;
+      width: 100vw;
 
-  #parameters {
-    position: relative;
-    height: 100%;
-    padding: 10px;
-    font-family: 'open sans', sans-serif;
-
-    box-shadow: 2px 0 2px black;
-  }
-
-  #parameters .controls {
-    display: grid;
-    grid-auto-rows: 40px;
-    grid-template-columns: 50% 50%;
-    align-items: center;
-    padding: 0px 20px;
-  }
-
-  #parameters .controls > *:not(button):nth-child(2n+1) {
-    justify-self: right;
-    padding-right: 15px;
-  }
-
-  #parameters .controls > input {
-    height: 20px;
-    border-radius: 5px;
-    border: 1px solid black;
-  }
-
-  #parameters .controls > input[type='file'] {
-    display: none;
-  }
-
-  #parameters .controls > button {
-    grid-column-start: span 2;
-    justify-self: right;
-    height: 20px;
-    width: 50%;
-    border-radius: 5px;
-    border: 1px solid black;
-  }
-
-  #regionEditor {
-    position: absolute;
-    right: 0;
-    height: 100%;
-    width: 400px;
-  }
-
-  #showcase {
-    height: 100%;
-
-    display: flex;
-    justify-content: left;
-    align-items: center;
-
-    overflow: scroll;
-  }
-
-  #credit {
-    position: fixed;
-    bottom: 0;
-    left: 0;
-
-    width: 330px;
-    height: 100px;
-    color: white;
-    background-color: black;
-    padding: 10px;
-  }
-
-  a {
-    color: white;
-  }</style> </head> <body style="margin: 0;"> <div id="parameters"> <h3>Parameters:</h3> <div id="credit"> Created by Dominick Reba <br> <a href="https://twitter.com/fudgepop01">@fudgepop01</a> <br> like what you see? Check out what I can do with <a href="https://svelte.dev/">Sveltejs</a> here: <a href="./RoABox/">[RoABox by fudgepop01]</a> </div> <div class="controls"> <label for="maxlines">max lines:</label> <input type="number" name="maxlines" id="maxlines" value="30" onchange="document.getElementById('editor').setAttribute('max-lines', event.target.value)"> <label for="bytesPerLine">bytes per line:</label> <input type="number" name="bytesPerLine" id="bytesPerLine" value="4" onchange="document.getElementById('editor').setAttribute('bytes-per-line', event.target.value)"> <label for="bytesPerGroup">bytes per group:</label> <input type="number" name="bytesPerGroup" id="bytesPerGroup" value="4" onchange="document.getElementById('editor').setAttribute('bytes-per-group', event.target.value)"> <label for="bitsPerGroup">bits per group:</label> <input type="number" name="bitsPerGroup" id="bitsPerGroup" value="4" onchange="document.getElementById('editor').setAttribute('bits-per-group', event.target.value)"> <label for="asciiInline">ascii inline?:</label> <input type="number" name="asciiInline" id="asciiInline" value="0" min="0" max="1" onchange="document.getElementById('editor').setAttribute('ascii-inline', event.target.value === '1')"> <label for="displayBin">display binary?:</label> <input type="number" name="displayBin" id="displayBin" value="1" min="0" max="1" onchange="document.getElementById('editor').setAttribute('display-bin', event.target.value === '1')"> <label for="displayHex">display hex?:</label> <input type="number" name="displayHex" id="displayHex" value="1" min="0" max="1" onchange="document.getElementById('editor').setAttribute('display-hex', event.target.value === '1')"> <label for="displayAscii">display ascii?:</label> <input type="number" name="displayAscii" id="displayAscii" value="1" min="0" max="1" onchange="document.getElementById('editor').setAttribute('display-ascii', event.target.value === '1')"> <label for="regionDepth">region depth:</label> <input type="number" name="regionDepth" id="regionDepth" value="2" onchange="document.getElementById('editor').setAttribute('region-depth', event.target.value)"> <label for="mode">mode:</label> <select id="mode" onchange="document.getElementById('editor').setAttribute('mode', event.target.value)"> <option value="region" selected="">region</option> <option value="select">select</option> <option value="noregion">no region</option> </select> <label for="editType">edit type:</label> <select id="editType" onchange="document.getElementById('editor').setAttribute('edit-type', event.target.value)"> <option value="insert">insert</option> <option value="overwrite" selected="">overwrite</option> <option value="readonly">read-only</option> </select> <label for="displayChunks">display as chunks?:</label> <input type="number" name="displayChunks" id="displayChunks" value="1" min="0" max="1" onchange="document.getElementById('editor').setAttribute('display-as-chunks', event.target.value === '1')"> <input type="file" name="uploadFile" id="uploadFile" onchange="document.getElementById('editor').acceptFile(this.files[0])"> <button onclick="document.getElementById('uploadFile').click()">upload</button> <!-- <button onclick="console.log(document.getElementById('editor').saveFile())">save</button> --> </div> </div> <div id="showcase"> <fudge-hex-tooltip id="tooltip"></fudge-hex-tooltip> <fudge-hex-editor id="editor" mode="region" bytes-per-line="4" edit-type="overwrite" display-bin="true"></fudge-hex-editor> </div> <div id="regionEditor"></div> <script>let container = document.getElementById("regionEditor");
-  let options = {
-    onChange() {
-      const jsonEditorData = editor.get();
-      document.getElementById("editor").regions = jsonEditorData.regions;
-      document.getElementById("editor").chunks = jsonEditorData.chunks;
+      position: relative;
+      display: grid;
+      grid-auto-rows: 100%;
+      grid-template-columns: 350px auto;
+      overflow: scroll;
     }
-  };
-  let editor = new JSONEditor(container, options);
 
-  let regions = [
-    {
-      start: 0x0,
-      end: 0x10,
-      name: 'outer layer w/ children',
-      subRegions: [{
+    #parameters {
+      position: relative;
+      height: 100%;
+      padding: 10px;
+      font-family: 'open sans', sans-serif;
+
+      box-shadow: 2px 0 2px black;
+    }
+
+    #parameters .controls {
+      display: grid;
+      grid-auto-rows: 40px;
+      grid-template-columns: 50% 50%;
+      align-items: center;
+      padding: 0px 20px;
+    }
+
+    #parameters .controls>*:not(button):nth-child(2n+1) {
+      justify-self: right;
+      padding-right: 15px;
+    }
+
+    #parameters .controls>input {
+      height: 20px;
+      border-radius: 5px;
+      border: 1px solid black;
+    }
+
+    #parameters .controls>input[type='file'] {
+      display: none;
+    }
+
+    #parameters .controls>button {
+      grid-column-start: span 2;
+      justify-self: right;
+      height: 20px;
+      width: 50%;
+      border-radius: 5px;
+      border: 1px solid black;
+    }
+
+    #regionEditor {
+      position: absolute;
+      right: 0;
+      height: 100%;
+      width: 400px;
+    }
+
+    #showcase {
+      height: 100%;
+
+      display: flex;
+      justify-content: left;
+      align-items: center;
+
+      overflow: scroll;
+    }
+
+    #credit {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+
+      width: 330px;
+      height: 100px;
+      color: white;
+      background-color: black;
+      padding: 10px;
+    }
+
+    a {
+      color: white;
+    }
+  </style>
+</head>
+
+<body style="margin: 0;">
+  <div id="parameters">
+    <h3>Parameters:</h3>
+    <div id="credit"> Created by Dominick Reba <br> <a href="https://twitter.com/fudgepop01">@fudgepop01</a> <br> like
+      what you see? Check out what I can do with <a href="https://svelte.dev/">Sveltejs</a> here: <a
+        href="./RoABox/">[RoABox by fudgepop01]</a> </div>
+    <div class="controls"> <label for="maxlines">max lines:</label> <input type="number" name="maxlines" id="maxlines"
+        value="30" onchange="document.getElementById('editor').setAttribute('max-lines', event.target.value)"> <label
+        for="bytesPerLine">bytes per line:</label> <input type="number" name="bytesPerLine" id="bytesPerLine" value="4"
+        onchange="document.getElementById('editor').setAttribute('bytes-per-line', event.target.value)"> <label
+        for="bytesPerGroup">bytes per group:</label> <input type="number" name="bytesPerGroup" id="bytesPerGroup"
+        value="4" onchange="document.getElementById('editor').setAttribute('bytes-per-group', event.target.value)">
+      <label for="bitsPerGroup">bits per group:</label> <input type="number" name="bitsPerGroup" id="bitsPerGroup"
+        value="4" onchange="document.getElementById('editor').setAttribute('bits-per-group', event.target.value)">
+      <label for="asciiInline">ascii inline?:</label> <input type="number" name="asciiInline" id="asciiInline" value="0"
+        min="0" max="1"
+        onchange="document.getElementById('editor').setAttribute('ascii-inline', event.target.value === '1')"> <label
+        for="displayBin">display binary?:</label> <input type="number" name="displayBin" id="displayBin" value="1"
+        min="0" max="1"
+        onchange="document.getElementById('editor').setAttribute('display-bin', event.target.value === '1')"> <label
+        for="displayHex">display hex?:</label> <input type="number" name="displayHex" id="displayHex" value="1" min="0"
+        max="1" onchange="document.getElementById('editor').setAttribute('display-hex', event.target.value === '1')">
+      <label for="displayAscii">display ascii?:</label> <input type="number" name="displayAscii" id="displayAscii"
+        value="1" min="0" max="1"
+        onchange="document.getElementById('editor').setAttribute('display-ascii', event.target.value === '1')"> <label
+        for="regionDepth">region depth:</label> <input type="number" name="regionDepth" id="regionDepth" value="2"
+        onchange="document.getElementById('editor').setAttribute('region-depth', event.target.value)"> <label
+        for="mode">mode:</label> <select id="mode"
+        onchange="document.getElementById('editor').setAttribute('mode', event.target.value)">
+        <option value="region" selected="">region</option>
+        <option value="select">select</option>
+        <option value="noregion">no region</option>
+      </select> <label for="editType">edit type:</label> <select id="editType"
+        onchange="document.getElementById('editor').setAttribute('edit-type', event.target.value)">
+        <option value="insert">insert</option>
+        <option value="overwrite" selected="">overwrite</option>
+        <option value="readonly">read-only</option>
+      </select> <label for="displayChunks">display chunks?:</label> <input type="number" name="displayChunks"
+        id="displayChunks" value="0" min="0" max="1"
+        onchange="document.getElementById('editor').setAttribute('display-as-chunks', event.target.value === '1')">
+      <input type="file" name="uploadFile" id="uploadFile"
+        onchange="document.getElementById('editor').acceptFile(this.files[0])"> <button
+        onclick="document.getElementById('uploadFile').click()">upload</button>
+      <!-- <button onclick="console.log(document.getElementById('editor').saveFile())">save</button> -->
+    </div>
+  </div>
+  <div id="showcase">
+    <fudge-hex-tooltip id="tooltip"></fudge-hex-tooltip>
+    <fudge-hex-editor id="editor" mode="region" bytes-per-line="4" edit-type="overwrite" display-bin="true">
+    </fudge-hex-editor>
+  </div>
+  <div id="regionEditor"></div>
+  <script>
+    let container = document.getElementById("regionEditor");
+    let options = {
+      onChange() {
+        const jsonEditorData = editor.get();
+        document.getElementById("editor").regions = jsonEditorData.regions;
+        document.getElementById("editor").chunks = jsonEditorData.chunks;
+      }
+    };
+    let editor = new JSONEditor(container, options);
+
+    let regions = [{
         start: 0x0,
-        end: 0x5,
-        name: '2nd-level child 1',
+        end: 0x10,
+        name: 'outer layer w/ children',
         subRegions: [{
-          start: 0x1,
-          end: 0x4,
-          name: '3rd-level child',
+          start: 0x0,
+          end: 0x5,
+          name: '2nd-level child 1',
           subRegions: [{
-            start: 0x2,
-            end: 0x3,
-            name: '4th-level child'
+            start: 0x1,
+            end: 0x4,
+            name: '3rd-level child',
+            subRegions: [{
+              start: 0x2,
+              end: 0x3,
+              name: '4th-level child'
+            }]
           }]
+        }, {
+          start: 0x8,
+          end: 0x10,
+          name: '2nd-level child 2'
         }]
       }, {
-        start: 0x8,
-        end: 0x10,
-        name: '2nd-level child 2'
-      }]
-    }, {
-      start: 0x10,
-      end: 0x14,
-      name: '2nd outer layer'
-    },
-    {
-      start: 26,
-      end: 60,
-      subRegions: [
-        {
+        start: 0x10,
+        end: 0x14,
+        name: '2nd outer layer'
+      },
+      {
+        start: 26,
+        end: 60,
+        subRegions: [{
           start: 28,
           end: 50
-        }
-      ]
-    },
-    {
-      start: 65,
-      end: 140
-    }
-  ];
-  document.getElementById("editor").regions = regions;
+        }]
+      },
+      {
+        start: 65,
+        end: 140
+      }
+    ];
+    document.getElementById("editor").regions = regions;
 
-  let chunks = [
-    {
-      start: 0,
-      end: 30
-    },
-    {
-      start: 42,
-      end: 69
-    },
-    {
-      start: 100,
-      end: 200
-    },
-    {
-      start: 256,
-      end: 300
-    }
-  ]
-  document.getElementById("editor").chunks = chunks;
-  document.getElementById("editor").displayAsChunks = false;
+    let chunks = [{
+        start: 0,
+        end: 30
+      },
+      {
+        start: 42,
+        end: 69
+      },
+      {
+        start: 100,
+        end: 200
+      },
+      {
+        start: 256,
+        end: 300
+      }
+    ]
+    document.getElementById("editor").chunks = chunks;
+    document.getElementById("editor").displayAsChunks = false;
 
-  editor.set({
-    regions: regions,
-    chunks: chunks
-  });</script> </body></html>
+    editor.set({
+      regions: regions,
+      chunks: chunks
+    });
+  </script>
+</body>
+
+</html>
