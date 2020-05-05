@@ -136,7 +136,7 @@
       end: 140
     }
   ];
-  document.getElementById("editor").regions = json;
+  document.getElementById("editor").regions = regions;
 
   let chunks = [
     {
@@ -160,6 +160,6 @@
   document.getElementById("editor").displayAsChunks = false;
 
   editor.set({
-    regions,
-    chunks
+    regions: regions,
+    chunks: chunks
   });</script> </body></html>
