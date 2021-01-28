@@ -70,7 +70,7 @@ let string1 = "myString";
 let string2 = "myString";
 
 /// displays true
-console.log(sym1 === sym2);
+console.log(string1 === string2);
 ```
 
 will display "true".
