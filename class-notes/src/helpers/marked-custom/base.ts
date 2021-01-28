@@ -51,10 +51,10 @@ export const rendererFactory = (
       } else if (href.startsWith("#")) {
         // @ts-ignore
         return `<a href="${window.location.origin}${window.location.pathname}?page=${localStorage.getItem("lastPage")}&location=${new Slugger().slug(href.substr(1), {dryrun: true})}">${text}</a>`
-      } else if (href.includes("localhost") || href.includes("brawlre.github.io")) {
+      } else if (href.includes("localhost") || href.includes("fudgepop01.github.io")) {
         const targetPage = (new URLSearchParams(href.substring(href.indexOf("?")))).get("page");
         if (pages.includes(targetPage))
-          return `<a href="${window.location.origin}${window.location.pathname}${href.replace(/https?:\/\/(?:localhost:\d{4}|brawlre\.github\.io)/g, "")}">${text}</a>`;
+          return `<a href="${window.location.origin}${window.location.pathname}${href.replace(/https?:\/\/(?:localhost:\d{4}|fudgepop01\.github\.io)/g, "")}">${text}</a>`;
         else
           return `<span class="invalid-link" data-targetpage="${targetPage}">${text}</span>`;
       }
@@ -66,9 +66,9 @@ export const rendererFactory = (
       console.log(href, title, text);
       if (text === "SCRIPT") {
         if (window.location.hostname === "localhost") {
-          pageScripts = [...pageScripts, `${window.location.origin}${window.location.pathname}docs/${href.substring(1)}.js`];
-        } else if (window.location.origin === "https://brawlre.github.io") {
-          pageScripts = [...pageScripts, `https://raw.githubusercontent.com/BrawlRE/BrawlRE.github.io/main/public/docs/${href.substring(1)}.js`];
+          pageScripts = [...pageScripts, `${window.location.origin}${window.location.pathname}pages/${href.substring(1)}.js`];
+        } else if (window.location.origin === "https://fudgepop01.github.io") {
+          pageScripts = [...pageScripts, `https://raw.githubusercontent.com/fudgepop01/fudgepop01.github.io/class-notes/public/pages/${href.substring(1)}.js`];
         }
         return '';
       }
