@@ -1,0 +1,12 @@
+? this is where the directory is defined
+? comments do NOT-YET exist at the end of lines
+? lines and filenames that start with "? " are comments and get ignored
+? to clarify, that is a question mark (?) followed by a space ( )
+
+? start a folder name with "?c " to make it show up as collapsed
+
+ISTE-330/
+  Day 1
+  Day 2
+index
+changelog
