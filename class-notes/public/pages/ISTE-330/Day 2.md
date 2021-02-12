@@ -70,7 +70,7 @@ let string1 = "myString";
 let string2 = "myString";
 
 /// displays true
-console.log(sym1 === sym2);
+console.log(string1 === string2);
 ```
 
 will display "true".
@@ -81,7 +81,28 @@ For more information on Symbols, here are the MDN web docs: https://developer.mo
 
 In javascript, if something is not a primitive then it is an Object, and will return as such with the `typeof` operator. 
 
-**This includes Arrays.**
+**THIS INCLUDES ARRAYS**
 
-## I'm mentally exhausted from coding and writing this stuff so that's all for today but i'll be updating this day (Day 2) tomorrow
+```js-interactive
+let myObject = {
+  firstName: "Bill",
+  lastName: "Nye",
+  title: "Science Guy"
+};
+let myArray = [1, 1, 2, 3, 5, 8];
+
+/// both of these will be "object"
+console.log(typeof myObject);
+console.log(typeof myArray);
+
+/// note: to test if something is an array, use Array.isArray()
+console.log(Array.isArray(myObject));
+console.log(Array.isArray(myArray));
+```
+
+Objects have properties whereas primitives do not. What primitives *do* have are "prototypes," which brings us to:
+
+## Objects vs Classes in Object Oriented Languages
+
+a "prototype" is like a shared 
 
