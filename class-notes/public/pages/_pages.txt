@@ -8,5 +8,8 @@
 ISTE-330/
   Day 1
   Day 2
+LuxxHelp/
+  Arrays and Loops
+  Arrow Functions
 index
 changelog
