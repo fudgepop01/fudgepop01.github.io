@@ -1,0 +1,102 @@
+? this is where the directory is defined
+? comments do NOT-YET exist at the end of lines
+? lines and filenames that start with "? " are comments and get ignored
+? to clarify, that is a question mark (?) followed by a space ( )
+
+? start a folder name with "?c " to make it show up as collapsed
+
+? Contributions/
+?c Projects/
+  ?c 2015/
+    Smashladder CSS
+  ?c 2017/
+    Floofy-Bot
+    basicDungeonCrawler
+    PMData
+  ?c 2018/
+    GCC Display
+    node-brawllib
+    bitdef
+  ?c 2019/
+    Basic-Snake-Game
+    EHMain/
+      About
+      README
+?c TODO/
+  ?c Projects/
+    ?c 2019/
+      kaitai_struct_webide
+      sbud
+      cassowary-ts
+      albert
+      kaitai_struct_compiler
+      kaitai_struct
+      kaitai_struct_doc
+      Ksy-Schema
+      kaitai_struct_webide_webpack
+      kaitai_struct_webide_vue
+      spark
+      fudgedit
+      fudgepop01.github.io
+      golden-layout
+      kaitai_ide_vscode
+      amiibo_research
+      amiibox
+      RivalsOfABox
+      Modules_of_Aether
+      RoASounds
+      svelte-repl
+      svelte-monaco-editor-example
+      podcast-stream-app
+      animejs-stream-components
+      streamer_dashboard
+      utimes
+      picarto-security-bot
+      RoABox2
+    ?c 2020/
+      Rivals-of-Aether-GML
+      amiibo-validator
+      exif-js
+      ProjectMCodes
+      GCTRM-Editor
+      aiscriptpad-editor
+      PPlusAI
+    ?c 2021/
+      Rivals-of-Aether-Snippets
+      Digital-Library
+      flutter
+      iste340-project3
+      AIScriptCLA
+      slippi-js
+      brawllib_rs
+      Ishiiruka
+      RAIEdit
+    ?c 2022/
+      wasm3
+      RAIExt
+      arch-ppc
+    ? _base
+  ?c History/
+      2017
+      2018
+      2019
+        ? started looking into Kaitai Struct
+        ? monaco editor stuff
+        ? joined Kaitai team org on April
+        ? created JSON schema for Kaitai Struct
+        ? initial attempt for Typescript Generation in Kaitai Struct
+        ? somehow example of monaco editor + sveltejs has 20 stars
+      2020
+        ? internship at MS
+        ? applicationInsightsJS debug plugin (still used and maintained to this day)
+        ? - written in typescript without any other frameworks, works in ie8 (somehow)
+        ? - https://github.com/microsoft/ApplicationInsights-JS/tree/master/extensions/applicationinsights-debugplugin-js
+        ? beginnings of ProjectM C++ journey (July)
+      2021
+        ? internship at MS (failed; but learned various important lessons)
+      2022
+      2023
+index
+skillset
+changelog
+alpharad application
