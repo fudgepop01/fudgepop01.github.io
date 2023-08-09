@@ -21,10 +21,18 @@ Though it was never deployed, I learned some new things as always - but others w
 
 - Backend
   - [KoaJS](https://koajs.com)
-  - 
+  - [ExpressJS](https://expressjs.com)
+  - [mongodb](https://www.mongodb.com)
+  - [laravel](https://laravel.com)
+  - php
 - Frontend
-  - 
+  - [VueJS](https://vuejs.org)
+    - Vue2 at the time
+  - [sass](https://sass-lang.com)
+  - [element-ui](https://element-plus.org/en-US/)
+    - a UI framework
 
 ## Repo Link
 
-[name](url)
+- [backend](https://github.com/fudgepop01/EHMain-Backend)
+- [frontend](https://github.com/fudgepop01/EHMain-Frontend)

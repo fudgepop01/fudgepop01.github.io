@@ -20,7 +20,7 @@ Mods created:
   - "play sound effect when actionable"
   - display various useful meters (hitlag, hitstun, DI angle, etc)
   - an old (now defunct) frame data display for discord:
-    - [link to page talking about it](/Projects/2017/PMData)
+    - [link to page talking about it](./Projects/2017/PMData.md)
 - Rivals of Aether
   - made yet another AI system that was later used in popular mods such as [plusle and minun](https://steamcommunity.com/workshop/filedetails/?id=2502590772) (though I never fully finished the system, the base is still there)
 

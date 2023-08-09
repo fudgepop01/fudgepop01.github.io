@@ -7,6 +7,7 @@
 
 ? Contributions/
 ?c Projects/
+  featured
   ?c 2015/
     Smashladder CSS
   ?c 2017/
@@ -19,27 +20,29 @@
     bitdef
   ?c 2019/
     Basic-Snake-Game
-    EHMain/
+    ?c EHMain/
       About
       README
+    kaitai_struct_webide
+    cassowary-ts
+    albert
+    kaitai_struct_typescript_integration
+    kaitai_struct
+    ? kaitai_struct_doc
+    Ksy-Schema
+    ? kaitai_struct_webide_webpack
+    ? kaitai_struct_webide_vue
+    ?c spark/
+      spark
+      dynalistdocs
+    fudgedit
+    fudgepop01.github.io
+    ? golden-layout
+    kaitai_ide_vscode
+
 ?c TODO/
   ?c Projects/
     ?c 2019/
-      kaitai_struct_webide
-      sbud
-      cassowary-ts
-      albert
-      kaitai_struct_compiler
-      kaitai_struct
-      kaitai_struct_doc
-      Ksy-Schema
-      kaitai_struct_webide_webpack
-      kaitai_struct_webide_vue
-      spark
-      fudgedit
-      fudgepop01.github.io
-      golden-layout
-      kaitai_ide_vscode
       amiibo_research
       amiibox
       RivalsOfABox

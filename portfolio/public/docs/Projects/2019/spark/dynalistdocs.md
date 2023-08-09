@@ -1,0 +1,518 @@
+- Wii-Hardware
+  - HackMii articles
+    - 2008
+      - April
+        - Hello World! - !(2008-04-08) 
+          - `bushing` has always wanted his own blog<br>
+        - Wii System Software - !(2008-04-10)
+          - Wii has two processors:
+            - main is "Broadway"
+              - PowerPC Architecture<br>
+              - similar to the one found in Gamecube (but much faster)<br>
+              - used when navigating system menu or launching a game<br>
+            - other is "Hollywood"
+              - officially considered graphics chip<br>
+              - contains ARM core 
+                - handles I/O and security<br>
+              - nicknamed "Starlet" by `Segher`<br>
+          - Boot Process
+            - Starlet loads<br>
+            - three stages of bootloader
+              - `boot0`<br>
+              - `boot1`<br>
+              - `boot2`<br>
+              - opens NAND storage to look for `1-2` (System Menu)<br>
+              - Upon finding `1-2` it reads the `TMD` header, loads `1-2` into memory, and then turns on the `Broadway` chip <br>
+            - Upon loading the menu
+              - two pieces of code running at once
+                - system menu code<br>
+                - "Starlet firmware" (named `IOS`)
+                  - there are 19(?) versions stored on the wii<br>
+                  - only one of them matters during boot (`IOS30`) for now<br>
+            - Upon menu start
+              - Warning screen
+                - ("don't throw shit at your TV, hit A to continue")<br>
+              - system menu checks NAND flash to see what channels are installed
+                - `also` checks to see if disc is present in drive<br>
+              - once channel is selected or disc attempts to start
+                - System Menu asks `IOS` to handle signatures (verification and such)<br>
+                - decrypts all code & data<br>
+                - loads it into memory<br>
+                - rebooting the PPC
+                  - (lots of rebooting happens while using the wii)<br>
+        - [on firmware patching risk and responsibility](https://hackmii.com/2008/04/on-firmware-patching-risk-and-responsibility/) - !(2008-04-10) 
+          - stuff about trying to make the wii hacking community a reputable one<br>
+        - Keys Keys Keys - !(2008-04-15) 
+          - AES Keys
+            - 128-bit (16-byte) symmetric AES (AES-128-CBC) for most encryption<br>
+            - **Common key (ebe42a225e8593e448d9c5457381aaf7):**
+              - knowing this allows you to decrypt most Wii content as long as the right ticket is provided<br>
+              - Stored in [OTP](http://en.wikipedia.org/wiki/Programmable_read-only_memory) area of `Starlet` ARM core inside `Hollywood` package<br>
+            - **SD key (ab01b9d8e1622b08afbad84dbfc2a55d):**
+              - used by System Menu `1-2` to encrypt anything before writing it out to the SD card. use by `1-2` to decrypt anything read __from__ the SD card.
+                - mainly done for obfuscation<br>
+              - no game supports loading or saving directly to the SD card
+                - handled by System Menu<br>
+              - other interesting keys:
+                - SD IV (216712e6aa1f689f95c5a22324dc6a98)<br>
+                - MD5 blanker (0e65378199be4517ab06ec22451a5793)<br>
+                - both stored in `1-2` binary<br>
+            - **NAND key (varies)**
+              - encrypts filesystem data on actual NAND chip itself<br>
+              - probably randomly generated during manufacturing<br>
+              - stored in OTP area of `Starlet`<br>
+              - prevents NAND filesystem from being read by a flash-chip reader<br>
+          - RSA Keys
+            - asymmetric cipher
+              - no "shared-secrets" - nothing to be extracted<br>
+              - only ones stored on wii are public keys (to verify authenticity of content)<br>
+            - **CP Key**
+              - used to sign the [TMD](http://wiibrew.org/wiki/Title_metadata) associated with every title<br>
+              - contains SHA1 hash of contents of title<br>
+              - [24c3](https://www.youtube.com/watch?v=74fMJNcEaE8) achieved by injecting `DOL` into "Lego Star Wars" and [foraging the signature](https://debugmo.de/2015/12/dieselgate/) on its `TMD`<br>
+              - people eventually discovered the common key needed to decrypt update partitions, allowing others to analyze / disassemble IOS<br>
+            - **XS (Access?) Key**
+              - key that signs [tickets](https://wiibrew.org/wiki/Ticket)<br>
+            - **CA: Certification Authority**
+              - signs both the XS and CP keys.<br>
+            - **MS (master?) Key**
+              - signs certificate containing copy of Wii's public ECC key. <br>
+              - Appended to savegames on SD cards so that any other Wii can verify that the key was issued by Nintendo<br>
+            - **Root**
+              - Grand-Master Key<br>
+              - Signs the CA key<br>
+          - ECC Keys
+            - [Elyptic Curve Cryptography](http://en.wikipedia.org/wiki/Elliptic_Curve_Cryptography)<br>
+            - uses when signing savegames before writing to SD card<br>
+            - Newer and faster on embedded system than RSA<br>
+          - Other
+            - [HMAC](http://en.wikipedia.org/wiki/HMAC) Key
+              - basically lets wii see if the chip was "pulled, rewritten, and resoldered"<br>
+          - Key Storage
+            - Inside Starlet ARM Core
+              - SHA1 hash of boot1<br>
+              - Common Key<br>
+              - ECC Private Key<br>
+              - NAND HMAC<br>
+              - NAND AES Key<br>
+              - RNG Seed<br>
+              - "other stuff we can't yet decipher"<br>
+        - [Homebrew Channel Video](https://www.youtube.com/watch?v=op1V5eWpTQQ) - !(2008-04-05) <br>
+        - [Autopsy of Mario Kart Brick](https://hackmii.com/2008/05/autopsy-of-a-mario-kart-brick/) - !(2008-04-08) <br>
+      - May
+        - `marcan` - [Parental Controls PWReset Tool](http://wii.marcansoft.com/parental.psp)<br>
+        - `marcan` [Homebrew Channel Progress Video](https://www.youtube.com/watch?v=CGeMP1zsW2I) - !(2008-05-17) 
+          - now including a banner!<br>
+          - made entirely with homebrew knowledge (no leaked nintendo SDKs or anything of the sort)<br>
+          - composed of
+            - header detailing channel name in all languages<br>
+            - other metadata<br>
+            - [U8](http://wiibrew.org/wiki/U8_archive) archive containing three more files
+              - `/meta/banner.bin`
+                - banner.bin contains the same data for the large full-screen banner<br>
+                - The files begin with an IMD5 header, which wraps an LZ77 compressed block of data<br>
+                - [LZ77 compression](http://nocash.emubase.de/gbatek.htm#biosdecompressionfunctions) is the same as used in the GBA and Nintendo DS BIOS routines<br>
+                - The compressed data is nothing but another U8 archive, with the following structure:
+                  - `arc/`
+                    - `blyt/`
+                      - `icon.brlyt or banner.brlyt`<br>
+                    - `anim/`
+                      - `icon.brlan` or `banner.brlan`<br>
+                    - __or__
+                      - `icon_Start.brlan` or `banner_Start.brlan`<br>
+                      - `icon_Loop.brlan` or `banner_Loop.brlan`<br>
+                    - `timg/`
+                      - `several .tpl files`<br>
+                - <br>
+              - `/meta/icon.bin`
+                - identical to `/meta/banner.bin` in format<br>
+                -  icon.bin contains the layout, animation, and bitmap data for the channel thumbnail icon<br>
+              - `/meta/sound.bin`
+                - contains sound snipped played when selecting channel<br>
+                - composed of a BNS audio file, which is a header followed by [GC-DSP ADPCM](http://hitmen.c02.at/files/yagcd/yagcd/chap15.html#sec15.34.7) audio data<br>
+          - **FOR MORE INFO**<br>
+        - [THE HOMEBREW CHANNEL](http://hbc.hackmii.com/) - !(2008-05-24) 
+          - first public release<br>
+          - and history is made<br>
+      - June
+        - [support devkitpro](https://devkitpro.org/support-devkitpro/)<br>
+        - [nintendon't care](https://hackmii.com/2008/06/your-wii-is-not-a-psp/)<br>
+        - Wii Hardware Architecture Diagram - !(2008-06-15) 
+          - `bushing` attempts to sum it all up<br>
+          - ![wii hw diagram v1](https://hackmii.com/static/wii_hw_diagram_v2.png)<br>
+        - June 16 Wii Update - !(2008-06-16) 
+          - Zelda Twilight Princess exploit patch<br>
+          - another bug that allows them to completely ignore the patch was found shortly after
+            - lol<br>
+      - July
+        - `IOS` Hax - !(2008-07-10) 
+          - Capabilities
+            - `IOS` manages all hardware unique to Wii
+              - NAND Flash<br>
+              - SD-Card Slot<br>
+              - WiFi<br>
+              - USB (at a low level - like libUSB)<br>
+            - contains VM that can run a javascript-like language and carrying on HTTP, SSL and SMTP communications
+              - WiiConnect24<br>
+              - Barely used by Nintendo<br>
+          - [other things about stuff](https://hackmii.com/2008/07/ios-hax/)<br>
+        - [an IRC channel](https://hackmii.com/2008/07/hackmii-irc/) - !(2008-07-16) <br>
+        - [Around the Wrold](http://www.metacafe.com/watch/1542991/around_the_world_chipd_s_3_region_wii/)
+          - a wii with different regions soldered onto it<br>
+        - `marcan` - [DVD Access Library](https://hackmii.com/2008/07/dvd-access-library-no-modchip-required/)
+          - The start of the ability to read DVDs on the Wii<br>
+        - `Erant` - [libdi and the DVDX installer](https://hackmii.com/2008/08/libdi-and-the-dvdx-installer/) - !(2008-08-12) 
+          - The DVDX installer instead will install a small, hidden, channel on your Wii that allows you to read DVDs on an unmodified system.<br>
+          - Usage of this package is fairly simple. Run the installer.dol found in the package, follow the onscreen instructions, and you're done<br>
+      - October
+        - `marcan` - [BootMii: The Beginning](https://hackmii.com/2008/10/bootmii-the-beginning/) - !(2008-10-14) 
+          - Bootmii
+            - A software-based solution for allowing Nintendo's code to go through **our** code rather than the other way around.
+              - better than others as of October 2008<br>
+              - accomplishes this while minimizing any changes to the existing system
+                - can be switched on and off at will<br>
+            - Bootmii - core
+              - initialization
+                - gives full control of console as early as possible
+                  - most brick-resistant as a result<br>
+                - fakesigned `boot2`<br>
+                - not a 'hacked' `boot2`<br>
+                - replaces the `ELF loader` of the `boot2` IOS binary, leaving the `boot2` __code__ untouched<br>
+                - ELF is a two-part file
+                  - `first` make the custom ELF loader a loadable file<br>
+                  - `then` load it with own ELF loader<br>
+                - replaces `boot2-ELF` with composite file
+                  - custom ELF loader (the "stub")<br>
+                  - BootMii-Core payload (the "loader")<br>
+                - `boot2` now consists of
+                  - custom stub<br>
+                  - custom BootMii-Core ELF<br>
+                  - the original `boot2`<br>
+                  - __custom stub & bootmii-core elf take up the spot of the original elf loader__<br>
+              - loading custom code
+                - pseudocode<br>
+                - `if (canMountSDCard && canLoad("/system/iosboot.bin"))`<br>`  run SDCard["/system/iosboot.bin"]`<br>`else`<br>`  run regular boot2`<br>
+              - full control achieved!
+                - can do basically anything, though [example](http://es.youtube.com/watch?v=9oAQ9i4FMeg&fmt=18) shows launching directly to homebrew channel<br>
+          - Wii Boot Sequence
+            - `boot0`
+              - part of the Hollywood chipset<br>
+              - totally unreachable<br>
+              - loads `boot1` from beginning of NAND<br>
+              - verified `boot1` against readonly hash<br>
+            - `boot1`
+              - untouchable due to verification process<br>
+              - __supposed__ to load `boot2` from section of NAND memory<br>
+            - `boot2`
+              - mini-IOS<br>
+              - loads system menu<br>
+              - uses same verification system as the rest of the wii<br>
+              - vulnerable to fakesigning bug<br>
+              - invulnerable to updates<br>
+              - not __actually__ a singular piece of software<br>
+          - IOS Binaries
+            - "The following applies to `boot2` and to all `IOSes` prior to `IOS30`, and to the boot file of `IOS30` and beyond"<br>
+            - Three Parts:
+              - simple header<br>
+              - ELF loader
+                - loads payload ELF into memory and runs it<br>
+              - payload ELF
+                - contains the __actual__ `IOS/boot2` code<br>
+        - <br>
+      - November
+        - [HBC Beta10](https://hackmii.com/2008/11/hbc-beta10-aka-your-last-chance/) released - !(2008-11-04) <br>
+        - [3.4 and recent updates](https://hackmii.com/2008/11/34-and-recent-updates/)
+          - death of the Twilight Hack until 20 days later when it's found that nintendo screwed up the Anti-Twilight hack check (again)<br>
+      - December
+        - [WiiPhonies completely obliterates competition](https://hackmii.com/2008/12/team-twiizers-and-the-iphone-dev-team-pwn-25c3/)<br>
+    - 2009
+      - Febuary
+        - [wii rants](https://hackmii.com/2009/02/why-the-wii-will-never-get-any-better/)
+          - also shows that a disc literally contains all the code required to run the console upon starting the game<br>
+      - April
+        - [marcan shifts away from wii hacking](https://hackmii.com/2009/04/updates/)<br>
+        - [nintendo decides to void warranty for HBC](https://hackmii.com/2009/04/warranty/)
+          - angery<br>
+      - May
+        - [bootmii beta 1](https://hackmii.com/2009/05/bootmii_beta_1/) released !(2009-05-13) <br>
+      - June
+        - [IOS: history, build process](https://hackmii.com/2009/06/ios-history-build-process/) - !(2009-06-30) 
+          - `IOS` likely stands for "input / output system" 
+            - because that's what it does<br>
+            - regulates I/O between `Broadway` (PPC) and the rest of the wii's peripherals<br>
+            - written mostly from scratch by "BroadOn"<br>
+          - `IOS` = "firmware" that runs while normal code (game, system menu, etc.) runs on the PPC
+            - the __same codebase__ is used to build `boot2` `boot1` and arguably `boot0`
+              - "matroshka dolls"<br>
+          - relations
+            - `boot2` = kernel<br>
+            - `IOS` = kernel + modules<br>
+            - `boot1` = stripped-down version of `boot2`<br>
+            - `boot0` = stripped-down version of `boot1`<br>
+          - they all compiled out of the same codebase, hence why the same `strncmp()` bug was present in `boot1`, BC, `boot2`, and all versions of `IOS`<br>
+          - first version of `IOS` was likely `IOS4`<br>
+          - every version of `IOS` has a build date<br>
+          -  ![version information](https://dynalist.io/u/VWx42ho6-Z1eiw6AwcDhVycm) <br>
+          - <br>
+      - August
+        - [Wii Hardware: A history](https://hackmii.com/2009/08/wii-hardware-a-history/) - !(2009-08-29) <br>
+        - [Timing is Everything](https://hackmii.com/2009/08/timing-is-everything-the-case-of-the-unsoftmoddable-wii/) - !(2009-08-29) 
+          - Starting 2009, newly manufactured Wiis:
+            - All versions of `IOS` have the [strncmp() bug](http://debugmo.de/?p=61) fixed, access to [/dev/flash](http://wiibrew.org/wiki//dev/flash) blocked, and "ES_Identify" was broken.<br>
+            - `boot1` had `strncmp()` bug fixed<br>
+            - crap installed into the slots for `IOS3`, `IOS4` and `IOS254`<br>
+          - Around march
+            - Old (but valid) versions of `IOS` would not run at all; they would hang if you tried, which prevented downgrading `IOS`. This did not apply to the leaked [IOS16](http://wiibrew.org/wiki/IOS16).<br>
+            - Attempts at reloading IOS by libogc would sometimes fail; depending on the program, this would look like a hang or would just cause all IOS calls to fail<br>
+          - Universal installer, Bootmii works by checking the wii's `IOS` version and looking through different hacking options for each one
+            - could use that to load `MINI` and execute it
+              - direct access to NAND flash<br>
+            - checks if bootmii can be install as boot2<br>
+            - reload into normal `IOS`
+              - wiimote access<br>
+              - to get there use MINI's arbitrary title launching function<br>
+            - loads into anti-scamware warning message<br>
+            - but on new wiis process would fail right around here<br>
+          - new wiis had a different `boot2` - `boot2v4`<br>
+          - new wiis
+            - began shipping with `boot2v4`<br>
+            - often fail to reload `IOS` (especially when that `IOS` version is older)<br>
+            - Launching PPC titles works fine on new wiis<br>
+            - same versions of `IOS` work differently on older wiis<br>
+            - "leaked" `IOS16` is exempt from these problems<br>
+          - how the stystem normally boots:
+            - System turns on<br>
+            - boot0 / boot1 / boot2 run on Starlet<br>
+            - boot2 loads the TMD for the System Menu, reads the required IOS version, then chainloads to that version of IOS<br>
+            - Newly loaded version of IOS loads System Menu from NAND into memory, then turns on PPC and starts it executing<br>
+            - User selects channel or disc; IOS loads TMD, reloads into new IOS<br>
+            - IOS loads game from NAND or disc into RAM, then bootstraps PPC<br>
+          - what happens when someone loads USBLoaderstuff from homebrew channel
+            - User selects HBC from system menu; menu calls ES_LaunchTitle(00010000-HAXX)<br>
+            - IOS reads HBC's TMD from NAND, sees that it needs IOS61 (or whatever), and reloads to it<br>
+            - IOS61 initializes hardware, then loads the HBC content into RAM and bootstraps PPC<br>
+            - User selects warezloader from SD card<br>
+            - HBC loads ELF from SD into PPC, and then jumps to it directly<br>
+            - ELF calls (e.g.) IOS_Reload(249) to load patched version of IOS<br>
+            - libogc makes IPC calls to IOS to reload IOS, but does not wait long enough for the process to finish, and then becomes confused<br>
+      - September
+        - first mention of smash stack exploit - !(2009-09-29) 
+          - http://wiibrew.org/wiki/Smash_Stack<br>
+          - [a lack of imagination](https://hackmii.com/2009/09/wii-menu-4-2-a-lack-of-imagination/)<br>
+    - 2010
+      - [stm release exploit](https://hackmii.com/2010/01/the-stm-release-exploit/) - !(2010-01-27) <br>
+      - [of homebrew and antipiracy](https://hackmii.com/2010/05/of_homebrew_and_antipiracy/) - !(2010-05-15) <br>
+      - [theming the homebrew channel](https://hackmii.com/2010/08/theming-the-homebrew-channel/) - !(2010-08-11) <br>
+      - [insert startup disc](https://hackmii.com/2010/09/insert-startup-disc/)<br>
+    - 2011
+      - [letterbomb (the letter from heaven)](https://hackmii.com/2011/08/letterbomb/) - !(2011-08-09) <br>
+      - [lolz](https://hackmii.com/2012/02/wiipowr/)<br>
+      - [HBC 1.1](https://hackmii.com/2012/02/the-homebrew-channel-v1-1-0/)<br>
+      - [HBC WiiU](https://hackmii.com/2012/12/hbc-release-for-a-new-wii-u/)<br>
+    - 2016
+      - [in memory of a hacking legend](https://hackmii.com/2016/02/ben/)
+        - seriously, shoutouts to this guy. <br>
+      - [open source homebrew channel](https://hackmii.com/2016/11/the-open-homebrew-channel/)
+        - [source](https://github.com/fail0verflow/hbc)<br>
+    - **That's all, folks**<br>
+  - Resources
+    - [YACGD](http://hitmen.c02.at/files/yagcd/yagcd/) - Yet Another Gamecube Documentation<br>
+    - [original geckoos codetype documentation](http://web.archive.org/web/20080925041014/http://www.usbgecko.com:80/codetypes.htm)
+      - **Before the codetypes**
+        - The wii has different memory regions<br>
+        - only 2 are used by games and cheat codes
+          - `MEM1` goes from `0x80000000` to `0x81800000`<br>
+          - `MEM2` goes from `0x90000000` to `0x94000000`
+            - the top of this is unaccessible (trying to read / write to it crashes the game)<br>
+            - only `0x90000000` to `0x93800000` can actually be accessed<br>
+        - `ba` = `base address`
+          - initalized to `0x80000000` <br>
+          - each time the `ba` is added to a code address, the code handler does `address = address + (ba & 0xFE000000)`<br>
+          - don't forget to set it to the original value afterwards if it's ever modified<br>
+        - `po` = `pointer`
+          - initialized to `0x80000000`<br>
+          - Each time the `po` is added to a code address, the code handler does: `address = address + po`<br>
+          - can be modified at will<br>
+        - `grN` = `Gecko Register N`
+          - not a real register, rather just a place in memory in which Gecko has reserved a place in memory<br>
+          - `N` ranges from `0x0` to `0xF`<br>
+          - anything can be stored in it / loaded from it<br>
+          - can be overwritten by other codes (so be careful)<br>
+          - If you want to store a value that must not change, try to use a "real" address ouside of the code handler, or use the 46/4E code types along with a goto code type.<br>
+          - `grN` are stored __before__ the gecko code handler meaning they can be accessed directly at a static address (`0x80001804`)<br>
+          - `0x80001804` = `gr0`, `0x80001808` = `gr1`, ... `0x80001840` = `grF`<br>
+        - `bN` = `block N`
+          - made of a `32-bit` value<br>
+          - stores information for the  repeat/return/goto/gosub codes<br>
+          - `b0` data is stored at `0x80001844`, `b1` at `0x8000184C`, and so on<br>
+        - `CT` = `Code Type`
+          - ranges from `0` to `7`<br>
+          - first `3` bits of the first number in the code<br>
+          - `4th` bit is used to tell the handler to use the pointer address instead of the base address<br>
+          - if the first number in a code is even, it uses the `ba`, if it's odd it uses the `po`<br>
+        - `CST` = `Code Subtype`
+          - first `3` bits of the second number of the code<br>
+          - `4th` bit is actually part of the address (`___`)<br>
+        - `___` = address used in some codes (often referred to as `address`)
+          - ranges from `0x00000000` to `0x01FFFFFF`<br>
+          - anything above `0x00FFFFFF` will make the subtype an odd number<br>
+        - `[]` = some RAM location, not a value
+          - ex: `[XXXXXXXX]` = "the data stored in `XXXXXXXX`"<br>
+          - value inside `[]` must actually be a valid address<br>
+        - For conditional `if` codes, the comparison are unsigned
+          - games might use signed numbers. In such a case, you must look for a "less than" value<br>
+        - Before writing to an address loaded from RAM, must check if it's valid. Can be done with `CE / DE if` codetypes<br>
+        - pointers might be dangerous (it could be nearly impossible to find a stable pointer)
+          - use ASM hacks to circumvent this<br>
+      - **codetypes and such** (the actual codes)
+        - `CT0` - Direct RAM write & fill
+          - `00______ YYYY00XX` - 8 bits
+            - writes `XX` `YYYY + 1` times at `ba + address`<br>
+          - `02______ YYYYXXXX` - 16 bits
+            - writes `XXXX` `YYYY + 1` times at `ba + address`<br>
+          - `04______ XXXXXXXX` - 32 bit
+            - writes `XXXXXXXX` at `ba + address`<br>
+          - `06______ YYYYYYYY`<br>`d1d2d3d4 d5d6....` - String write (patch code)
+            - writes `d1d2d3d4 d5d6...` consecutively<br>
+            - starts at `ba + address`<br>
+            - `YYYYYYYY` is the number of bytes to write<br>
+          - `08______ 000000XX`<br>`TNNNZZZZ VVVVVVVV` - Serial code (Slider / Multi Skip)
+            - `ba + address` = initial address<br>
+            - `XXXXXXXX` = initial value for RAM write<br>
+            - `T` = value size
+              - 0 = byte (`XX`)<br>
+              - 1 = halfword (`XXXX`)<br>
+              - 2 = word (`XXXXXXXX`)<br>
+            - `NNN` = amount of **additional** addresses to write to
+              - (the first is assumed)<br>
+            - `ZZZZ` = address increment in bytes
+              - how many to skip by<br>
+            - `VVVVVVVV` = Value increment
+              - how much to add to the value after each additional RAM write<br>
+        - `CT1` - regular if codes
+          - `2X______(ENDIF?) YYYYYYYY` - 32 bit compare
+            - **fully written** = `if ([ba + address] <X> YYYYYYYY)`<br>
+            - `X` = comparison type
+              - `0: ==`<br>
+              - `2: !=`<br>
+              - `4: >`<br>
+              - `6: <`  <br>
+            - `(ENDIF?)` = add `1` to the `address` to make this code apply an `ENDIF` first
+              - it will still use `______` without the added 1 for address calculation<br>
+            - `YYYYYYYY` = value to compare against<br>
+          - `2X______(ENDIF?) ZZZZYYYY` - 16 bit compare
+            - **fully written** = `if (([ba + address] & ~ZZZZ) <X> YYYY)`<br>
+            - `X` = comparison type
+              - `8: ==`<br>
+              - `A: !=`<br>
+              - `C: >`<br>
+              - `E: <`  <br>
+            - `(ENDIF?)` = add `1` to the `address` to make this code apply an `ENDIF` first
+              - it will still use `______` without the added 1 for address calculation<br>
+            - `ZZZZ` = <br>
+            - `YYYY` = value to compare against<br>
+        - `CT2` - Base Address / Pointer Operations
+          - **Base**<br>
+          - `40TYZ00N XXXXXXXX` - **load into** Base Address
+            - long version
+              - `40000: ba = [XXXXXXXX]`<br>`40001: ba = [grN + XXXXXXXX]`<br>`40010: ba = [ba + XXXXXXXX]`<br>`40011: ba = [ba + grN + XXXXXXXX]`<br>
+              - `40100: ba += [XXXXXXXX]`<br>`40101: ba += [grN + XXXXXXXX]`<br>`40110: ba += [ba + XXXXXXXX]`<br>`40111: ba += [ba + grN + XXXXXXXX]`<br>
+              - `50010: ba = [po + XXXXXXXX]`<br>`50011: ba = [po + grN + XXXXXXXX]`<br>`50110: ba += [po + XXXXXXXX]`<br>`50111: ba += [po + grN + XXXXXXXX]`<br>
+            - short version
+              - `T:` if `0` then `ba` is set to the value found otherwise it is set to `ba` += value <br>
+              - `Y:` controls weathre `ba / po` is factored into the address' value<br>
+              - `Z:` controls weather grN is factored into the address' value<br>
+              - `N:` the gecko register to use if `Z` is set to `1`<br>
+              - `XXXXXXXX` = the address to load the value from<br>
+          - `42TYZ00N XXXXXXXX` - **set** Base Address to
+            - long version 
+              - `42000: ba = XXXXXXXX`<br>`42001: ba = grN + XXXXXXXX`<br>`42010: ba = ba + XXXXXXXX`<br>`42011: ba = ba + grN + XXXXXXXX`<br>
+              - `42100: ba += XXXXXXXX`<br>`42101: ba += grN + XXXXXXXX`<br>`42110: ba += ba + XXXXXXXX`<br>`42111: ba += ba + grN + XXXXXXXX`<br>
+              - `52010: ba = po + XXXXXXXX`<br>`52011: ba = po + grN + XXXXXXXX`<br>`52110: ba += po + XXXXXXXX`<br>`52111: ba += po + grN + XXXXXXXX`<br>
+            - short version
+              - `T:` if `0` then `ba` is set to the value found <br>
+              - `Y:` controls weathre `ba / po` is adeed into the specified value<br>
+              - `Z:` controls weather grN is added into the specified value<br>
+              - `N:` the gecko register to use if `Z` is set to `1`<br>
+              - `XXXXXXXX` = the base value to set `ba` to<br>
+          - `440YZ00N XXXXXXXX` - **store** Base Address at
+            - `44000: [XXXXXXXX] = ba`<br>`44001: [grN + XXXXXXXX] = ba`<br>`44010: [ba + XXXXXXXX] = ba`<br>`44011: [ba + grN + XXXXXXXX] = ba`<br>
+            - `54010: [po + XXXXXXXX] = ba`<br>`54011: [po + grN + XXXXXXXX] = ba`<br>
+          - `4600XXXX 00000000` - store next code's location into Base Address
+            - `ba` holds the address at which the next line of code is stored + `XXXX`<br>
+            - `XXXX` is a __signed__ 16-bit value<br>
+            - `46000000 00000000` would make `ba` point to the next code's first 32 bits<br>
+            - `46000004 00000000` would make `ba` point to the next code's second 32 bits<br>
+          - **Pointer**<br>
+          - `40TYZ00N XXXXXXXX` - **load into** Pointer Address
+            - long version
+              - `48000: po = [XXXXXXXX]`<br>`48001: po = [grN + XXXXXXXX]`<br>`48010: po = [ba + XXXXXXXX]`<br>`48011: po = [ba + grN + XXXXXXXX]`<br>
+              - `48100: po += [XXXXXXXX]`<br>`48101: po += [grN + XXXXXXXX]`<br>`48110: po += [ba + XXXXXXXX]`<br>`48111: po += [ba + grN + XXXXXXXX]`<br>
+              - `58010: po = [po + XXXXXXXX]`<br>`58011: po = [po + grN + XXXXXXXX]`<br>`58110: po += [po + XXXXXXXX]`<br>`58111: po += [po + grN + XXXXXXXX]`<br>
+            - short version
+              - `T:` if `0` then `po` is set to the value found, otherwise it is set to `po` += value <br>
+              - `Y:` controls weather `ba / po` is factored into the address' value<br>
+              - `Z:` controls weather grN is factored into the address' value<br>
+              - `N:` the gecko register to use if `Z` is set to `1`<br>
+              - `XXXXXXXX` = the address to load the value from<br>
+          - `42TYZ00N XXXXXXXX` - **set** Pointer Address to
+            - long version 
+              - `4A000: po = XXXXXXXX`<br>`4A001: po = grN + XXXXXXXX`<br>`4A10: po = ba + XXXXXXXX`<br>`4A011: po = ba + grN + XXXXXXXX`<br>
+              - `4A100: po += XXXXXXXX`<br>`4A101: po += grN + XXXXXXXX`<br>`4A110: po += ba + XXXXXXXX`<br>`4A111: po += ba + grN + XXXXXXXX`<br>
+              - `5A010: po = po + XXXXXXXX`<br>`5A011: po = po + grN + XXXXXXXX`<br>`5A110: po += po + XXXXXXXX`<br>`5A111: po += po + grN + XXXXXXXX`<br>
+            - short version
+              - `T:` if `0` then `po` is set to the value found <br>
+              - `Y:` controls weathre `ba / po` is adeed into the specified value<br>
+              - `Z:` controls weather grN is added into the specified value<br>
+              - `N:` the gecko register to use if `Z` is set to `1`<br>
+              - `XXXXXXXX` = the base value to set `ba` to<br>
+          - `440YZ00N XXXXXXXX` - **store** Pointer Address at
+            - `4C000: [XXXXXXXX] = po`<br>`4C001: [grN + XXXXXXXX] = po`<br>`4C010: [ba + XXXXXXXX] = po`<br>`4C011: [ba + grN + XXXXXXXX] = po`<br>
+            - `5C010: [po + XXXXXXXX] = po`<br>`5C011: [po + grN + XXXXXXXX] = po`<br>
+          - `4600XXXX 00000000` - store next code's location into Pointer Address
+            - `po` holds the address at which the next line of code is stored + `XXXX`<br>
+            - `XXXX` is a __signed__ 16-bit value (`0xFFFF` = `-1`)<br>
+            - `46000000 00000000` would make `po` point to the next code's first 32 bits<br>
+            - `46000004 00000000` would make `po` point to the next code's second 32 bits<br>
+        - `CT3` - Repeat / Goto / Gosub / Return
+          - `6000NNNN 0000000P` - set repeat
+            - stores next code address and `NNNN` in `bP`<br>
+          - `62000000 0000000P` - execute repeat
+            - if `NNNN` stored in `bP` is greater than `0`, it is decreased by 1 and the code handler jumps to the "next code address" stored in `bP`<br>
+          - `62X00000 0000000P` - return
+            - `X` = code execution status requirement
+              - `0:` true<br>
+              - `1:` false<br>
+              - `2:` always jump<br>
+            - If the code execution status is `<X>`, the code handler jumps to the "next code address" stored in `bP`
+              - (`NNNN` in `bP` is not touched).<br>
+          - <br>
+    - [old bootmii repos on gitweb](https://web.archive.org/web/20171213024615/http://gitweb.bootmii.org:80/)<br>
+    - [zelda twilight hack source code](http://git.infradead.org/users/segher/savezelda.git)<br>
+  - Requested...
+    - `2128AE64 80000001` if fighter stock count at address `8128AE64` == `0x80000001`
+      - `206212C2 DFFF0001` if third bit at address `806212C2` == true (is 1)
+        - `0528AE64 80000001` set address `8128AE64` to `0x80000001`<br>
+      - `E2100001 00000000` ENDIF; ELSE
+        - `0528AE64 00000001` set address `8128AE64` to `0x00000001`<br>
+      - `E2000001 00000000` ENDIF;<br>
+    - `2128AE65 00000001` ENDIF; if fighter stock count at address `8128AE65` == `0x00000001`
+      - `206212C2 DFFF0001` if third bit at address `806212C2` == true (is 1)
+        - `0528AE64 80000001` set address `8128AE64` to `0x80000001`<br>
+      - `E2100001 00000000` ENDIF; ELSE
+        - `0528AE64 00000001` set address `8128AE64` to `0x00000001`<br>
+      - `E2000001 00000000` ENDIF;<br>
+    - `212DCE65 80000001`ENDIF; if fighter stock count at address `812DCE6` == `0x80000001`
+      - `20621486 DFFF0001` if third bit at address `806212C2` == true (is 1)
+        - `052DCE65 80000001` set address `812DCE65` to `0x80000001`<br>
+      - `E2100001 00000000` ENDIF; ELSE
+        - `052DCE65 00000001` set address `812DCE65` to `0x00000001`<br>
+      - `E2000001 00000000` ENDIF;<br>
+    - `212DCE65 00000001`ENDIF; if fighter stock count at address `812DCE6` == `0x00000001`
+      - `20621486 DFFF0001` if third bit at address `806212C2` == true (is 1)
+        - `052DCE65 80000001` set address `812DCE65` to `0x80000001`<br>
+      - `E2100001 00000000` ENDIF; ELSE
+        - `052DCE65 00000001` set address `812DCE65` to `0x00000001`<br>
+      - `E2000001 00000000` ENDIF;<br>
+    - `2128AE64 80000001`<br>`206212C2 DFFF0001`<br>`0528AE64 80000001`<br>`E2100001 00000000`<br>`0528AE64 00000001`<br>`E2000001 00000000`<br>`2128AE65 00000001`<br>`206212C2 DFFF0001`<br>`0528AE64 80000001`<br>`E2100001 00000000`<br>`0528AE64 00000001`<br>`E2000001 00000000`<br>`212DCE65 80000001`<br>`20621486 DFFF0001`<br>`052DCE65 80000001`<br>`E2100001 00000000`<br>`052DCE65 00000001`<br>`E2000001 00000000`<br>`212DCE65 00000001`<br>`20621486 DFFF0001`<br>`052DCE65 80000001`<br>`E2100001 00000000`<br>`052DCE65 00000001`<br>`E2000001 00000000`<br>
+</outline>
