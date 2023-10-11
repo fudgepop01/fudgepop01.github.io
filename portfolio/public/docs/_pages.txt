@@ -39,25 +39,25 @@
     fudgepop01.github.io
     ? golden-layout
     kaitai_ide_vscode
+    amiibo_research
+    amiibox
+    RivalsOfABox
+    Modules_of_Aether
+    ? RoASounds
+    ? svelte-repl
+    svelte-monaco-editor-example
+    ? podcast-stream-app
+    animejs-stream-components
+    streamer_dashboard
+    ? utimes
+    picarto-security-bot
+    RoABox2
+  ?c 2020/
+    Rivals-of-Aether-GML
 
 ?c TODO/
   ?c Projects/
-    ?c 2019/
-      amiibo_research
-      amiibox
-      RivalsOfABox
-      Modules_of_Aether
-      RoASounds
-      svelte-repl
-      svelte-monaco-editor-example
-      podcast-stream-app
-      animejs-stream-components
-      streamer_dashboard
-      utimes
-      picarto-security-bot
-      RoABox2
     ?c 2020/
-      Rivals-of-Aether-GML
       amiibo-validator
       exif-js
       ProjectMCodes
@@ -96,7 +96,7 @@
         ? - https://github.com/microsoft/ApplicationInsights-JS/tree/master/extensions/applicationinsights-debugplugin-js
         ? beginnings of ProjectM C++ journey (July)
       2021
-        ? internship at MS (failed; but learned various important lessons)
+        ? internship at MS
       2022
       2023
 index
