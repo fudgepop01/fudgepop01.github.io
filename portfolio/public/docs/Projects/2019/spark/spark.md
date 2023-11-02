@@ -11,7 +11,7 @@ gekko codes are effectivley instructions that were once passed to a special prod
 To achieve my goal I studied pages upon pages of old documentation to create my own summaries of the important parts relevant to gecko code creation (and the history of Wii modding as a whole). These were originally written using [dynalist](https://dynalist.io/).
 
 - [original dynalist form](https://dynalist.io/d/XfUd2tMt1AOjySJhIEkHq4NE)
-- [markdown form (hosted in-repo)](./Projects/2019/spark/dynalistdocs.md)
+- [markdown form (hosted in-repo)](./dynalistdocs.md)
 
 ## Benefits
 

@@ -54,15 +54,15 @@
     RoABox2
   ?c 2020/
     Rivals-of-Aether-GML
+    amiibo-validator
+    ? exif-js
+    ProjectMCodes
+    GCTRM-Editor
+    aiscriptpad-editor
 
 ?c TODO/
   ?c Projects/
     ?c 2020/
-      amiibo-validator
-      exif-js
-      ProjectMCodes
-      GCTRM-Editor
-      aiscriptpad-editor
       PPlusAI
     ?c 2021/
       Rivals-of-Aether-Snippets
@@ -96,7 +96,7 @@
         ? - https://github.com/microsoft/ApplicationInsights-JS/tree/master/extensions/applicationinsights-debugplugin-js
         ? beginnings of ProjectM C++ journey (July)
       2021
-        ? internship at MS
+        ? internship at MS (failed; but learned various important lessons)
       2022
       2023
 index

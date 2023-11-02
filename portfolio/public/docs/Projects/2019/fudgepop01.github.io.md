@@ -1,6 +1,6 @@
 # fudgepop01.github.io
 
-This is my github pages website that uses github's hosting solution to deliver static pages to any visitors. I originally used it to host my hex editor, [fudgedit](./Projects/2019/fudgedit.md), and provide a demo of what it can do.
+This is my github pages website that uses github's hosting solution to deliver static pages to any visitors. I originally used it to host my hex editor, [fudgedit](./fudgedit.md), and provide a demo of what it can do.
 
 ## Learnings
 
