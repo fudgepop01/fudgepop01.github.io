@@ -59,11 +59,10 @@
     ProjectMCodes
     GCTRM-Editor
     aiscriptpad-editor
+    PPlusAI
 
 ?c TODO/
   ?c Projects/
-    ?c 2020/
-      PPlusAI
     ?c 2021/
       Rivals-of-Aether-Snippets
       Digital-Library
