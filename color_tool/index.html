@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="./fudge_badge.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>color tool</title>
+    <link rel="stylesheet" href="./global.css">
+    <script src="https://colorjs.io/dist/color.global.js"></script>
+  </head>
+  <body>
+    <div class="container">
+      <div id="colorBox" style="background-color: #80bfff;"></div>
+      <div id="inputArea">
+        <button id="paste"> paste clipboard </button>
+        <input maxlength="6" type="text" name="in" id="in" value="80bfff" style="width: 100px">
+        <label>
+          <span>separator</span>
+          <input type="text" name="separator" style="width: 50px;" id="separator" value=", ">
+        </label>
+        <label>
+          <span>parenthesis</span>
+          <input type="checkbox" name="parens" id="parenthesis">
+        </label>
+        <label class="valueInput">
+          <span>R:</span>
+          <input type="range" name="in-red" id="in-red" min="0" max="255">
+          <span id="in-red-display">255</span>
+        </label>
+        <label class="valueInput">
+          <span>G:</span>
+          <input type="range" name="in-green" id="in-green" min="0" max="255">
+          <span id="in-green-display">255</span>
+        </label>
+        <label class="valueInput">
+          <span>B:</span>
+          <input type="range" name="in-blue" id="in-blue" min="0" max="255">
+          <span id="in-blue-display">255</span>
+        </label>
+      </div>
+      <div id="textOutputArea">
+        <label>
+          <span>rgb01</span>
+          <input readonly type="text" name="out" id="out">
+        </label>
+        <label>
+          <span>rgb</span>
+          <input readonly type="text" name="out" id="rgb-out">
+        </label>
+        <label>
+          <span>other format</span>
+          <select name="other-select" id="other-select" style="max-width: 200px"></select>
+        </label>
+        <label>
+          <span>other result</span>
+          <input readonly type="text" name="out" id="other-out">
+          <Button id="copy-other-out-exact">copy exact</Button>
+        </label>
+        <footer>for more info about color spaces: <a href="https://facelessuser.github.io/coloraide/colors/">https://facelessuser.github.io/coloraide/colors/</a></footer>
+      </div>
+    </div>
+
+    <div class="signature-container">
+      <div class="signature">
+        <span style="color: white; text-align: center; font-family:'Trebuchet MS', 'Lucida Sans Unicode', 'Lucida Grande', 'Lucida Sans', Arial, sans-serif;">made with love by</span>
+        <a href="https://x.com/fudgepop01/"><img src="./fudge_badge.png" alt="fudgepop01 badge" style="width: 150px;"></a>
+        <a href='https://ko-fi.com/J3J8Y3EA' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi1.png?v=3' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a>
+      </div>
+    </div>
+      
+    <script src="./script.js"></script>
+  </body>
+</html>
