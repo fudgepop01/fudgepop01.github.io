@@ -11,6 +11,13 @@ Lean_Product_Management/
   Implementing_Lean_Product_Management_at_Scale
   Orient_Enterprise_Leaders
   Learn_with_one_Product
+  Scale_Learnings_Across_the_Portfolio
+  Excel_with_Composability_and_Continuous_Innovation
+?c anotherthing/
+  that is really
+  really
+  reallyyyyy
+  super duper
   nested thing/
     test1
     test2
@@ -29,13 +36,6 @@ Lean_Product_Management/
             double-nested thing/
         test 5
         test 6
-  Scale_Learnings_Across_the_Portfolio
-  Excel_with_Composability_and_Continuous_Innovation
-?c anotherthing/
-  that is really
-  really
-  reallyyyyy
-  super duper
   extremely
   undoubtedly
   incredibly
