@@ -1,6 +1,6 @@
 # Lean Product Management: Orient Enterprise Leaders
 
-![Orient Learn Scale Excel. The Lean Product Management system](../resources/learn-project-management-circle-ORIENT.png)
+![Orient Learn Scale Excel. The Lean Product Management system](./img/learn-project-management-circle-ORIENT.png)
 
 We have seen implementations of Lean Product Management at scale succeed in large and smaller enterprises using a four-phased iterative approach. This story dives deeper into the first phase: Orient Enterprise Leaders.
 
@@ -18,7 +18,7 @@ Customer-centricity is key — Lean Product Management must sustainably make the
 
 If — and only if — the implementation journey begins to succeed in the eyes of leadership, orienting the leadership team will come to mean re-focusing their decisions on maximizing the customer lifetime value and profitability of the enterprise’s offering portfolio. Leadership will have a new customer-centric product orientation.
 
-![A customer-centric product orientation focuses on product value and design considerations.](../resources/customer-centric-product-orientation.webp)
+![A customer-centric product orientation focuses on product value and design considerations.](./img/customer-centric-product-orientation.webp)
 
 Such an orientation for decision making focuses — as shown in the above graphic — on product value and also product design considerations, especially customer desirability.
 

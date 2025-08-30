@@ -1,6 +1,6 @@
 # Lean Product Management: Learn with one Product
 
-![Orient Learn Scale Excel. The Lean Product Management system](../resources/learn-project-management-circle-LEARN.png)
+![Orient Learn Scale Excel. The Lean Product Management system](./img/learn-project-management-circle-LEARN.png)
 
 We have seen implementations of Lean Product Management at scale succeed in large and smaller enterprises using a four-phased iterative approach. This story dives deeper into the second phase: **Learn** with one Product (a “Bottom-Up” Approach).
 
@@ -18,7 +18,7 @@ Perhaps you can read in this author’s voice the scars that led to my convictio
 
 ## Coordinate continuous innovation as the product evolves
 
-![It’s necessary to coordinate continuous innovation as the product evolves.](../resources/coordination-as-the-product-evolves.webp)
+![It’s necessary to coordinate continuous innovation as the product evolves.](./img/coordination-as-the-product-evolves.webp)
 
 All that being said, while carefully managing the leadership team’s perception at all times, things will need to get more sophisticated. Innovation doesn’t stand still, and continuous innovation does need coordination. While one innovation is being deployed, the next is being conceptualized. It gets messy as the innovations scale to many customers.
 

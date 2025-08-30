@@ -1,6 +1,6 @@
 # Lean Product Management: Scale Learnings Across the Portfolio
 
-![Orient Learn Scale Excel. The Lean Product Management system](../resources/learn-project-management-circle-SCALE.png)
+![Orient Learn Scale Excel. The Lean Product Management system](./img/learn-project-management-circle-SCALE.png)
 
 We have seen implementations of Lean Product Management at scale succeed in large and smaller enterprises using a four-phased iterative approach. This story dives deeper into the third phase: **Scale** learnings across the portfolio (a “Top-Down” Approach).
 
@@ -12,7 +12,7 @@ Early, tangible successes with Lean Product Management will begin to open the he
 
 Opportunities will begin arising to establish offering portfolios, inventory their offerings, simplify and rationalize them, standardize, modernize, and then move them into continuous optimization. As you succeed, silo’ed business functions will evolve into value streams that accelerate the flow of innovation value to customers and amplify customer feedback loops.
 
-![It’s necessary to coordinate continuous innovation as one product scales to a product portfolio.](../resources/coordinate-continuous-innovation-product-portfolio.png)
+![It’s necessary to coordinate continuous innovation as one product scales to a product portfolio.](./img/coordinate-continuous-innovation-product-portfolio.png)
 
 It’s easy to take your eyes off the ball and get caught up in process when taking a “Top-Down Approach” — or at least to create that perception among the leadership team. Best to avoid jargon and to over-communicate the pragmatic value of everything you ask them to do — or else you’ll start losing their support and the transformation will languish.
 

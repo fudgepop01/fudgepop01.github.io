@@ -1,6 +1,6 @@
 # Lean Product Management: Excel with Composability and Continuous Innovation
 
-![Orient Learn Scale Excel. The Lean Product Management system](../resources/learn-project-management-circle-EXCEL.png)
+![Orient Learn Scale Excel. The Lean Product Management system](./img/learn-project-management-circle-EXCEL.png)
 
 We have seen implementations of Lean Product Management at scale succeed in large and smaller enterprises using a four-phased iterative approach. This story dives deeper into the fourth phase: **Excel** with Composability and Continuous Innovation.
 
@@ -16,7 +16,7 @@ Most consumers are willing to pay a lot more for a car than for the parts needed
 
 Complex enterprises offering many products leave value on the table when they fail to exploit opportunities to combine their products together with partner offerings to solve higher value problems. However, silo’ed organizations can render such product “bundling” at an attractive price point unfeasible. Time to implement Product Line Management, the ultimate Lean Product Management silo buster.
 
-![It’s necessary to coordinate continuous innovation across product lines to meet demand for complex solutions.](../resources/coordinate-continuous-innovation-product-lines-demand.webp)
+![It’s necessary to coordinate continuous innovation across product lines to meet demand for complex solutions.](./img/coordinate-continuous-innovation-product-lines-demand.webp)
 
 An enterprise’s Product Line Management System (PLM) is the Operational Value Stream in which leaders make decisions about the enterprise’s products so as to deliver value to the enterprise’s stakeholders — customers, owners / shareholders, employees, partners, communities, governments, etc. PLM coordinates decisions within and across the enterprise’s Product Lines, each of which has responsibility for one or more product portfolios.
 

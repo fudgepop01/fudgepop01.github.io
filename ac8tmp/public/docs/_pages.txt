@@ -6,52 +6,22 @@
 ? start a folder name with "?c " to make it show up as collapsed
 
 index
-Compounding_Innovation_Overview
-Lean_Product_Management/
-  Implementing_Lean_Product_Management_at_Scale
-  Orient_Enterprise_Leaders
-  Learn_with_one_Product
-  Scale_Learnings_Across_the_Portfolio
-  Excel_with_Composability_and_Continuous_Innovation
-?c anotherthing/
-  that is really
-  really
-  reallyyyyy
-  super duper
-  nested thing/
-    test1
-    test2
-    double-nested thing/
-      test 3
-      test 4
-      triple-nested thing/
-        test 3
-        test 4
-        double-nested thing/
-          test 3
-          test 4
-          double-nested thing/
-            test 3
-            test 4
-            double-nested thing/
-        test 5
-        test 6
-  extremely
-  undoubtedly
-  incredibly
-  much
-  much2
-  much3
-  muuuuch
-  longer
-  than
-  the
-  one
-  i should
-  reasonably
-  ever 
-  have to
-  expect
-  ?c and another thing/
-    there is more
-    wowie
+Rocket_To_Your_Aspirations/
+  Rocket_To_Your_Aspirations
+Compounding_Innovation/
+  Compounding_Innovation
+  Lean_Product_Management/
+    Compounding_Innovation_Overview
+    Implementing_Lean_Product_Management_at_Scale
+    Orient_Enterprise_Leaders
+    Learn_with_one_Product
+    Scale_Learnings_Across_the_Portfolio
+    Excel_with_Composability_and_Continuous_Innovation
+Network_Effects/
+  Network_Effects
+Viral_Ideation/
+  Viral_Ideation
+Generative_Learning/
+  Generative_Learning
+Artificial_Intelligence/
+  Artificial_Intelligence

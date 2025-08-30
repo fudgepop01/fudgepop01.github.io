@@ -1,6 +1,6 @@
 # Implementing Lean Product Management at Scale
 
-![Orient Learn Scale Excel. The Lean Product Management system](../resources/learn-project-management-circle.jpeg)
+![Orient Learn Scale Excel. The Lean Product Management system](./img/learn-project-management-circle.jpeg)
 
 This story dives deeper into Lean Product Management, as promised at the end of our earlier story on Compounding Innovation.
 
